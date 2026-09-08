@@ -57,7 +57,7 @@ struct ContentView: View {
                         Text(model.state == .connected ? "RUST ENGINE ACTIVE" : "RUST ENGINE READY")
                             .font(.system(size: 9, weight: .bold)).tracking(0.8)
                     }.foregroundStyle(model.state == .connected ? mint : muted)
-                    Text("Native macOS · v0.2.1").font(.system(size: 11)).foregroundStyle(muted)
+                    Text("Native macOS · v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")").font(.system(size: 11)).foregroundStyle(muted)
                     Text("Development build").font(.system(size: 10)).foregroundStyle(muted.opacity(0.65))
                 }.padding(.bottom, 24)
             }.padding(.horizontal, 22).frame(width: 214)

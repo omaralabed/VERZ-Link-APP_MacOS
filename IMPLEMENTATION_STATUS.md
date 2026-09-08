@@ -29,6 +29,13 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
   responsive link as a last resort if every link exceeds the cutoff.
 - Retained/retried UDP Join after socket backpressure; preserve NAT mapping
   during temporary silence instead of repeatedly discarding the socket.
+- Constant-time tagged replay ring replacing per-packet window scans.
+- Per-socket UDP burst buffers; no host-wide sysctl changes.
+- Bounded 4,096-packet per-flow TCP resequencing with an 80 ms hold limit;
+  ACK-only TCP and UDP bypass the hold. Fast-start capacity discovery and
+  congestion backoff driven by data repair, not idle heartbeat failure alone.
+- Negotiated ACK batching with individual delivery IDs/timestamps preserved;
+  older clients and relays retain the original single-ACK behavior.
 - UI control writes and TUN delivery cannot block the failover/UI event loops.
 - Connected-only interface list, including carrier present before DHCP completes.
 - Signed SMAppService/XPC launcher replacing per-connection AppleScript.
@@ -37,7 +44,7 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 
 ## Verified on September 8, 2026
 
-- 28 Rust library tests plus 2 runtime regression tests; Rust clippy clean.
+- 36 Rust library tests plus 2 runtime regression tests; Rust clippy clean.
 - 7 Swift tests pass; universal app and helper signatures verified.
 - Controlled isolated Linux test: one 30.97 MB TCP transfer survived two link
   cuts with matching SHA-256; 650/650 ICMP replies, maximum reply gap 46.105 ms.
@@ -57,11 +64,24 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
   tests are not throughput benchmarks or physical-unplug timing measurements.
 - Running app shows only the two connected Wi-Fi/Ethernet interfaces, hiding
   inactive ports. User-selected Use/Metered preferences remain intact.
+- Throughput investigation reproduced the user's slowdown: original Mac
+  private-relay TCP download 41.55 Mbps, upload 43.38–46.97 Mbps. Controlled
+  one-CPU throughput rose from 29.14 to 184.01 Mbps after packet-processing
+  changes. These are not Speedtest results; see [performance](PERFORMANCE.md).
+- Version 0.2.2 real Mac retest with both adapters: single-stream download
+  201.16 Mbps, upload 77.05–151.23 Mbps with matching hashes. Four parallel
+  streams measured aggregate 256.91 Mbps down / 162.20 Mbps up. This does not
+  establish the user's 300+ Mbps target or eliminate the remaining regression.
+- Mixed-version client/relay interoperability preserved TCP/hash integrity in
+  both directions. Latest virtual cut test also preserved TCP/hash integrity,
+  but its 100.572 ms maximum ICMP reply gap does not pass a strict 100 ms gate.
 
 ## Known open user issues
 
 - Physical Mac unplug/replug and application-goodput regression matrix remain
   unverified; do not claim the user's freeze/speed complaints fully resolved.
+- User reports 300+ Mbps direct access on the shared-router setup. That target
+  and repeatable no-regression throughput are not yet established in the app.
 - The user added an Apple Development signing identity and selected Mina Alabed
   (Personal Team) in Xcode; this selection is preserved. This is not Developer
   ID/notarized distribution or a Network Extension. Installation and approval

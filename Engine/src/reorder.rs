@@ -3,8 +3,14 @@
 use std::collections::HashMap;
 
 const MAX_FLOWS: usize = 1024;
-const MAX_BUFFERED: usize = 1024;
-const HOLD_MS: u64 = 50;
+// At 300 Mbps a 40 ms arrival gap spans roughly 1,250 full-size packets.
+// The former 64-packet per-flow cap forced TCP reordering at ordinary speeds.
+const MAX_PER_FLOW: usize = 4096;
+const MAX_BUFFERED: usize = 8192;
+// Cover the scheduler's 70 ms minimum repair timer plus a short alternate RTT.
+// Releasing a gap at 50 ms triggered inner TCP loss recovery before the outer
+// repair could arrive. ACK-only TCP and UDP still bypass this hold entirely.
+const HOLD_MS: u64 = 80;
 
 #[derive(Default)]
 pub struct TcpReorder {
@@ -93,7 +99,7 @@ impl TcpReorder {
         let before = flow.pending.len();
         let mut output = Vec::new();
         if seq.wrapping_sub(flow.next) as i32 > 0
-            && flow.pending.len() < 64
+            && flow.pending.len() < MAX_PER_FLOW
             && self.buffered < MAX_BUFFERED
         {
             flow.pending.push((seq, length, now, ip));
@@ -162,8 +168,26 @@ mod tests {
         let mut q = TcpReorder::default();
         q.push(tcp(u32::MAX - 99), 0);
         assert!(q.push(tcp(100), 1).is_empty());
-        assert!(q.drain_due(50).is_empty());
-        assert_eq!(q.drain_due(51), vec![tcp(100)]);
+        assert!(q.drain_due(80).is_empty());
+        assert_eq!(q.drain_due(81), vec![tcp(100)]);
+        assert_eq!(q.buffered, 0);
+    }
+
+    #[test]
+    fn fast_path_burst_waits_for_slower_path_without_forcing_tcp_reordering() {
+        let mut q = TcpReorder::default();
+        q.push(tcp(0), 0);
+        for index in 2..1500 {
+            assert!(q.push(tcp(index * 100), 1).is_empty());
+        }
+        let packets = q.push(tcp(100), 41);
+        assert_eq!(packets.len(), 1499);
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(
+                u32::from_be_bytes(packet[24..28].try_into().unwrap()),
+                (index as u32 + 1) * 100
+            );
+        }
         assert_eq!(q.buffered, 0);
     }
 }

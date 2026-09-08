@@ -16,7 +16,10 @@ use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time};
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use verz_link_lab::{
     bind_interface_socket,
-    bond::{BOND_MTU, Frame, Kind, MAX_PATHS, Policy, Scheduler, handshake},
+    bond::{
+        AckBatcher, BOND_MTU, FEATURE_ACK_BATCH, Frame, Kind, MAX_PATHS, Policy, Scheduler,
+        handshake,
+    },
     load_secret,
     reorder::TcpReorder,
     tunnel::{
@@ -144,6 +147,8 @@ struct Subflow {
     socket: Arc<UdpSocket>,
     reader: JoinHandle<()>,
     pending_join: Option<Vec<u8>>,
+    ack_batching: bool,
+    acks: AckBatcher,
 }
 impl Drop for Subflow {
     fn drop(&mut self) {
@@ -185,6 +190,8 @@ fn open_subflow(
         socket,
         reader,
         pending_join: None,
+        ack_batching: false,
+        acks: AckBatcher::default(),
     })
 }
 
@@ -232,6 +239,14 @@ fn send_client(
         let index = usize::from(frame.path);
         let Some(path) = paths.get_mut(index).and_then(Option::as_mut) else {
             continue;
+        };
+        let frame = if path.ack_batching {
+            let Some(frame) = path.acks.push(frame) else {
+                continue;
+            };
+            frame
+        } else {
+            frame
         };
         // A fresh Tokio UDP socket may not yet be writable. Losing Join here
         // strands all following probes at the relay's old NAT address.
@@ -308,7 +323,14 @@ async fn client(args: Client) -> Result<()> {
     let joins: Vec<_> = scheduler
         .paths
         .iter()
-        .map(|path| Frame::control(Kind::Join, path.id, policy_number(scheduler.policy), 0))
+        .map(|path| {
+            Frame::control(
+                Kind::Join,
+                path.id,
+                FEATURE_ACK_BATCH | policy_number(scheduler.policy),
+                0,
+            )
+        })
         .collect();
     send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
     println!(
@@ -367,11 +389,13 @@ async fn client(args: Client) -> Result<()> {
                     }
                 }
                 let joins = scheduler.paths.iter().filter(|path| path.enabled).map(|path| Frame::control(Kind::Join, path.id,
-                    policy_number(scheduler.policy) | if path.metered { 256 } else { 0 }, now(epoch))).collect();
+                    FEATURE_ACK_BATCH | policy_number(scheduler.policy) | if path.metered { 256 } else { 0 }, now(epoch))).collect();
                 send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
             }
             _ = tick.tick() => {
                 let moment = now(epoch);
+                let acknowledgements = sockets.iter_mut().flatten().flat_map(|path| path.acks.drain()).collect();
+                send_client(acknowledgements, &mut transport, &mut sockets, &mut scheduler)?;
                 scheduler.counters.queue_drops += writer.deliver(reorder.drain_due(moment));
                 for index in 0..sockets.len() {
                     if !scheduler.paths[index].enabled || moment.saturating_sub(last_reset[index]) < 500 { continue; }
@@ -382,7 +406,7 @@ async fn client(args: Client) -> Result<()> {
                         if sockets[index].is_none() {
                             sockets[index] = open_subflow(&scheduler.paths[index].name, args.relay, index, sender.clone()).ok();
                         }
-                        let id = policy_number(scheduler.policy) | if scheduler.paths[index].metered { 256 } else { 0 };
+                        let id = FEATURE_ACK_BATCH | policy_number(scheduler.policy) | if scheduler.paths[index].metered { 256 } else { 0 };
                         send_client(vec![Frame::control(Kind::Join, index as u8, id, moment)], &mut transport, &mut sockets, &mut scheduler)?;
                     }
                 }
@@ -402,6 +426,8 @@ async fn client(args: Client) -> Result<()> {
                         if kind != IP { continue; }
                         let Ok(frame) = Frame::decode(&body) else { continue; };
                         if usize::from(frame.path) != index { continue; }
+                        if frame.kind == Kind::JoinAck && frame.id & FEATURE_ACK_BATCH != 0
+                            && let Some(path) = sockets[index].as_mut() { path.ack_batching = true; }
                         if frame.kind == Kind::Data && validate_ipv4(&frame.body, None, Some(assigned)).is_err() { continue; }
                         let (delivery, responses) = scheduler.receive(&frame, now(epoch));
                         if let Some(delivery) = delivery {
@@ -435,9 +461,19 @@ struct Peer {
     hello: Vec<u8>,
     welcome: Vec<u8>,
     last_seen: Instant,
+    ack_batching: bool,
+    acks: AckBatcher,
 }
 fn send_server(socket: &UdpSocket, peer: &mut Peer, frames: Vec<Frame>) -> Result<()> {
     for frame in frames {
+        let frame = if peer.ack_batching {
+            let Some(frame) = peer.acks.push(frame) else {
+                continue;
+            };
+            frame
+        } else {
+            frame
+        };
         if let Some(address) = peer
             .addresses
             .get(usize::from(frame.path))
@@ -458,6 +494,7 @@ async fn server(args: Server) -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "Linux relay required");
     let secret = load_secret(&args.secret_file)?;
     let socket = UdpSocket::bind(args.listen).await?;
+    verz_link_lab::configure_udp_buffers(&socket)?;
     let tun = Arc::new(
         DeviceBuilder::new()
             .name(&args.tun_name)
@@ -488,12 +525,16 @@ async fn server(args: Server) -> Result<()> {
             _ = report.tick() => {
                 peers.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(120));
                 println!("{}", json!({"devices":peers.len(), "healthy_paths":peers.values().map(|peer| peer.scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count()).sum::<usize>(),
-                    "clients":peers.values().map(|peer| json!({"ip":Ipv4Addr::from(peer.assigned).to_string(), "paths":peer.scheduler.paths, "counters":peer.scheduler.counters})).collect::<Vec<_>>()}));
+                    "clients":peers.values().map(|peer| json!({"ip":Ipv4Addr::from(peer.assigned).to_string(), "ack_batching":peer.ack_batching, "paths":peer.scheduler.paths, "counters":peer.scheduler.counters})).collect::<Vec<_>>()}));
             }
             _ = tick.tick(), if !peers.is_empty() => {
                 let dropped = writer.deliver(reorder.drain_due(now(epoch)));
                 if dropped > 0 { eprintln!("Tunnel delivery queue full: {dropped} packets dropped"); }
-                for peer in peers.values_mut() { let frames = peer.scheduler.tick(now(epoch)); send_server(&socket, peer, frames)?; }
+                for peer in peers.values_mut() {
+                    let mut frames = peer.acks.drain();
+                    frames.extend(peer.scheduler.tick(now(epoch)));
+                    send_server(&socket, peer, frames)?;
+                }
             }
             received = socket.recv_from(&mut wire) => {
                 let (length, address) = received?;
@@ -516,7 +557,8 @@ async fn server(args: Server) -> Result<()> {
                     let mut scheduler = Scheduler::new(vec![("path0".into(), false)], Policy::Smart)?;
                     scheduler.remove_path(0);
                     peers.insert(header.session, Peer { transport: Transport::new(header.session, noise)?, assigned,
-                        addresses: vec![None], scheduler, hello: packet.to_vec(), welcome, last_seen: Instant::now() });
+                        addresses: vec![None], scheduler, hello: packet.to_vec(), welcome, last_seen: Instant::now(),
+                        ack_batching: false, acks: AckBatcher::default() });
                     continue;
                 }
                 let Some(peer) = peers.get_mut(&header.session) else { continue; };
@@ -532,12 +574,16 @@ async fn server(args: Server) -> Result<()> {
                     }
                     peer.scheduler.add_path(format!("path{index}"), frame.id & 256 != 0)?;
                     peer.scheduler.policy = number_policy(frame.id);
+                    peer.ack_batching = frame.id & FEATURE_ACK_BATCH != 0;
                     peer.addresses[index] = Some(address);
                 } else if peer.addresses.get(index) != Some(&Some(address)) { continue; }
                 peer.last_seen = Instant::now();
                 if frame.kind == Kind::Close { peers.remove(&header.session); continue; }
                 if frame.kind == Kind::Data && (validate_ipv4(&frame.body, Some(peer.assigned), None).is_err() || !destination_allowed(&frame.body)) { continue; }
-                let (delivery, responses) = peer.scheduler.receive(&frame, now(epoch));
+                let (delivery, mut responses) = peer.scheduler.receive(&frame, now(epoch));
+                if frame.kind == Kind::Join && peer.ack_batching {
+                    for response in &mut responses { response.kind = Kind::JoinAck; }
+                }
                 if let Some(delivery) = delivery {
                     peer.scheduler.counters.queue_drops += writer.deliver(reorder.push(delivery, now(epoch)));
                 }

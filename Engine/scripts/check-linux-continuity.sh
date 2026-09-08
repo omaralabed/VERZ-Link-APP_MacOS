@@ -3,6 +3,15 @@
 set -euo pipefail
 umask 077
 MODE=${1:-cuts}
+BOND_BIN=${VERZ_TEST_BOND_BIN:-/opt/verz-link-lab/verz-bond}
+CLIENT_BIN=${VERZ_TEST_CLIENT_BIN:-$BOND_BIN}
+HTTP_BIN=${VERZ_TEST_HTTP_BIN:-/opt/verz-link-lab/verz-tunnel-http}
+RATE=${VERZ_TEST_RATE:-10mbit}
+DELAY_LOW=${VERZ_TEST_DELAY_LOW:-10ms}
+DELAY_HIGH=${VERZ_TEST_DELAY_HIGH:-30ms}
+HTTP_ARGS=()
+if [ -n "${VERZ_TEST_STREAM_DELAY_MS:-}" ]; then HTTP_ARGS+=(--stream-delay-ms "$VERZ_TEST_STREAM_DELAY_MS"); fi
+if [ -n "${VERZ_TEST_STREAM_REPEATS:-}" ]; then HTTP_ARGS+=(--stream-repeats "$VERZ_TEST_STREAM_REPEATS"); fi
 case "$MODE" in cuts|both|low|high) ;; *) echo "Use cuts, both, low, or high" >&2; exit 1;; esac
 PATHS=(vzbc0 vzbc1)
 EXPECTED_PATHS=2
@@ -60,25 +69,25 @@ ip netns exec "$NS" sysctl -qw net.ipv4.conf.all.rp_filter=0
 ip netns exec "$NS" sysctl -qw net.ipv4.conf.vzbc1.rp_filter=0
 # 20 ms RTT versus 60 ms RTT, each limited to 10 Mbps independently.
 # Shaping applies ONLY to interfaces created by this test, never eth0/SSH.
-ip netns exec "$RELAY_NS" tc qdisc add dev vzbh0 root netem delay 10ms rate 10mbit
-ip netns exec "$NS" tc qdisc add dev vzbc0 root netem delay 10ms rate 10mbit
-ip netns exec "$RELAY_NS" tc qdisc add dev vzbh1 root netem delay 30ms rate 10mbit
-ip netns exec "$NS" tc qdisc add dev vzbc1 root netem delay 30ms rate 10mbit
-ip netns exec "$RELAY_NS" /opt/verz-link-lab/verz-bond server --listen 10.203.240.1:39002 \
+ip netns exec "$RELAY_NS" tc qdisc add dev vzbh0 root netem delay "$DELAY_LOW" rate "$RATE"
+ip netns exec "$NS" tc qdisc add dev vzbc0 root netem delay "$DELAY_LOW" rate "$RATE"
+ip netns exec "$RELAY_NS" tc qdisc add dev vzbh1 root netem delay "$DELAY_HIGH" rate "$RATE"
+ip netns exec "$NS" tc qdisc add dev vzbc1 root netem delay "$DELAY_HIGH" rate "$RATE"
+ip netns exec "$RELAY_NS" "$BOND_BIN" server --listen 10.203.240.1:39002 \
     --secret-file /etc/verz-link-lab/secret --tun-name vzrelay >"$TEST_DIR/relay.log" 2>&1 &
 RELAY_PID=$!
 for _ in $(seq 1 50); do
     if ip -n "$RELAY_NS" address show vzrelay 2>/dev/null | grep -q '10.78.0.1'; then break; fi
     sleep 0.1
 done
-ip netns exec "$RELAY_NS" /opt/verz-link-lab/verz-tunnel-http --listen 10.78.0.1:8080 \
-    --file /opt/verz-link-lab/verz-bond >"$TEST_DIR/http.log" 2>&1 &
+ip netns exec "$RELAY_NS" "$HTTP_BIN" --listen 10.78.0.1:8080 \
+    --file /opt/verz-link-lab/verz-bond "${HTTP_ARGS[@]}" >"$TEST_DIR/http.log" 2>&1 &
 HTTP_PID=$!
 for _ in $(seq 1 50); do
     if ip netns exec "$RELAY_NS" curl --fail --silent --noproxy '*' --max-time 1 http://10.78.0.1:8080/health >/dev/null; then break; fi
     sleep 0.1
 done
-ip netns exec "$NS" /opt/verz-link-lab/verz-bond client --relay 10.203.240.1:39002 \
+ip netns exec "$NS" "$CLIENT_BIN" client --relay 10.203.240.1:39002 \
     --interface "${PATHS[@]}" --secret-file /etc/verz-link-lab/secret >"$TEST_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 TUN=

@@ -15,6 +15,10 @@ struct Args {
     listen: SocketAddr,
     #[arg(long)]
     file: PathBuf,
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=256))]
+    stream_repeats: u16,
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(0..=100))]
+    stream_delay_ms: u64,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -43,7 +47,18 @@ async fn main() -> Result<()> {
         let hash = hash.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match timeout(Duration::from_secs(90), serve(socket, file, hash)).await {
+            match timeout(
+                Duration::from_secs(90),
+                serve(
+                    socket,
+                    file,
+                    hash,
+                    args.stream_repeats,
+                    args.stream_delay_ms,
+                ),
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 other => eprintln!("HTTP test connection: {other:?}"),
             }
@@ -51,7 +66,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(mut socket: TcpStream, file: Arc<Vec<u8>>, hash: Arc<String>) -> Result<()> {
+async fn serve(
+    mut socket: TcpStream,
+    file: Arc<Vec<u8>>,
+    hash: Arc<String>,
+    stream_repeats: u16,
+    stream_delay_ms: u64,
+) -> Result<()> {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         ensure!(header.len() < 8192, "HTTP header too large");
@@ -59,25 +80,33 @@ async fn serve(mut socket: TcpStream, file: Arc<Vec<u8>>, hash: Arc<String>) -> 
     }
     let text = std::str::from_utf8(&header)?;
     let request = text.lines().next().unwrap_or("");
+    // Separate unpaced endpoint for throughput measurement. Keep the existing
+    // continuity stream's deliberately slow default unchanged.
+    let is_bulk = request.starts_with("GET /bulk ") || request.starts_with("GET /bulk-sha256 ");
+    let stream_repeats = if is_bulk { 64 } else { stream_repeats };
+    let stream_delay_ms = if is_bulk { 0 } else { stream_delay_ms };
     if request.starts_with("GET /health ") {
         respond(&mut socket, b"VERZ real TCP over encrypted IP tunnel\n").await?;
     } else if request.starts_with("GET /download ") {
         respond(&mut socket, &file).await?;
-    } else if request.starts_with("GET /stream ") {
+    } else if request.starts_with("GET /stream ") || request.starts_with("GET /bulk ") {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            file.len() * 16
+            file.len() * usize::from(stream_repeats)
         );
         socket.write_all(header.as_bytes()).await?;
-        for _ in 0..16 {
+        for _ in 0..stream_repeats {
             for chunk in file.chunks(16384) {
                 socket.write_all(chunk).await?;
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                if stream_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stream_delay_ms)).await;
+                }
             }
         }
-    } else if request.starts_with("GET /stream-sha256 ") {
+    } else if request.starts_with("GET /stream-sha256 ") || request.starts_with("GET /bulk-sha256 ")
+    {
         let mut digest = Sha256::new();
-        for _ in 0..16 {
+        for _ in 0..stream_repeats {
             digest.update(file.as_slice());
         }
         respond(

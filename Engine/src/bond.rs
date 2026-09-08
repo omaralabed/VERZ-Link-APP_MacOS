@@ -11,6 +11,7 @@ pub const BOND_MTU: usize = 1200;
 /// is dynamic; ordinary multi-adapter Macs do not pay for unused path slots.
 pub const MAX_PATHS: usize = 256;
 pub const MAX_PENDING: usize = 4096;
+pub const FEATURE_ACK_BATCH: u64 = 512;
 const PROBE_MS: u64 = 20;
 pub const LATENCY_CUTOFF_MS: f64 = 75.0;
 const PACKET_TTL_MS: u64 = 1000;
@@ -51,6 +52,8 @@ pub enum Kind {
     Data = 4,
     Ack = 5,
     Close = 6,
+    AckBatch = 7,
+    JoinAck = 8,
 }
 
 #[derive(Clone, Debug)]
@@ -92,11 +95,15 @@ impl Frame {
             4 => Kind::Data,
             5 => Kind::Ack,
             6 => Kind::Close,
+            7 => Kind::AckBatch,
+            8 => Kind::JoinAck,
             _ => anyhow::bail!("invalid multipath frame type"),
         };
         ensure!(
             if kind == Kind::Data {
                 bytes.len() >= FRAME_HEADER + 20
+            } else if kind == Kind::AckBatch {
+                bytes.len() >= FRAME_HEADER && (bytes.len() - FRAME_HEADER).is_multiple_of(16)
             } else {
                 bytes.len() == FRAME_HEADER
             },
@@ -109,6 +116,42 @@ impl Frame {
             stamp: u64::from_be_bytes(bytes[10..18].try_into()?),
             body: bytes[18..].to_vec(),
         })
+    }
+}
+
+/// Coalesce path-local ACKs, preserving every packet ID and original timestamp.
+/// The runtime flushes partial batches on its 2 ms tick. Negotiation is required
+/// so clients/relays predating AckBatch continue using ordinary ACK frames.
+#[derive(Default)]
+pub struct AckBatcher {
+    pending: BTreeMap<u8, Vec<Frame>>,
+}
+impl AckBatcher {
+    pub fn push(&mut self, frame: Frame) -> Option<Frame> {
+        if frame.kind != Kind::Ack {
+            return Some(frame);
+        }
+        let pending = self.pending.entry(frame.path).or_default();
+        pending.push(frame);
+        (pending.len() >= 16).then(|| Self::batch(std::mem::take(pending)))
+    }
+    pub fn drain(&mut self) -> Vec<Frame> {
+        self.pending
+            .values_mut()
+            .filter(|items| !items.is_empty())
+            .map(|items| Self::batch(std::mem::take(items)))
+            .collect()
+    }
+    fn batch(mut frames: Vec<Frame>) -> Frame {
+        let mut first = frames.remove(0);
+        // Even a partial one-entry flush needs a distinct kind, otherwise the
+        // runtime's send path would enqueue it again instead of transmitting.
+        first.kind = Kind::AckBatch;
+        for frame in frames {
+            first.body.extend_from_slice(&frame.id.to_be_bytes());
+            first.body.extend_from_slice(&frame.stamp.to_be_bytes());
+        }
+        first
     }
 }
 
@@ -128,6 +171,7 @@ pub struct Path {
     pub delivery_bps: f64,
     pub in_flight: usize,
     pub congestion_window: usize,
+    pub slow_start_threshold: usize,
     pub timeouts: u64,
     pub latency_excluded: bool,
     #[serde(skip)]
@@ -142,6 +186,8 @@ pub struct Path {
     rate_bytes: u64,
     #[serde(skip)]
     last_congestion: Option<u64>,
+    #[serde(skip)]
+    growth_credit: usize,
 }
 impl Path {
     fn new(id: u8, name: String, metered: bool) -> Self {
@@ -160,6 +206,7 @@ impl Path {
             delivery_bps: 0.0,
             in_flight: 0,
             congestion_window: 16 * BOND_MTU,
+            slow_start_threshold: 4 * 1024 * 1024,
             timeouts: 0,
             latency_excluded: false,
             last_response: None,
@@ -168,6 +215,7 @@ impl Path {
             rate_started: 0,
             rate_bytes: 0,
             last_congestion: None,
+            growth_credit: 0,
         }
     }
     pub fn failure_ms(&self) -> u64 {
@@ -217,6 +265,37 @@ impl Path {
         // Congestion-window/RTT pacing allows discovery without treating a
         // previous quiet flow's delivery rate as a permanent capacity cap.
         (self.congestion_window as f64 / self.rtt_ms.unwrap_or(30.0).max(1.0)).max(1.0)
+    }
+
+    fn acknowledge_capacity(&mut self, bytes: usize) {
+        if self.congestion_window < self.slow_start_threshold {
+            // Discover available capacity in RTTs, not tens of seconds of
+            // fixed additive growth from the initial 19 KB window.
+            self.congestion_window += bytes;
+        } else {
+            // Retain fractional additive growth instead of rounding every ACK
+            // down to zero once the window exceeds one MSS squared.
+            self.growth_credit += bytes;
+            while self.growth_credit >= self.congestion_window {
+                self.growth_credit -= self.congestion_window;
+                self.congestion_window += BOND_MTU;
+            }
+        }
+        self.congestion_window = self.congestion_window.min(4 * 1024 * 1024);
+    }
+
+    fn congestion_loss(&mut self, now: u64) {
+        if self
+            .last_congestion
+            .is_some_and(|last| now.saturating_sub(last) < self.repair_ms())
+        {
+            return;
+        }
+        self.timeouts += 1;
+        self.last_congestion = Some(now);
+        self.slow_start_threshold = (self.congestion_window / 2).max(2 * BOND_MTU);
+        self.congestion_window = self.slow_start_threshold;
+        self.growth_credit = 0;
     }
 }
 
@@ -327,7 +406,9 @@ impl Scheduler {
         path.good_samples = 0;
         path.last_response = None;
         path.next_send = 0.0;
-        path.congestion_window = (path.congestion_window / 2).max(2 * BOND_MTU);
+        // Liveness controls eligibility immediately, but a quiet path's probe
+        // gap is not evidence that its data capacity has halved. Actual pending
+        // data repairs still apply congestion backoff in tick().
     }
     pub fn receive(&mut self, frame: &Frame, now: u64) -> (Option<Vec<u8>>, Vec<Frame>) {
         let index = usize::from(frame.path);
@@ -344,7 +425,7 @@ impl Scheduler {
                     frame.stamp,
                 )],
             ),
-            Kind::Pong => {
+            Kind::Pong | Kind::JoinAck => {
                 self.paths[index].observe(now, frame.stamp);
                 (None, Vec::new())
             }
@@ -369,9 +450,7 @@ impl Scheduler {
                         }
                         path.acknowledged_bytes += pending.body.len() as u64;
                         path.rate_bytes += pending.body.len() as u64;
-                        path.congestion_window = (path.congestion_window
-                            + BOND_MTU * pending.body.len() / path.congestion_window.max(1))
-                        .min(4 * 1024 * 1024);
+                        path.acknowledge_capacity(pending.body.len());
                         let elapsed = now.saturating_sub(path.rate_started);
                         if elapsed >= 250 {
                             let sample = path.rate_bytes as f64 * 8000.0 / elapsed as f64;
@@ -385,6 +464,24 @@ impl Scheduler {
                         }
                     }
                     self.release_flight(&pending);
+                }
+                (None, Vec::new())
+            }
+            Kind::AckBatch => {
+                self.receive(
+                    &Frame::control(Kind::Ack, frame.path, frame.id, frame.stamp),
+                    now,
+                );
+                for ack in frame.body.chunks_exact(16) {
+                    self.receive(
+                        &Frame::control(
+                            Kind::Ack,
+                            frame.path,
+                            u64::from_be_bytes(ack[..8].try_into().expect("ACK ID")),
+                            u64::from_be_bytes(ack[8..].try_into().expect("ACK timestamp")),
+                        ),
+                        now,
+                    );
                 }
                 (None, Vec::new())
             }
@@ -546,15 +643,8 @@ impl Scheduler {
                 // Congestion responses are bounded and applied on the original
                 // path, while repair uses the surviving path's own pacing.
                 for &index in packet.attempts.keys() {
-                    if index < self.paths.len()
-                        && self.paths[index].last_congestion.is_none_or(|last| {
-                            now.saturating_sub(last) >= self.paths[index].repair_ms()
-                        })
-                    {
-                        self.paths[index].timeouts += 1;
-                        self.paths[index].last_congestion = Some(now);
-                        self.paths[index].congestion_window =
-                            (self.paths[index].congestion_window / 2).max(2 * BOND_MTU);
+                    if index < self.paths.len() {
+                        self.paths[index].congestion_loss(now);
                     }
                 }
                 output.push(self.send_copy(&mut packet, id, target, now));
@@ -678,6 +768,59 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn ack_batches_release_each_packet_once_and_preserve_timestamps() {
+        let mut s = unequal_latency();
+        s.remove_path(1);
+        s.paths[0].congestion_window = 1024 * 1024;
+        for _ in 0..16 {
+            s.enqueue(bulk());
+        }
+        let packets: Vec<_> = s
+            .tick(100)
+            .into_iter()
+            .filter(|f| f.kind == Kind::Data)
+            .collect();
+        assert_eq!(packets.len(), 16);
+        let mut batcher = AckBatcher::default();
+        let mut batches = Vec::new();
+        for packet in &packets {
+            batches.extend(batcher.push(Frame::control(
+                Kind::Ack,
+                packet.path,
+                packet.id,
+                packet.stamp,
+            )));
+        }
+        assert_eq!(batches.len(), 1);
+        assert!(batcher.drain().is_empty());
+        let decoded = Frame::decode(&batches[0].encode()).unwrap();
+        assert_eq!(decoded.kind, Kind::AckBatch);
+        s.receive(&decoded, 120);
+        s.receive(&decoded, 121);
+        assert_eq!(s.pending_packets(), 0);
+        assert_eq!(s.paths[0].in_flight, 0);
+        assert_eq!(s.paths[0].acknowledged_bytes, 16 * BOND_MTU as u64);
+    }
+
+    #[test]
+    fn partial_ack_batches_flush_once_and_do_not_mix_paths() {
+        let mut batcher = AckBatcher::default();
+        assert!(batcher.push(Frame::control(Kind::Ack, 0, 10, 50)).is_none());
+        assert!(batcher.push(Frame::control(Kind::Ack, 1, 11, 51)).is_none());
+        let frames = batcher.drain();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert_eq!(frame.kind, Kind::AckBatch);
+            assert!(Frame::decode(&frame.encode()).is_ok());
+            assert!(batcher.push(frame).is_some());
+        }
+        assert!(batcher.drain().is_empty());
+        let mut invalid = Frame::control(Kind::AckBatch, 0, 1, 1).encode();
+        invalid.push(0);
+        assert!(Frame::decode(&invalid).is_err());
+    }
     #[test]
     fn smart_uses_bulk_capacity_with_forty_ms_rtt_difference() {
         let mut s = unequal_latency();
@@ -723,6 +866,41 @@ mod tests {
                 .iter()
                 .any(|f| f.kind == Kind::Data && f.path == 1)
         );
+    }
+
+    #[test]
+    fn idle_probe_failure_does_not_destroy_learned_capacity() {
+        let mut s = unequal_latency();
+        s.paths[0].congestion_window = 400_000;
+        s.fail_path(0);
+        assert!(!s.paths[0].ready(101));
+        assert_eq!(s.paths[0].congestion_window, 400_000);
+        s.paths[0].congestion_loss(200);
+        assert_eq!(s.paths[0].congestion_window, 200_000);
+        s.paths[0].congestion_loss(201);
+        assert_eq!(s.paths[0].congestion_window, 200_000);
+    }
+
+    #[test]
+    fn capacity_discovery_grows_quickly_then_backs_off_on_real_loss() {
+        let mut path = Path::new(0, "en0".into(), false);
+        for _ in 0..512 {
+            path.acknowledge_capacity(BOND_MTU);
+        }
+        assert_eq!(path.congestion_window, 528 * BOND_MTU);
+        path.congestion_loss(100);
+        let reduced = path.congestion_window;
+        assert_eq!(reduced, 264 * BOND_MTU);
+        for _ in 0..264 {
+            path.acknowledge_capacity(BOND_MTU);
+        }
+        assert_eq!(path.congestion_window, reduced + BOND_MTU);
+        path.congestion_window = 2 * 1024 * 1024;
+        path.slow_start_threshold = path.congestion_window;
+        for _ in 0..2000 {
+            path.acknowledge_capacity(BOND_MTU);
+        }
+        assert!(path.congestion_window > 2 * 1024 * 1024);
     }
     #[test]
     fn removed_low_latency_link_repairs_over_slower_link_immediately() {

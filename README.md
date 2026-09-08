@@ -3,6 +3,9 @@
 Native SwiftUI/Xcode client with a Rust encrypted multipath IPv4 engine and a
 Linux relay. **Development build; not a completed V2 product.** See
 [implementation status](IMPLEMENTATION_STATUS.md) for measured results and gaps.
+The current throughput investigation and repeatable test command are in
+[performance notes](PERFORMANCE.md); do not use the deliberately delayed
+continuity stream as a speed benchmark.
 
 ## Run from Xcode
 

@@ -8,7 +8,6 @@ pub mod reorder;
 pub mod tunnel;
 
 use std::{
-    collections::BTreeSet,
     fs,
     net::{SocketAddr, UdpSocket as StdUdpSocket},
     path::Path,
@@ -131,7 +130,9 @@ pub struct Message {
 pub struct ReplayWindow {
     width: u64,
     high: Option<u64>,
-    seen: BTreeSet<u64>,
+    // Exact counter tags in a fixed ring avoid scanning the entire window for
+    // each authenticated packet. Tags distinguish a reused slot from a replay.
+    seen: Vec<Option<u64>>,
 }
 
 impl ReplayWindow {
@@ -140,14 +141,14 @@ impl ReplayWindow {
         Self {
             width,
             high: None,
-            seen: BTreeSet::new(),
+            seen: vec![None; usize::try_from(width).expect("replay window fits memory")],
         }
     }
 
     pub fn contains(&self, counter: u64) -> bool {
         self.high
-            .is_some_and(|high| counter.saturating_add(self.width) <= high)
-            || self.seen.contains(&counter)
+            .is_some_and(|high| counter <= high && high - counter >= self.width)
+            || self.seen[(counter % self.width) as usize] == Some(counter)
     }
 
     pub fn mark(&mut self, counter: u64) -> bool {
@@ -156,9 +157,8 @@ impl ReplayWindow {
         }
         let high = self.high.map_or(counter, |value| value.max(counter));
         self.high = Some(high);
-        let floor = high.saturating_sub(self.width - 1);
-        self.seen.retain(|value| *value >= floor);
-        self.seen.insert(counter)
+        self.seen[(counter % self.width) as usize] = Some(counter);
+        true
     }
 }
 
@@ -441,12 +441,60 @@ pub fn bind_interface_socket(interface: &str, relay: SocketAddr) -> Result<UdpSo
         bail!("the first lab build supports IPv4 relay addresses only");
     }
     let socket = StdUdpSocket::bind("0.0.0.0:0").context("bind UDP socket")?;
+    #[cfg(unix)]
+    configure_udp_buffers(&socket)?;
     bind_ipv4_interface(&socket, interface)?;
     socket
         .connect(relay)
         .with_context(|| format!("connect {interface} to {relay}"))?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket).context("register UDP socket with Tokio")
+}
+
+/// Size this socket for short packet bursts without changing host-wide sysctls.
+/// Linux accounts approximately twice the requested size for socket metadata.
+#[cfg(unix)]
+pub fn configure_udp_buffers(socket: &impl std::os::fd::AsRawFd) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    let set = |option: libc::c_int, bytes: libc::c_int| -> std::io::Result<()> {
+        // SAFETY: fd is borrowed from a live socket and the pointer/length
+        // describe a local integer for the duration of the syscall.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    for (option, requested) in [
+        (libc::SO_RCVBUF, 4 * 1024 * 1024),
+        (libc::SO_SNDBUF, 1024 * 1024),
+    ] {
+        // macOS can reject requests above its socket allocation ceiling.
+        set(option, requested)
+            .or_else(|_| set(option, 1024 * 1024))
+            .or_else(|_| set(option, 256 * 1024))?;
+        #[cfg(target_os = "linux")]
+        {
+            // The privileged TUN runtime can raise its own socket limit while
+            // leaving unrelated services and global buffer limits unchanged.
+            let force = if option == libc::SO_RCVBUF {
+                libc::SO_RCVBUFFORCE
+            } else {
+                libc::SO_SNDBUFFORCE
+            };
+            let _ = set(force, requested); // Unprivileged diagnostic clients retain the normal limit.
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -509,6 +557,30 @@ fn bind_ipv4_interface(_socket: &StdUdpSocket, interface: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn udp_burst_buffers_are_configured_on_the_socket() {
+        use std::os::fd::AsRawFd;
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_buffers(&socket).unwrap();
+        for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            let mut bytes: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&bytes) as libc::socklen_t;
+            // SAFETY: live socket with correctly sized writable output values.
+            let result = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&mut bytes as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            };
+            assert_eq!(result, 0);
+            assert!(bytes >= 256 * 1024, "buffer is only {bytes} bytes");
+        }
+    }
+
     #[test]
     fn encrypted_packet_round_trip_and_tamper_rejection() {
         let secret = [7_u8; 32];
@@ -536,6 +608,49 @@ mod tests {
         assert!(!window.mark(8));
         assert!(window.mark(20));
         assert!(!window.mark(10));
+    }
+
+    #[test]
+    fn replay_ring_matches_reference_for_gaps_duplicates_and_reordering() {
+        use std::collections::BTreeSet;
+        for width in [1, 3, 8, 65, 8192] {
+            let mut window = ReplayWindow::new(width);
+            let mut seen = BTreeSet::new();
+            let mut high = 0_u64;
+            let mut random = 7_u64;
+            for _ in 0..30_000 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let counter = match random % 4 {
+                    0 => high.saturating_add(random % (width * 2 + 1)),
+                    1 => high.saturating_sub(random % (width * 2 + 1)),
+                    2 => high.saturating_add(1),
+                    _ => high,
+                };
+                let replay =
+                    (counter <= high && high - counter >= width) || seen.contains(&counter);
+                assert_eq!(window.contains(counter), replay);
+                assert_eq!(window.mark(counter), !replay);
+                if !replay {
+                    high = high.max(counter);
+                    seen.insert(counter);
+                    while seen.first().is_some_and(|value| high - value >= width) {
+                        seen.pop_first();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replay_ring_handles_counter_limit_without_saturating_false_positives() {
+        let mut window = ReplayWindow::new(8);
+        assert!(window.mark(u64::MAX));
+        assert!(window.mark(u64::MAX - 7));
+        assert!(!window.mark(u64::MAX - 8));
+        assert!(window.mark(u64::MAX - 1));
+        assert!(!window.mark(u64::MAX));
+        assert!(!window.mark(u64::MAX - 1));
+        assert!(!window.mark(0));
     }
 
     #[test]
