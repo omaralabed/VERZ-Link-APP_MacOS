@@ -1,0 +1,360 @@
+import SwiftUI
+import Charts
+
+private let mint = Color(red: 0.12, green: 0.91, blue: 0.72)
+private let cyan = Color(red: 0.20, green: 0.76, blue: 0.98)
+private let panel = Color(red: 0.075, green: 0.09, blue: 0.11)
+private let muted = Color(red: 0.52, green: 0.58, blue: 0.63)
+
+struct BrandMark: View {
+    var body: some View {
+        GeometryReader { geometry in
+            Path { p in
+                let scale = min(geometry.size.width, geometry.size.height) / 100
+                p.move(to: CGPoint(x: 10 * scale, y: 14 * scale))
+                p.addLine(to: CGPoint(x: 44 * scale, y: 86 * scale))
+                p.addLine(to: CGPoint(x: 60 * scale, y: 14 * scale))
+                p.addLine(to: CGPoint(x: 90 * scale, y: 14 * scale))
+                p.addLine(to: CGPoint(x: 50 * scale, y: 86 * scale))
+                p.addLine(to: CGPoint(x: 90 * scale, y: 86 * scale))
+            }.stroke(LinearGradient(colors: [cyan, mint], startPoint: .topLeading, endPoint: .bottomTrailing),
+                     style: StrokeStyle(lineWidth: geometry.size.width * 0.085, lineCap: .round, lineJoin: .round))
+        }
+    }
+}
+
+struct ContentView: View {
+    @ObservedObject var model: LinkModel
+    private let pages = [("Connection", "point.3.connected.trianglepath.dotted"), ("Diagnostics", "waveform.path.ecg"),
+                         ("Activity", "text.alignleft"), ("Settings", "slider.horizontal.3")]
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 10) {
+                    BrandMark().frame(width: 34, height: 34)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("VERZ").font(.system(size: 23, weight: .bold, design: .rounded)).tracking(3)
+                        Text("LINK").font(.system(size: 10, weight: .semibold)).tracking(5).foregroundStyle(muted)
+                    }
+                }.padding(.bottom, 46).padding(.top, 30)
+                Text("WORKSPACE").font(.system(size: 9, weight: .bold)).tracking(2).foregroundStyle(muted).padding(.bottom, 16)
+                ForEach(pages, id: \.0) { page in
+                    Button { model.selectedPage = page.0 } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: page.1).frame(width: 20)
+                            Text(page.0).font(.system(size: 13, weight: model.selectedPage == page.0 ? .semibold : .medium))
+                            Spacer()
+                            if model.selectedPage == page.0 { Circle().fill(mint).frame(width: 5, height: 5) }
+                        }.foregroundStyle(model.selectedPage == page.0 ? mint : muted)
+                            .padding(.horizontal, 12).padding(.vertical, 13)
+                            .background(model.selectedPage == page.0 ? mint.opacity(0.085) : .clear, in: RoundedRectangle(cornerRadius: 9))
+                    }.buttonStyle(.plain).padding(.bottom, 5)
+                }
+                Spacer()
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 7) {
+                        Circle().fill(model.state == .connected ? mint : muted).frame(width: 6, height: 6)
+                        Text(model.state == .connected ? "RUST ENGINE ACTIVE" : "RUST ENGINE READY")
+                            .font(.system(size: 9, weight: .bold)).tracking(0.8)
+                    }.foregroundStyle(model.state == .connected ? mint : muted)
+                    Text("Native macOS · v0.1.0").font(.system(size: 11)).foregroundStyle(muted)
+                    Text("Development build").font(.system(size: 10)).foregroundStyle(muted.opacity(0.65))
+                }.padding(.bottom, 24)
+            }.padding(.horizontal, 22).frame(width: 214)
+                .background(Color(red: 0.035, green: 0.047, blue: 0.060))
+            Rectangle().fill(.white.opacity(0.06)).frame(width: 1)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text(model.selectedPage).font(.system(size: 28, weight: .semibold))
+                            Text(subtitle).font(.system(size: 12)).foregroundStyle(muted)
+                        }
+                        Spacer()
+                        Label("\(model.state == .connected ? "SECURE LINK" : "MAC CLIENT")", systemImage: "shield.lefthalf.filled")
+                            .font(.system(size: 9, weight: .bold)).tracking(1)
+                            .foregroundStyle(model.state == .connected ? mint : muted)
+                            .padding(10).background(panel, in: Capsule())
+                    }.padding(.bottom, 4)
+                    if let error = model.errorMessage {
+                        HStack(alignment: .top) {
+                            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                            Text(error).font(.system(size: 12)).textSelection(.enabled)
+                            Spacer()
+                            Button { model.errorMessage = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+                        }.padding(14).background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    switch model.selectedPage {
+                    case "Diagnostics": diagnostics
+                    case "Activity": activity
+                    case "Settings": settings
+                    default: connection
+                    }
+                }.padding(30).padding(.top, 22)
+            }.background(Color(red: 0.045, green: 0.057, blue: 0.072))
+        }.tint(mint)
+    }
+
+    private var subtitle: String {
+        switch model.selectedPage {
+        case "Diagnostics": return "Measure the connection carrying your Mac’s traffic."
+        case "Activity": return "A live record of your connection and test results."
+        case "Settings": return "Your relay, credentials, and portable connection profile."
+        default: return "Your networks. One encrypted connection."
+        }
+    }
+
+    private var connection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        eyebrow("CONNECTION STATUS")
+                        Text(model.state.rawValue).font(.system(size: 29, weight: .medium))
+                        Text(model.state == .connected ? "Internet traffic uses your enabled networks through one VERZ tunnel."
+                             : model.state == .reconnecting ? "Waiting for a usable path. Your tunnel stays in place."
+                             : "Connect your Mac’s Wi-Fi and Ethernet networks to your VERZ relay.")
+                            .font(.system(size: 12)).foregroundStyle(muted)
+                    }
+                    Spacer()
+                    ZStack {
+                        Circle().stroke(mint.opacity(0.12), lineWidth: 1).frame(width: 78, height: 78)
+                        Circle().fill(mint.opacity(0.07)).frame(width: 60, height: 60)
+                        Image(systemName: model.state == .connected ? "lock.shield.fill" : "power")
+                            .font(.system(size: 24, weight: .light)).foregroundStyle(mint)
+                    }
+                }
+                HStack(spacing: 18) {
+                    Button { model.busy ? model.disconnect() : model.connect() } label: {
+                        HStack(spacing: 10) {
+                            if model.state == .authorizing || model.state == .connecting || model.state == .disconnecting {
+                                ProgressView().controlSize(.small)
+                            } else { Image(systemName: "power") }
+                            Text(model.busy ? "Disconnect" : "Connect").fontWeight(.semibold)
+                        }.frame(width: 150, height: 42)
+                            .foregroundStyle(model.busy ? mint : Color.black)
+                            .background(model.busy ? mint.opacity(0.12) : mint, in: RoundedRectangle(cornerRadius: 9))
+                    }.buttonStyle(.plain).disabled(model.state == .disconnecting || (!model.busy && !model.hasReadyInterface))
+                    Text(model.state == .connected ? "UPTIME  \(uptime)" : "macOS will request administrator approval")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)
+                    Spacer()
+                }
+                Divider().overlay(.white.opacity(0.03))
+                HStack(spacing: 16) {
+                    detail("RELAY", model.relay)
+                    Spacer()
+                    detail("PUBLIC IPv4", model.publicIP ?? (model.state == .connected ? "Verifying…" : "—"))
+                    Spacer()
+                    detail("ENCRYPTION", "ChaCha20-Poly1305")
+                }
+            }.padding(24).card()
+            networkInterfaces
+            HStack(spacing: 14) {
+                metric("DOWNLOAD", String(format: "%.2f", model.receivedMbps), "Mbps", "arrow.down", cyan)
+                metric("UPLOAD", String(format: "%.2f", model.sentMbps), "Mbps", "arrow.up", mint)
+                metric("DATA TRANSFERRED", ByteCountFormatter.string(fromByteCount: Int64(model.receivedBytes + model.sentBytes), countStyle: .decimal), "this session", "arrow.up.arrow.down", muted)
+            }
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    eyebrow("LIVE TRAFFIC")
+                    Spacer()
+                    Text("↓ Download").foregroundStyle(cyan)
+                    Text("↑ Upload").foregroundStyle(mint)
+                }.font(.system(size: 10))
+                Chart(Array(model.samples.enumerated()), id: \.element.id) { index, sample in
+                    LineMark(x: .value("Seconds", index), y: .value("Mbps", sample.received), series: .value("Direction", "Download")).foregroundStyle(cyan)
+                    LineMark(x: .value("Seconds", index), y: .value("Mbps", sample.sent), series: .value("Direction", "Upload")).foregroundStyle(mint)
+                }.chartXScale(domain: 0...59).chartXAxis(.hidden)
+                    .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) }
+                    .frame(height: 105)
+                    .overlay { if model.samples.isEmpty { Text("Live measurements appear when connected").font(.system(size: 11)).foregroundStyle(muted) } }
+                HStack {
+                    Text("Last 60 seconds · actual tunnel interface counters")
+                    Spacer()
+                    Text("Mbps")
+                }.font(.system(size: 9)).foregroundStyle(muted)
+            }.padding(20).card()
+        }
+    }
+
+    private var networkInterfaces: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                eyebrow("YOUR NETWORK INTERFACES")
+                Spacer()
+                Text("Updates automatically").font(.system(size: 10)).foregroundStyle(muted)
+                Button { model.refreshInterfaces() } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Refresh network interfaces")
+            }
+            if model.interfaces.isEmpty {
+                Text("No Wi-Fi or Ethernet adapters detected.").font(.system(size: 12)).foregroundStyle(muted)
+            }
+            ForEach(model.interfaces) { interface in
+                HStack(spacing: 12) {
+                    Image(systemName: interface.isWiFi ? "wifi" : "cable.connector")
+                        .font(.system(size: 17)).frame(width: 26)
+                        .foregroundStyle(interface.canConnect ? mint : muted)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(interface.title).font(.system(size: 12, weight: .medium))
+                        Text([interface.status, interface.address ?? interface.addresses.first].compactMap { $0 }.joined(separator: " · "))
+                            .font(.system(size: 10)).foregroundStyle(muted)
+                    }
+                    Spacer()
+                    if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(path.state.capitalized).foregroundStyle(path.state == "healthy" ? mint : muted)
+                            Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
+                            Text("↑ \(ByteCountFormatter.string(fromByteCount: Int64(path.sentBytes), countStyle: .decimal))  ↓ \(ByteCountFormatter.string(fromByteCount: Int64(path.receivedBytes), countStyle: .decimal))").foregroundStyle(muted)
+                        }.font(.system(size: 10))
+                    }
+                    Toggle("Use", isOn: Binding(get: { !model.disabledInterfaces.contains(interface.name) },
+                        set: { model.setInterface(interface.name, enabled: $0) })).toggleStyle(.switch).controlSize(.small)
+                        .fixedSize().help("Include this adapter in the multipath connection")
+                    Toggle("Metered", isOn: Binding(get: { model.meteredInterfaces.contains(interface.name) },
+                        set: { model.setMetered(interface.name, metered: $0) })).controlSize(.small).fixedSize()
+                }.padding(.vertical, 5)
+            }
+            Text("Enabled adapters join automatically when they obtain an IPv4 address. Adding or removing a path does not restart the tunnel.")
+                .font(.system(size: 10)).foregroundStyle(muted)
+            HStack {
+                Text("Connection preference").font(.system(size: 12))
+                Spacer()
+                Picker("Connection preference", selection: $model.policy) {
+                    Text("Smart").tag("smart")
+                    Text("Performance").tag("performance")
+                    Text("Continuity").tag("continuity")
+                    Text("Data saver").tag("data-saver")
+                }.labelsHidden().frame(width: 160)
+            }
+        }.padding(20).card()
+    }
+
+    private var diagnostics: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("Test the real connection").font(.system(size: 20, weight: .semibold))
+                        Text("10 ICMP pings, a file download, and a verified upload.").font(.system(size: 12)).foregroundStyle(muted)
+                    }
+                    Spacer()
+                    Button("Run diagnostics") { model.runTest() }.buttonStyle(.borderedProminent).disabled(!model.canTest)
+                }
+                if model.testRunning {
+                    ProgressView(value: model.testProgress)
+                    Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint)
+                } else if model.state != .connected {
+                    Label("Connect to your relay before starting a new test.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
+                } else if !model.testStage.isEmpty { Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint) }
+            }.padding(24).card()
+            if let result = model.result {
+                HStack {
+                    eyebrow("LAST COMPLETED TEST")
+                    Spacer()
+                    Text(result.date.formatted()).font(.system(size: 11)).foregroundStyle(muted)
+                }
+                HStack(spacing: 14) {
+                    metric("LATENCY · AVERAGE", String(format: "%.2f", result.averageMs), "ms", "waveform.path.ecg", mint)
+                    metric("PING LOSS", String(format: "%.1f", result.lossPercent), "%", "circle.dotted", cyan)
+                    metric("INTEGRITY", "Verified", "SHA-256 · both files", "checkmark.shield", mint)
+                }
+                VStack(alignment: .leading, spacing: 18) {
+                    transfer("Download", bytes: result.downloadBytes, speed: result.downloadMbps, hash: result.downloadHash, symbol: "arrow.down")
+                    Divider()
+                    transfer("Upload", bytes: result.uploadBytes, speed: result.uploadMbps, hash: result.uploadHash, symbol: "arrow.up")
+                    Text("These are short file-transfer measurements, not a sustained capacity or bonding benchmark.")
+                        .font(.system(size: 11)).foregroundStyle(muted)
+                }.padding(24).card()
+                Button("Export test report…") { model.exportReport() }
+            } else {
+                VStack(spacing: 14) {
+                    Image(systemName: "waveform.path.ecg").font(.system(size: 38, weight: .ultraLight)).foregroundStyle(mint)
+                    Text("Your first measurement starts here").font(.system(size: 16))
+                    Text("Results will be saved on this Mac. No generated numbers.").font(.system(size: 12)).foregroundStyle(muted)
+                }.frame(maxWidth: .infinity).padding(.vertical, 70).card()
+            }
+            Label("100 ms maximum failover disruption is a release gate. Passing ping or file-transfer checks alone does not validate that gate.", systemImage: "hammer")
+                .font(.system(size: 11)).foregroundStyle(muted)
+        }
+    }
+
+    private var activity: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack { eyebrow("SESSION EVENTS"); Spacer(); Button("Export report…") { model.exportReport() } }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(model.activity.reversed()) { item in
+                    HStack(alignment: .top, spacing: 16) {
+                        Text(item.date.formatted(date: .omitted, time: .standard)).foregroundStyle(muted).frame(width: 86, alignment: .leading)
+                        Text(item.message).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                    }.font(.system(size: 11, design: .monospaced)).padding(.vertical, 12)
+                    Divider().opacity(0.3)
+                }
+            }.padding(20).card()
+        }
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 18) {
+                eyebrow("RELAY CONNECTION")
+                Text("Server address").font(.system(size: 13, weight: .medium))
+                TextField("IPv4:port", text: $model.relay).textFieldStyle(.roundedBorder).disabled(model.busy)
+                Text("Use the same relay profile on another Mac. Each connection receives its own encrypted session and private IPv4 address.")
+                    .font(.system(size: 12)).foregroundStyle(muted)
+                Divider()
+                HStack {
+                    Label(model.hasCredential ? "Connection key installed" : "Connection key required", systemImage: model.hasCredential ? "checkmark.shield" : "key")
+                        .foregroundStyle(model.hasCredential ? mint : .orange)
+                    Spacer()
+                    Button("Import profile or key…") { model.importKey() }.disabled(model.busy)
+                }.font(.system(size: 12))
+                Button("Export private profile for another Mac…") { model.exportProfile() }.disabled(!model.hasCredential)
+                Text("The app never contains your key. Profiles include relay access credentials: transfer them privately. Credentials are stored in a permission-restricted file on this Mac.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+            }.padding(24).card()
+            VStack(alignment: .leading, spacing: 16) {
+                eyebrow("THIS BUILD")
+                settingRow("Networking engine", "Rust · native system tunnel")
+                settingRow("Authentication", "Noise PSK + ephemeral X25519")
+                settingRow("Traffic", "IPv4 internet + DNS through relay")
+                settingRow("IPv6", "Blocked by tunnel routes while connected")
+                settingRow("Local network", "Existing more-specific LAN routes remain local")
+                settingRow("Uplinks", "Dynamic Wi-Fi and Ethernet paths")
+                settingRow("Distribution", "Universal · macOS 14+ · development-signed")
+                Divider()
+                Text("This development build uses a shared relay profile. Production device enrollment, audited no-regression performance, corporate-VPN underlay compatibility, and the full V2 release gates are not complete.")
+                    .font(.system(size: 12)).foregroundStyle(muted)
+            }.padding(24).card()
+        }
+    }
+
+    private var uptime: String { String(format: "%02d:%02d:%02d", model.uptime / 3600, model.uptime / 60 % 60, model.uptime % 60) }
+    private func eyebrow(_ text: String) -> some View { Text(text).font(.system(size: 9, weight: .bold)).tracking(1.5).foregroundStyle(muted) }
+    private func detail(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) { eyebrow(title); Text(value).font(.system(size: 11, weight: .medium, design: .monospaced)).textSelection(.enabled) }
+    }
+    private func metric(_ title: String, _ value: String, _ unit: String, _ icon: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack { eyebrow(title); Spacer(); Image(systemName: icon).foregroundStyle(color).font(.system(size: 11)) }
+            Text(value).font(.system(size: 25, weight: .medium, design: .rounded)).lineLimit(1).minimumScaleFactor(0.6)
+            Text(unit).font(.system(size: 10)).foregroundStyle(muted)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(18).card()
+    }
+    private func settingRow(_ label: String, _ value: String) -> some View {
+        HStack { Text(label).foregroundStyle(muted); Spacer(); Text(value) }.font(.system(size: 12))
+    }
+    private func transfer(_ title: String, bytes: Int, speed: Double, hash: String, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack { Label(title, systemImage: symbol).foregroundStyle(mint); Spacer(); Text(String(format: "%.2f Mbps", speed)).fontWeight(.semibold) }
+            Text("\(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)) · SHA-256 verified").font(.system(size: 11)).foregroundStyle(muted)
+            Text(hash).font(.system(size: 9, design: .monospaced)).foregroundStyle(muted).textSelection(.enabled)
+        }
+    }
+}
+
+private extension View {
+    func card() -> some View {
+        background(panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.055), lineWidth: 1))
+    }
+}

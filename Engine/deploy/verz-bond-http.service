@@ -1,0 +1,21 @@
+[Unit]
+Description=VERZ private multipath diagnostics endpoint
+Requires=verz-bond.service
+After=verz-bond.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/opt/verz-link-lab/verz-tunnel-http --listen 10.78.0.1:8080 --file /opt/verz-link-lab/verz-bond
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=VERZ multipath relay scoped IPv4 forwarding
+Wants=network-online.target
+After=network-online.target ufw.service
+Before=verz-bond.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/verz-link-lab/verz-bond-network.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

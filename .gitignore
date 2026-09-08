@@ -1,0 +1,10 @@
+.build/
+dist/
+Helper/target/
+Engine/target/
+*.log
+.DS_Store
+.swiftpm/
+**/xcuserdata/
+**/lab-secret
+*.verz

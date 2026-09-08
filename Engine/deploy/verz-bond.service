@@ -1,0 +1,31 @@
+[Unit]
+Description=VERZ multipath encrypted IP relay
+Wants=network-online.target
+After=network-online.target verz-bond-network.service
+Requires=verz-bond-network.service
+
+[Service]
+Type=simple
+ExecStart=/opt/verz-link-lab/verz-bond server --secret-file %d/lab-secret
+LoadCredential=lab-secret:/etc/verz-link-lab/secret
+Restart=on-failure
+RestartSec=2
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+MemoryMax=256M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target
