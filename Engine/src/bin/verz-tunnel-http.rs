@@ -63,6 +63,28 @@ async fn serve(mut socket: TcpStream, file: Arc<Vec<u8>>, hash: Arc<String>) -> 
         respond(&mut socket, b"VERZ real TCP over encrypted IP tunnel\n").await?;
     } else if request.starts_with("GET /download ") {
         respond(&mut socket, &file).await?;
+    } else if request.starts_with("GET /stream ") {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            file.len() * 16
+        );
+        socket.write_all(header.as_bytes()).await?;
+        for _ in 0..16 {
+            for chunk in file.chunks(16384) {
+                socket.write_all(chunk).await?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    } else if request.starts_with("GET /stream-sha256 ") {
+        let mut digest = Sha256::new();
+        for _ in 0..16 {
+            digest.update(file.as_slice());
+        }
+        respond(
+            &mut socket,
+            format!("{}\n", hex::encode(digest.finalize())).as_bytes(),
+        )
+        .await?;
     } else if request.starts_with("GET /sha256 ") {
         respond(&mut socket, hash.as_bytes()).await?;
     } else if request.starts_with("POST /upload ") {

@@ -16,7 +16,7 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 - Live interface byte counters, actual ICMP/file-transfer diagnostics.
 - Automatic discovery of named Wi-Fi/Ethernet interfaces (latest source).
 
-## In progress — required before another bonding handoff
+## Implemented multipath changes — acceptance still incomplete
 
 - A single device session spanning independently bound physical uplinks.
 - Bidirectional authenticated path probes and health state transitions.
@@ -24,7 +24,48 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 - Automatic link loss/recovery without removing the device tunnel.
 - Traffic-aware scheduling, congestion limits and operating preferences.
 - Actual per-path telemetry in the native app, not UI-generated metrics.
-- Controlled real TCP/UDP continuity tests, including maximum interruption.
+- Smart bulk scheduling uses unequal-latency links, with per-TCP-flow bounded reordering.
+- 75 ms smoothed RTT exclusion; recovery below 65 ms. Keep the least-latency
+  responsive link as a last resort if every link exceeds the cutoff.
+- Retained/retried UDP Join after socket backpressure; preserve NAT mapping
+  during temporary silence instead of repeatedly discarding the socket.
+- UI control writes and TUN delivery cannot block the failover/UI event loops.
+- Connected-only interface list, including carrier present before DHCP completes.
+- Signed SMAppService/XPC launcher replacing per-connection AppleScript.
+  Caller identity is enforced using Apple's code-signing requirement API.
+  Root executes only verified copies in a newly created root-only directory.
+
+## Verified on September 8, 2026
+
+- 28 Rust library tests plus 2 runtime regression tests; Rust clippy clean.
+- 7 Swift tests pass; universal app and helper signatures verified.
+- Controlled isolated Linux test: one 30.97 MB TCP transfer survived two link
+  cuts with matching SHA-256; 650/650 ICMP replies, maximum reply gap 46.105 ms.
+- Two independently shaped 10 Mbps links at 20/60 ms baseline RTT: one TCP
+  transfer measured 8.25 Mbps / 7.83 Mbps individually and 12.11 Mbps combined.
+  This is 46.8% above the better single-link test, NOT sum-capacity acceptance.
+- Mac en0/en7 protocol check: 524/524 encrypted relay-kernel ICMP replies,
+  88 ms maximum reply gap after a software-controlled subflow cut. This check
+  does NOT route Mac apps or measure physical WAN/TCP interruption.
+- Signed Xcode app registered the managed helper; after the user's one-time
+  approval, connection and disconnect/reconnect succeeded without a password
+  prompt. Disconnect restored the original en7 route and stopped the session
+  engine; reconnect restored the utun route and private TCP endpoint access.
+- Two real Mac app TCP transfers, each 30,972,416 bytes, completed with matching
+  SHA-256 while Ethernet or Wi-Fi was separately disabled using the app's Use
+  control. Both adapters were restored afterward. These rate-limited continuity
+  tests are not throughput benchmarks or physical-unplug timing measurements.
+- Running app shows only the two connected Wi-Fi/Ethernet interfaces, hiding
+  inactive ports. User-selected Use/Metered preferences remain intact.
+
+## Known open user issues
+
+- Physical Mac unplug/replug and application-goodput regression matrix remain
+  unverified; do not claim the user's freeze/speed complaints fully resolved.
+- The user added an Apple Development signing identity and selected Mina Alabed
+  (Personal Team) in Xcode; this selection is preserved. This is not Developer
+  ID/notarized distribution or a Network Extension. Installation and approval
+  on a second Mac remain unverified.
 
 ## Additional V2 requirements not complete
 

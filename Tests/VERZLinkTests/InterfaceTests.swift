@@ -1,7 +1,18 @@
 import XCTest
+import Darwin
 @testable import VERZLink
 
 final class InterfaceTests: XCTestCase {
+    func testControlSocketBackpressureReturnsWithoutIndefiniteBlocking() {
+        var pair: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair), 0)
+        defer { close(pair[0]); close(pair[1]) }
+        var timeout = timeval(tv_sec: 0, tv_usec: 100_000)
+        XCTAssertEqual(setsockopt(pair[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)), 0)
+        let start = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(TunnelSession.writeCommand(Data(repeating: 1, count: 2_000_000), to: pair[0]))
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 1.0)
+    }
     private func ethernet(_ name: String = "en7", addresses: [String] = ["192.168.108.3"], link: Bool = true) -> LinkInterface {
         LinkInterface(name: name, displayName: "USB Ethernet", isWiFi: false,
                       addresses: addresses, isUp: true, linkActive: link)
@@ -21,6 +32,13 @@ final class InterfaceTests: XCTestCase {
         XCTAssertFalse(LinkInterface.usableIPv4("127.0.0.1"))
         XCTAssertFalse(LinkInterface.usableIPv4("0.0.0.0"))
         XCTAssertTrue(ethernet().canConnect)
+    }
+    func testOnlyConnectedPortsAreVisibleIncludingDHCPInProgress() {
+        XCTAssertFalse(ethernet(link: false).isConnected)
+        XCTAssertTrue(ethernet().isConnected)
+        XCTAssertTrue(ethernet(addresses: [], link: true).isConnected)
+        let ports = (2...21).map { ethernet("en\($0)", link: $0.isMultiple(of: 2)) }
+        XCTAssertEqual(ports.filter(\.isConnected).count, 10)
     }
     func testManyAdaptersHaveDistinctIdentities() {
         let ports = (2...21).map { ethernet("en\($0)") }

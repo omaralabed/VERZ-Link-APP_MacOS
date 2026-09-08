@@ -12,7 +12,9 @@ struct LinkInterface: Identifiable, Hashable, Sendable {
     var id: String { name }
     var address: String? { addresses.first(where: Self.usableIPv4) }
     var canConnect: Bool { isUp && linkActive != false && address != nil }
-    var title: String { "\(displayName) (\(name))" }
+    // Carrier can be up before DHCP completes; that adapter stays visible.
+    var isConnected: Bool { isUp && (linkActive ?? (address != nil)) }
+    var title: String { displayName.contains("(\(name))") ? displayName : "\(displayName) (\(name))" }
     var status: String {
         if !isUp { return "Disabled" }
         if linkActive == false { return isWiFi ? "Not connected" : "No cable link" }

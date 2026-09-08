@@ -82,7 +82,13 @@ fn main() -> Result<()> {
     let reader = socket.try_clone()?;
     let events: Events = Arc::new(Mutex::new(socket));
     event(&events, json!({"event":"helper_ready"}));
-    let mut child = Command::new(directory.join("verz-bond"))
+    // Persistent service: only run the engine beside this signed supervisor,
+    // never a user-replaceable executable from the session directory.
+    let engine = std::env::current_exe()?
+        .parent()
+        .context("supervisor executable directory")?
+        .join("verz-bond");
+    let mut child = Command::new(engine)
         .args(["client", "--relay", &relay.to_string(), "--interface"])
         .args(&interfaces)
         .arg("--secret-file")

@@ -57,7 +57,7 @@ struct ContentView: View {
                         Text(model.state == .connected ? "RUST ENGINE ACTIVE" : "RUST ENGINE READY")
                             .font(.system(size: 9, weight: .bold)).tracking(0.8)
                     }.foregroundStyle(model.state == .connected ? mint : muted)
-                    Text("Native macOS · v0.1.0").font(.system(size: 11)).foregroundStyle(muted)
+                    Text("Native macOS · v0.2.1").font(.system(size: 11)).foregroundStyle(muted)
                     Text("Development build").font(.system(size: 10)).foregroundStyle(muted.opacity(0.65))
                 }.padding(.bottom, 24)
             }.padding(.horizontal, 22).frame(width: 214)
@@ -135,7 +135,7 @@ struct ContentView: View {
                             .foregroundStyle(model.busy ? mint : Color.black)
                             .background(model.busy ? mint.opacity(0.12) : mint, in: RoundedRectangle(cornerRadius: 9))
                     }.buttonStyle(.plain).disabled(model.state == .disconnecting || (!model.busy && !model.hasReadyInterface))
-                    Text(model.state == .connected ? "UPTIME  \(uptime)" : "macOS will request administrator approval")
+                    Text(model.state == .connected ? "UPTIME  \(uptime)" : "One-time macOS helper setup · normal connections need no password")
                         .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)
                     Spacer()
                 }
@@ -186,10 +186,10 @@ struct ContentView: View {
                 Button { model.refreshInterfaces() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh network interfaces")
             }
-            if model.interfaces.isEmpty {
-                Text("No Wi-Fi or Ethernet adapters detected.").font(.system(size: 12)).foregroundStyle(muted)
+            if model.visibleInterfaces.isEmpty {
+                Text("No connected networks. Join Wi-Fi or plug in an Ethernet cable.").font(.system(size: 12)).foregroundStyle(muted)
             }
-            ForEach(model.interfaces) { interface in
+            ForEach(model.visibleInterfaces) { interface in
                 HStack(spacing: 12) {
                     Image(systemName: interface.isWiFi ? "wifi" : "cable.connector")
                         .font(.system(size: 17)).frame(width: 26)
@@ -202,7 +202,8 @@ struct ContentView: View {
                     Spacer()
                     if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
-                            Text(path.state.capitalized).foregroundStyle(path.state == "healthy" ? mint : muted)
+                            Text(path.latencyExcluded == true ? "High RTT · standby / last resort" : path.state.capitalized)
+                                .foregroundStyle(path.state == "healthy" && path.latencyExcluded != true ? mint : muted)
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
                             Text("↑ \(ByteCountFormatter.string(fromByteCount: Int64(path.sentBytes), countStyle: .decimal))  ↓ \(ByteCountFormatter.string(fromByteCount: Int64(path.receivedBytes), countStyle: .decimal))").foregroundStyle(muted)
                         }.font(.system(size: 10))
@@ -214,7 +215,7 @@ struct ContentView: View {
                         set: { model.setMetered(interface.name, metered: $0) })).controlSize(.small).fixedSize()
                 }.padding(.vertical, 5)
             }
-            Text("Enabled adapters join automatically when they obtain an IPv4 address. Adding or removing a path does not restart the tunnel.")
+            Text("Connected adapters appear automatically. Links at 75 ms RTT or above stop carrying data when another usable link exists; probes continue. Recovery below 65 ms avoids rapid switching.")
                 .font(.system(size: 10)).foregroundStyle(muted)
             HStack {
                 Text("Connection preference").font(.system(size: 12))

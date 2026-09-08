@@ -4,7 +4,6 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::json;
-use snow::HandshakeState;
 use std::{
     collections::HashMap,
     io::BufRead,
@@ -14,11 +13,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time};
-use tun_rs::DeviceBuilder;
+use tun_rs::{AsyncDevice, DeviceBuilder};
 use verz_link_lab::{
     bind_interface_socket,
-    bond::{BOND_MTU, Frame, Kind, MAX_PATHS, Policy, Scheduler},
+    bond::{BOND_MTU, Frame, Kind, MAX_PATHS, Policy, Scheduler, handshake},
     load_secret,
+    reorder::TcpReorder,
     tunnel::{
         HEADER, HELLO, Header, IP, MAX_WIRE, Transport, WELCOME, internet_destination_allowed,
         validate_ipv4,
@@ -27,6 +27,33 @@ use verz_link_lab::{
 
 const SERVER_IP: [u8; 4] = [10, 78, 0, 1];
 const DEFAULT_RELAY: &str = "69.164.213.57:39002";
+
+struct PacketWriter {
+    sender: mpsc::Sender<Vec<u8>>,
+    task: JoinHandle<std::io::Result<()>>,
+}
+impl PacketWriter {
+    fn new(tun: Arc<AsyncDevice>) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
+        let task = tokio::spawn(async move {
+            while let Some(packet) = receiver.recv().await {
+                tun.send(&packet).await?;
+            }
+            Ok(())
+        });
+        Self { sender, task }
+    }
+    fn deliver(&self, packets: Vec<Vec<u8>>) -> u64 {
+        packets.into_iter().fold(0, |dropped, packet| {
+            dropped + u64::from(self.sender.try_send(packet).is_err())
+        })
+    }
+}
+impl Drop for PacketWriter {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 #[derive(Parser)]
 struct Cli {
@@ -65,6 +92,7 @@ struct Client {
 #[derive(Deserialize)]
 struct InterfaceConfig {
     name: String,
+    address: Option<String>,
     #[serde(default)]
     metered: bool,
 }
@@ -74,18 +102,6 @@ struct Control {
     policy: Option<String>,
 }
 
-fn handshake(secret: &[u8; 32], session: &[u8; 16], initiator: bool) -> Result<HandshakeState> {
-    let mut prologue = b"VERZ Link multipath v1 / authenticated IPv4 lease / MTU1200 / ".to_vec();
-    prologue.extend_from_slice(session);
-    let builder = snow::Builder::new("Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s".parse()?)
-        .psk(0, secret)?
-        .prologue(&prologue)?;
-    Ok(if initiator {
-        builder.build_initiator()?
-    } else {
-        builder.build_responder()?
-    })
-}
 fn now(epoch: Instant) -> u64 {
     epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -127,6 +143,7 @@ struct Subflow {
     generation: u64,
     socket: Arc<UdpSocket>,
     reader: JoinHandle<()>,
+    pending_join: Option<Vec<u8>>,
 }
 impl Drop for Subflow {
     fn drop(&mut self) {
@@ -167,6 +184,7 @@ fn open_subflow(
         generation,
         socket,
         reader,
+        pending_join: None,
     })
 }
 
@@ -212,15 +230,32 @@ fn send_client(
 ) -> Result<()> {
     for frame in frames {
         let index = usize::from(frame.path);
-        let Some(path) = paths.get(index).and_then(Option::as_ref) else {
+        let Some(path) = paths.get_mut(index).and_then(Option::as_mut) else {
             continue;
         };
+        // A fresh Tokio UDP socket may not yet be writable. Losing Join here
+        // strands all following probes at the relay's old NAT address.
+        if let Some(join) = path.pending_join.as_ref() {
+            match path.socket.try_send(join) {
+                Ok(_) => path.pending_join = None,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => {
+                    scheduler.fail_path(index);
+                    paths[index] = None;
+                    continue;
+                }
+            }
+        }
         let packet = transport.seal(IP, &frame.encode())?;
-        if let Err(error) = path.socket.try_send(&packet)
-            && error.kind() != std::io::ErrorKind::WouldBlock
-        {
-            scheduler.fail_path(index);
-            paths[index] = None;
+        if let Err(error) = path.socket.try_send(&packet) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                if frame.kind == Kind::Join {
+                    path.pending_join = Some(packet);
+                }
+            } else {
+                scheduler.fail_path(index);
+                paths[index] = None;
+            }
         }
     }
     Ok(())
@@ -254,17 +289,22 @@ async fn client(args: Client) -> Result<()> {
         "no selected network has a usable route to the VERZ Server"
     );
     let (mut transport, assigned) = establish(&args, &sockets, &mut input).await?;
-    let tun = DeviceBuilder::new()
-        .ipv4(
-            Ipv4Addr::from(assigned),
-            32,
-            Some(Ipv4Addr::from(SERVER_IP)),
-        )
-        .mtu(BOND_MTU as u16)
-        .build_async()
-        .context("create multipath system tunnel")?;
+    let tun = Arc::new(
+        DeviceBuilder::new()
+            .ipv4(
+                Ipv4Addr::from(assigned),
+                32,
+                Some(Ipv4Addr::from(SERVER_IP)),
+            )
+            .mtu(BOND_MTU as u16)
+            .build_async()
+            .context("create multipath system tunnel")?,
+    );
+    let mut writer = PacketWriter::new(tun.clone());
+    let mut reorder = TcpReorder::default();
     let epoch = Instant::now();
     let mut last_reset = vec![0_u64; sockets.len()];
+    let mut interface_addresses: HashMap<String, String> = HashMap::new();
     let joins: Vec<_> = scheduler
         .paths
         .iter()
@@ -300,6 +340,7 @@ async fn client(args: Client) -> Result<()> {
     loop {
         tokio::select! {
             _ = &mut stop => break,
+            result = &mut writer.task => { result.context("tunnel writer task")??; anyhow::bail!("tunnel writer stopped"); }
             _ = report.tick() => {
                 println!("BOND_STATE {}", json!({"paths":scheduler.paths, "policy":scheduler.policy,
                     "counters":scheduler.counters, "pending_packets":scheduler.pending_packets(),
@@ -314,18 +355,31 @@ async fn client(args: Client) -> Result<()> {
                         scheduler.remove_path(index); *socket = None;
                     }
                 }
-                for item in control.interfaces { let index = scheduler.add_path(item.name, item.metered)?; if index >= sockets.len() { sockets.push(None); last_reset.push(0); } }
+                for item in control.interfaces {
+                    let Ok(index) = scheduler.add_path(item.name.clone(), item.metered) else {
+                        println!("Additional adapter {} exceeds this session's path-ID limit; existing paths remain active", item.name);
+                        continue;
+                    };
+                    if index >= sockets.len() { sockets.push(None); last_reset.push(0); }
+                    if let Some(address) = item.address
+                        && interface_addresses.insert(item.name, address.clone()).is_some_and(|previous| previous != address) {
+                        sockets[index] = None; scheduler.fail_path(index); last_reset[index] = 0;
+                    }
+                }
                 let joins = scheduler.paths.iter().filter(|path| path.enabled).map(|path| Frame::control(Kind::Join, path.id,
                     policy_number(scheduler.policy) | if path.metered { 256 } else { 0 }, now(epoch))).collect();
                 send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
             }
             _ = tick.tick() => {
                 let moment = now(epoch);
+                scheduler.counters.queue_drops += writer.deliver(reorder.drain_due(moment));
                 for index in 0..sockets.len() {
                     if !scheduler.paths[index].enabled || moment.saturating_sub(last_reset[index]) < 500 { continue; }
                     if sockets[index].is_none() || !scheduler.paths[index].ready(moment) {
                         last_reset[index] = moment;
-                        if sockets[index].is_none() || scheduler.paths[index].state == "failed" {
+                        // Keep the NAT mapping while probing a temporarily
+                        // silent path. Rebind only after a socket/address error.
+                        if sockets[index].is_none() {
                             sockets[index] = open_subflow(&scheduler.paths[index].name, args.relay, index, sender.clone()).ok();
                         }
                         let id = policy_number(scheduler.policy) | if scheduler.paths[index].metered { 256 } else { 0 };
@@ -350,7 +404,9 @@ async fn client(args: Client) -> Result<()> {
                         if usize::from(frame.path) != index { continue; }
                         if frame.kind == Kind::Data && validate_ipv4(&frame.body, None, Some(assigned)).is_err() { continue; }
                         let (delivery, responses) = scheduler.receive(&frame, now(epoch));
-                        if let Some(delivery) = delivery { tun.send(&delivery).await?; }
+                        if let Some(delivery) = delivery {
+                            scheduler.counters.queue_drops += writer.deliver(reorder.push(delivery, now(epoch)));
+                        }
                         send_client(responses, &mut transport, &mut sockets, &mut scheduler)?;
                     }
                 }
@@ -402,11 +458,15 @@ async fn server(args: Server) -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "Linux relay required");
     let secret = load_secret(&args.secret_file)?;
     let socket = UdpSocket::bind(args.listen).await?;
-    let tun = DeviceBuilder::new()
-        .name(&args.tun_name)
-        .ipv4(Ipv4Addr::from(SERVER_IP), 24, None)
-        .mtu(BOND_MTU as u16)
-        .build_async()?;
+    let tun = Arc::new(
+        DeviceBuilder::new()
+            .name(&args.tun_name)
+            .ipv4(Ipv4Addr::from(SERVER_IP), 24, None)
+            .mtu(BOND_MTU as u16)
+            .build_async()?,
+    );
+    let mut writer = PacketWriter::new(tun.clone());
+    let mut reorder = TcpReorder::default();
     let mut peers: HashMap<[u8; 16], Peer> = HashMap::new();
     let mut wire = [0; MAX_WIRE + 1];
     let mut ip = [0; 65536];
@@ -424,11 +484,15 @@ async fn server(args: Server) -> Result<()> {
     loop {
         tokio::select! {
             _ = &mut stop => break,
+            result = &mut writer.task => { result.context("tunnel writer task")??; anyhow::bail!("tunnel writer stopped"); }
             _ = report.tick() => {
                 peers.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(120));
-                println!("{}", json!({"devices":peers.len(), "healthy_paths":peers.values().map(|peer| peer.scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count()).sum::<usize>()}));
+                println!("{}", json!({"devices":peers.len(), "healthy_paths":peers.values().map(|peer| peer.scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count()).sum::<usize>(),
+                    "clients":peers.values().map(|peer| json!({"ip":Ipv4Addr::from(peer.assigned).to_string(), "paths":peer.scheduler.paths, "counters":peer.scheduler.counters})).collect::<Vec<_>>()}));
             }
-            _ = tick.tick() => {
+            _ = tick.tick(), if !peers.is_empty() => {
+                let dropped = writer.deliver(reorder.drain_due(now(epoch)));
+                if dropped > 0 { eprintln!("Tunnel delivery queue full: {dropped} packets dropped"); }
                 for peer in peers.values_mut() { let frames = peer.scheduler.tick(now(epoch)); send_server(&socket, peer, frames)?; }
             }
             received = socket.recv_from(&mut wire) => {
@@ -474,7 +538,9 @@ async fn server(args: Server) -> Result<()> {
                 if frame.kind == Kind::Close { peers.remove(&header.session); continue; }
                 if frame.kind == Kind::Data && (validate_ipv4(&frame.body, Some(peer.assigned), None).is_err() || !destination_allowed(&frame.body)) { continue; }
                 let (delivery, responses) = peer.scheduler.receive(&frame, now(epoch));
-                if let Some(delivery) = delivery { tun.send(&delivery).await?; }
+                if let Some(delivery) = delivery {
+                    peer.scheduler.counters.queue_drops += writer.deliver(reorder.push(delivery, now(epoch)));
+                }
                 send_server(&socket, peer, responses)?;
             }
             length = tun.recv(&mut ip) => {
@@ -492,5 +558,65 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Mode::Server(args) => server(args).await,
         Mode::Client(args) => client(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_rejoin_is_sent_before_subsequent_probe() -> Result<()> {
+        let secret = [42; 32];
+        let session = [9; 16];
+        let mut initiator = handshake(&secret, &session, true)?;
+        let mut responder = handshake(&secret, &session, false)?;
+        let mut wire = [0; MAX_WIRE];
+        let mut plain = [0; MAX_WIRE];
+        let len = initiator.write_message(&[], &mut wire)?;
+        responder.read_message(&wire[..len], &mut plain)?;
+        let len = responder.write_message(&[], &mut wire)?;
+        initiator.read_message(&wire[..len], &mut plain)?;
+        let mut tx = Transport::new(session, initiator)?;
+        let mut rx = Transport::new(session, responder)?;
+        let server = UdpSocket::bind("127.0.0.1:0").await?;
+        let (sender, _input) = mpsc::channel(8);
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let mut path = open_subflow(name, server.local_addr()?, 0, sender)?;
+        // Model Join retained after WouldBlock on a newly opened socket.
+        path.pending_join = Some(tx.seal(IP, &Frame::control(Kind::Join, 0, 0, 1).encode())?);
+        path.socket.writable().await?;
+        let mut paths = vec![Some(path)];
+        let mut scheduler = Scheduler::new(vec![(name.into(), false)], Policy::Smart)?;
+        send_client(
+            vec![Frame::control(Kind::Probe, 0, 2, 2)],
+            &mut tx,
+            &mut paths,
+            &mut scheduler,
+        )?;
+        for expected in [Kind::Join, Kind::Probe] {
+            let (len, _) =
+                time::timeout(Duration::from_secs(1), server.recv_from(&mut wire)).await??;
+            let (_, bytes) = rx.open(&wire[..len])?;
+            assert_eq!(Frame::decode(&bytes)?.kind, expected);
+        }
+        assert!(paths[0].as_ref().unwrap().pending_join.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocked_tun_writer_cannot_block_the_reactor() {
+        let (sender, _receiver) = mpsc::channel(1024);
+        let writer = PacketWriter {
+            sender,
+            task: tokio::spawn(std::future::pending()),
+        };
+        assert_eq!(writer.deliver(vec![vec![0; 1200]; 2048]), 1024);
+        // No await on the writer is needed to process control/failover work.
+        assert_eq!(writer.deliver(vec![vec![0; 1200]]), 1);
     }
 }

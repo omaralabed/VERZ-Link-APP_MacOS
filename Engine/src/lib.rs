@@ -4,6 +4,7 @@
 //! carries real IPv4 packets between operating-system network interfaces.
 
 pub mod bond;
+pub mod reorder;
 pub mod tunnel;
 
 use std::{

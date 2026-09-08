@@ -21,7 +21,7 @@ struct ActivityEntry: Identifiable {
 }
 
 enum ConnectionState: String {
-    case disconnected = "Disconnected", authorizing = "Waiting for permission"
+    case disconnected = "Disconnected", authorizing = "Starting connection service"
     case connecting = "Connecting", connected = "Connected", reconnecting = "Waiting for networks", disconnecting = "Disconnecting"
 }
 
@@ -36,6 +36,7 @@ struct PathTelemetry: Decodable, Identifiable {
     let receivedBytes: UInt64
     let acknowledgedBytes: UInt64
     let deliveryBps: Double
+    var latencyExcluded: Bool?
 }
 struct BondTelemetry: Decodable {
     let paths: [PathTelemetry]
@@ -86,6 +87,7 @@ final class LinkModel: ObservableObject {
     var busy: Bool { state != .disconnected }
     var canTest: Bool { state == .connected && !testRunning }
     var enabledInterfaces: [LinkInterface] { interfaces.filter { $0.canConnect && !disabledInterfaces.contains($0.name) } }
+    var visibleInterfaces: [LinkInterface] { interfaces.filter(\.isConnected) }
     var hasReadyInterface: Bool { !enabledInterfaces.isEmpty }
     var keyURL: URL { storage.appendingPathComponent("lab-secret") }
 
@@ -336,7 +338,7 @@ final class LinkModel: ObservableObject {
     }
 
     private func configurationData() -> Data {
-        let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "metered": meteredInterfaces.contains($0.name)] }
+        let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "address": $0.address ?? "", "metered": meteredInterfaces.contains($0.name)] }
         return (try? JSONSerialization.data(withJSONObject: ["interfaces": paths, "policy": policy], options: [.sortedKeys])) ?? Data()
     }
 

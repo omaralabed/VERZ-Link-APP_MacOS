@@ -12,8 +12,26 @@ pub const BOND_MTU: usize = 1200;
 pub const MAX_PATHS: usize = 256;
 pub const MAX_PENDING: usize = 4096;
 const PROBE_MS: u64 = 20;
+pub const LATENCY_CUTOFF_MS: f64 = 75.0;
 const PACKET_TTL_MS: u64 = 1000;
 const FRAME_HEADER: usize = 18;
+
+pub fn handshake(
+    secret: &[u8; 32],
+    session: &[u8; 16],
+    initiator: bool,
+) -> Result<snow::HandshakeState> {
+    let mut prologue = b"VERZ Link multipath v1 / authenticated IPv4 lease / MTU1200 / ".to_vec();
+    prologue.extend_from_slice(session);
+    let builder = snow::Builder::new("Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s".parse()?)
+        .psk(0, secret)?
+        .prologue(&prologue)?;
+    Ok(if initiator {
+        builder.build_initiator()?
+    } else {
+        builder.build_responder()?
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -111,6 +129,7 @@ pub struct Path {
     pub in_flight: usize,
     pub congestion_window: usize,
     pub timeouts: u64,
+    pub latency_excluded: bool,
     #[serde(skip)]
     last_response: Option<u64>,
     #[serde(skip)]
@@ -121,6 +140,8 @@ pub struct Path {
     rate_started: u64,
     #[serde(skip)]
     rate_bytes: u64,
+    #[serde(skip)]
+    last_congestion: Option<u64>,
 }
 impl Path {
     fn new(id: u8, name: String, metered: bool) -> Self {
@@ -140,15 +161,22 @@ impl Path {
             in_flight: 0,
             congestion_window: 16 * BOND_MTU,
             timeouts: 0,
+            latency_excluded: false,
             last_response: None,
             good_samples: 0,
             next_send: 0.0,
             rate_started: 0,
             rate_bytes: 0,
+            last_congestion: None,
         }
     }
     pub fn failure_ms(&self) -> u64 {
-        (self.rtt_ms.unwrap_or(30.0) + 4.0 * self.jitter_ms).clamp(35.0, 70.0) as u64
+        // Probes are continuous: detect missing replies, not a high RTT.
+        // Protection/repair is separate from declaring the entire path dead.
+        (3.0 * PROBE_MS as f64 + 4.0 * self.jitter_ms).clamp(60.0, 1000.0) as u64
+    }
+    fn repair_ms(&self) -> u64 {
+        (self.rtt_ms.unwrap_or(30.0) + 4.0 * self.jitter_ms + 20.0).max(70.0) as u64
     }
     pub fn ready(&self, now: u64) -> bool {
         self.enabled
@@ -172,6 +200,11 @@ impl Path {
         self.minimum_rtt_ms = self.minimum_rtt_ms.min(sample);
         self.last_response = Some(now);
         self.good_samples = self.good_samples.saturating_add(1);
+        if self.rtt_ms.unwrap_or(sample) >= LATENCY_CUTOFF_MS {
+            self.latency_excluded = true;
+        } else if self.rtt_ms.unwrap_or(sample) < 65.0 && self.good_samples >= 3 {
+            self.latency_excluded = false;
+        }
         self.state = if self.good_samples < 3 {
             "recovering"
         } else if self.rtt_ms.unwrap_or(sample) - self.minimum_rtt_ms > 15.0 {
@@ -212,6 +245,7 @@ pub struct Scheduler {
     pub counters: Counters,
     pending: BTreeMap<u64, Pending>,
     queued: VecDeque<Vec<u8>>,
+    urgent: VecDeque<Vec<u8>>,
     received: ReplayWindow,
     next_id: u64,
     last_probe: Option<u64>,
@@ -233,19 +267,29 @@ impl Scheduler {
             counters: Counters::default(),
             pending: BTreeMap::new(),
             queued: VecDeque::new(),
+            urgent: VecDeque::new(),
             received: ReplayWindow::new(16384),
             next_id: 0,
             last_probe: None,
         })
     }
     pub fn enqueue(&mut self, ip: Vec<u8>) {
+        let limit = if interactive(&ip) {
+            MAX_PENDING
+        } else {
+            MAX_PENDING - 64
+        };
         if ip.len() > BOND_MTU
             || ip.len() < 20
-            || self.queued.len() + self.pending.len() >= MAX_PENDING
+            || self.queued.len() + self.urgent.len() + self.pending.len() >= limit
         {
             self.counters.queue_drops += 1;
         } else {
-            self.queued.push_back(ip);
+            if interactive(&ip) {
+                self.urgent.push_back(ip);
+            } else {
+                self.queued.push_back(ip);
+            }
         }
     }
     pub fn add_path(&mut self, name: String, metered: bool) -> Result<usize> {
@@ -282,6 +326,7 @@ impl Scheduler {
         path.state = "failed";
         path.good_samples = 0;
         path.last_response = None;
+        path.next_send = 0.0;
         path.congestion_window = (path.congestion_window / 2).max(2 * BOND_MTU);
     }
     pub fn receive(&mut self, frame: &Frame, now: u64) -> (Option<Vec<u8>>, Vec<Frame>) {
@@ -304,18 +349,24 @@ impl Scheduler {
                 (None, Vec::new())
             }
             Kind::Ack => {
-                if !self
-                    .pending
-                    .get(&frame.id)
-                    .is_some_and(|packet| packet.attempts.get(&index) == Some(&frame.stamp))
-                {
+                if !self.pending.get(&frame.id).is_some_and(|packet| {
+                    frame.stamp >= packet.born
+                        && packet
+                            .attempts
+                            .get(&index)
+                            .is_some_and(|&last| frame.stamp <= last)
+                }) {
                     return (None, Vec::new());
                 }
                 if let Some(pending) = self.pending.remove(&frame.id) {
                     // Attribute delivery only once; redundancy never inflates goodput.
-                    if pending.attempts.get(&index) == Some(&frame.stamp) {
+                    {
                         let path = &mut self.paths[index];
-                        path.observe(now, frame.stamp);
+                        // Accept an original copy's ACK after a resend without
+                        // using an ambiguous RTT measurement.
+                        if pending.attempts.get(&index) == Some(&frame.stamp) {
+                            path.observe(now, frame.stamp);
+                        }
                         path.acknowledged_bytes += pending.body.len() as u64;
                         path.rate_bytes += pending.body.len() as u64;
                         path.congestion_window = (path.congestion_window
@@ -361,7 +412,7 @@ impl Scheduler {
             }
         }
     }
-    fn targets(&self, bytes: usize, interactive: bool, now: u64) -> Vec<usize> {
+    pub fn data_paths(&self, now: u64) -> Vec<usize> {
         let mut ready: Vec<_> = self
             .paths
             .iter()
@@ -369,22 +420,32 @@ impl Scheduler {
             .filter(|(_, path)| path.ready(now))
             .map(|(index, _)| index)
             .collect();
-        if self.policy == Policy::DataSaver && ready.iter().any(|&index| !self.paths[index].metered)
-        {
-            ready.retain(|&index| !self.paths[index].metered);
-        }
         ready.sort_by(|&a, &b| {
             self.paths[a]
                 .rtt_ms
                 .unwrap_or(f64::MAX)
                 .total_cmp(&self.paths[b].rtt_ms.unwrap_or(f64::MAX))
         });
-        if let Some(&fastest) = ready.first() {
-            let floor = self.paths[fastest].rtt_ms.unwrap_or(30.0);
-            if !interactive && self.policy != Policy::Performance {
-                ready.retain(|&index| self.paths[index].rtt_ms.unwrap_or(30.0) - floor <= 10.0);
-            }
+        if ready
+            .iter()
+            .any(|&index| !self.paths[index].latency_excluded)
+        {
+            ready.retain(|&index| !self.paths[index].latency_excluded);
+        } else {
+            // If every link is above the limit, preserve basic connectivity
+            // over the best one rather than silently blackholing the Mac.
+            ready.truncate(1);
         }
+        if self.policy == Policy::DataSaver && ready.iter().any(|&index| !self.paths[index].metered)
+        {
+            ready.retain(|&index| !self.paths[index].metered);
+        }
+        ready
+    }
+    fn targets(&self, bytes: usize, interactive: bool, now: u64) -> Vec<usize> {
+        let mut ready = self.data_paths(now);
+        // No relative-RTT cutoff: a 40 ms difference still adds capacity when
+        // both links remain below the explicit 75 ms ceiling.
         ready.retain(|&index| {
             let path = &self.paths[index];
             path.in_flight + bytes <= path.congestion_window && path.next_send <= now as f64
@@ -407,7 +468,9 @@ impl Scheduler {
         }
         packet.attempts.insert(path, now);
         self.paths[path].sent_bytes += packet.body.len() as u64;
-        self.paths[path].next_send = (self.paths[path].next_send.max(now as f64))
+        // Permit bounded catch-up between runtime ticks; otherwise a 2 ms
+        // timer accidentally caps every path at one packet per 2 ms (~4.8 Mbps).
+        self.paths[path].next_send = (self.paths[path].next_send.max(now.saturating_sub(4) as f64))
             + packet.body.len() as f64 / self.paths[path].estimated_bytes_per_ms();
         Frame {
             kind: Kind::Data,
@@ -436,10 +499,17 @@ impl Scheduler {
                 output.push(Frame::control(Kind::Probe, path.id, now, now));
             }
         }
+        let data_paths = self.data_paths(now);
         let due: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, packet)| now.saturating_sub(packet.last_repair) >= 25)
+            .filter(|(_, packet)| {
+                now.saturating_sub(packet.last_repair) >= 2
+                    && packet.attempts.iter().all(|(&index, &stamp)| {
+                        !data_paths.contains(&index)
+                            || now.saturating_sub(stamp) >= self.paths[index].repair_ms()
+                    })
+            })
             .map(|(&id, _)| id)
             .take(64)
             .collect();
@@ -450,22 +520,39 @@ impl Scheduler {
                 self.counters.expired_packets += 1;
                 continue;
             }
-            let candidates = self.targets(packet.body.len(), true, now);
+            let mut candidates = self.targets(packet.body.len(), true, now);
+            // A resend on the same path does not add in-flight bytes. An
+            // exhausted congestion window must not deadlock its own repairs.
+            for &index in packet.attempts.keys() {
+                let path = &self.paths[index];
+                if data_paths.contains(&index)
+                    && path.next_send <= now as f64
+                    && !candidates.contains(&index)
+                {
+                    candidates.push(index);
+                }
+            }
             let target = candidates
                 .iter()
                 .find(|&&index| !packet.attempts.contains_key(&index))
                 .copied()
                 .or_else(|| {
                     candidates.first().copied().filter(|&index| {
-                        now.saturating_sub(*packet.attempts.get(&index).unwrap_or(&0)) >= 70
+                        now.saturating_sub(*packet.attempts.get(&index).unwrap_or(&0))
+                            >= self.paths[index].repair_ms()
                     })
                 });
             if let Some(target) = target {
                 // Congestion responses are bounded and applied on the original
                 // path, while repair uses the surviving path's own pacing.
                 for &index in packet.attempts.keys() {
-                    if index < self.paths.len() && index != target {
+                    if index < self.paths.len()
+                        && self.paths[index].last_congestion.is_none_or(|last| {
+                            now.saturating_sub(last) >= self.paths[index].repair_ms()
+                        })
+                    {
                         self.paths[index].timeouts += 1;
+                        self.paths[index].last_congestion = Some(now);
                         self.paths[index].congestion_window =
                             (self.paths[index].congestion_window / 2).max(2 * BOND_MTU);
                     }
@@ -476,16 +563,28 @@ impl Scheduler {
             packet.last_repair = now;
             self.pending.insert(id, packet);
         }
-        for _ in 0..32 {
-            let Some(body) = self.queued.front() else {
+        // Bounded work per reactor turn, without a ~154 Mbps aggregate cap
+        // imposed by 32 packets at a 2 ms tick.
+        for _ in 0..128 {
+            let queue = if self.urgent.is_empty() {
+                &self.queued
+            } else {
+                &self.urgent
+            };
+            let Some(body) = queue.front() else {
                 break;
             };
-            let interactive = body.get(9) != Some(&6) || body.len() < 600;
-            let targets = self.targets(body.len(), interactive, now);
+            let is_interactive = interactive(body);
+            let targets = self.targets(body.len(), is_interactive, now);
             let Some(&primary) = targets.first() else {
                 break;
             };
-            let body = self.queued.pop_front().expect("checked queue");
+            let body = if self.urgent.is_empty() {
+                self.queued.pop_front()
+            } else {
+                self.urgent.pop_front()
+            }
+            .expect("checked queue");
             let id = self.next_id;
             let Some(next) = id.checked_add(1) else {
                 self.counters.queue_drops += 1;
@@ -499,7 +598,7 @@ impl Scheduler {
                 last_repair: now,
             };
             output.push(self.send_copy(&mut packet, id, primary, now));
-            if interactive && let Some(&alternate) = targets.get(1) {
+            if is_interactive && let Some(&alternate) = targets.get(1) {
                 let recovery = self.paths[primary].failure_ms() as f64
                     + self.paths[alternate].rtt_ms.unwrap_or(100.0)
                     + (self.paths[alternate].in_flight + packet.body.len()) as f64
@@ -518,9 +617,172 @@ impl Scheduler {
     }
 }
 
+fn interactive(ip: &[u8]) -> bool {
+    // Large UDP/QUIC transfers are bulk too. Treating every UDP packet as
+    // interactive duplicated downloads and consumed the capacity being bonded.
+    ip.len() < 600 || ip.get(9) == Some(&1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn unequal_latency() -> Scheduler {
+        let mut s = scheduler(Policy::Smart);
+        for (p, rtt) in s.paths.iter_mut().zip([20.0, 60.0]) {
+            p.rtt_ms = Some(rtt);
+            p.minimum_rtt_ms = rtt;
+            p.jitter_ms = 0.0;
+            p.last_response = Some(100);
+        }
+        s
+    }
+    #[test]
+    fn seventy_five_ms_path_is_probe_only_until_stable_recovery() {
+        let mut s = unequal_latency();
+        s.paths[1].rtt_ms = Some(75.0);
+        s.receive(&Frame::control(Kind::Pong, 1, 100, 25), 100);
+        assert_eq!(s.data_paths(100), vec![0]);
+        assert!(
+            s.tick(100)
+                .iter()
+                .any(|f| f.kind == Kind::Probe && f.path == 1)
+        );
+        for now in 101..120 {
+            s.receive(&Frame::control(Kind::Pong, 1, now, now - 40), now);
+        }
+        assert!(s.data_paths(120).contains(&1));
+    }
+    #[test]
+    fn all_high_latency_keeps_best_last_resort_instead_of_blackholing() {
+        let mut s = unequal_latency();
+        for p in &mut s.paths {
+            p.latency_excluded = true;
+        }
+        assert_eq!(s.data_paths(100), vec![0]);
+    }
+    fn bulk() -> Vec<u8> {
+        let mut p = vec![0; 1200];
+        p[0] = 0x45;
+        p[9] = 6;
+        p
+    }
+    #[test]
+    fn large_quic_packets_do_not_consume_protection_capacity() {
+        let mut p = bulk();
+        p[9] = 17;
+        assert!(!interactive(&p));
+        let mut s = unequal_latency();
+        s.enqueue(p);
+        assert_eq!(
+            s.tick(100).iter().filter(|f| f.kind == Kind::Data).count(),
+            1
+        );
+    }
+    #[test]
+    fn smart_uses_bulk_capacity_with_forty_ms_rtt_difference() {
+        let mut s = unequal_latency();
+        for _ in 0..100 {
+            s.enqueue(bulk());
+        }
+        let sent = s.tick(100);
+        for path in [0, 1] {
+            assert!(
+                sent.iter()
+                    .any(|frame| frame.kind == Kind::Data && frame.path == path)
+            );
+        }
+    }
+    #[test]
+    fn healthy_slower_path_is_not_penalized_before_its_rtt() {
+        let mut s = unequal_latency();
+        s.fail_path(0);
+        s.enqueue(bulk());
+        let frame = s
+            .tick(100)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap();
+        assert_eq!(frame.path, 1);
+        s.tick(140);
+        assert_eq!(s.counters.repairs, 0);
+        assert_eq!(s.paths[1].timeouts, 0);
+        s.receive(&Frame::control(Kind::Ack, 1, frame.id, frame.stamp), 160);
+        assert_eq!(s.pending_packets(), 0);
+    }
+    #[test]
+    fn full_surviving_window_can_retransmit_instead_of_deadlocking() {
+        let mut s = unequal_latency();
+        s.fail_path(0);
+        s.paths[1].congestion_window = BOND_MTU;
+        s.enqueue(bulk());
+        s.tick(100);
+        assert_eq!(s.paths[1].in_flight, BOND_MTU);
+        s.paths[1].last_response = Some(180);
+        assert!(
+            s.tick(181)
+                .iter()
+                .any(|f| f.kind == Kind::Data && f.path == 1)
+        );
+    }
+    #[test]
+    fn removed_low_latency_link_repairs_over_slower_link_immediately() {
+        let mut s = unequal_latency();
+        s.enqueue(bulk());
+        let first = s
+            .tick(100)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap();
+        assert_eq!(first.path, 0);
+        s.remove_path(0);
+        assert!(
+            s.tick(102)
+                .iter()
+                .any(|f| f.kind == Kind::Data && f.path == 1 && f.id == first.id)
+        );
+    }
+    #[test]
+    fn original_ack_after_resend_still_releases_pending_packet() {
+        let mut scheduler = scheduler(Policy::Smart);
+        scheduler.enqueue(packet());
+        let original = scheduler
+            .tick(31)
+            .into_iter()
+            .find(|frame| frame.kind == Kind::Data)
+            .unwrap();
+        scheduler
+            .pending
+            .get_mut(&original.id)
+            .unwrap()
+            .attempts
+            .insert(original.path as usize, 101);
+        scheduler.receive(
+            &Frame::control(Kind::Ack, original.path, original.id, original.stamp),
+            150,
+        );
+        assert_eq!(scheduler.pending_packets(), 0);
+        assert_eq!(
+            scheduler.paths[original.path as usize].acknowledged_bytes,
+            100
+        );
+    }
+    #[test]
+    fn interactive_packets_do_not_wait_behind_queued_bulk() {
+        let mut scheduler = scheduler(Policy::Smart);
+        let mut bulk = vec![0; 1200];
+        bulk[0] = 0x45;
+        bulk[9] = 6;
+        for _ in 0..100 {
+            scheduler.enqueue(bulk.clone());
+        }
+        scheduler.enqueue(packet());
+        let first = scheduler
+            .tick(31)
+            .into_iter()
+            .find(|frame| frame.kind == Kind::Data)
+            .unwrap();
+        assert_eq!(first.body.len(), 100);
+    }
     fn scheduler(policy: Policy) -> Scheduler {
         let mut scheduler = Scheduler::new(
             vec![("wifi".into(), false), ("ethernet".into(), false)],
@@ -614,7 +876,7 @@ mod tests {
         for _ in 0..MAX_PENDING + 10 {
             scheduler.enqueue(packet());
         }
-        assert_eq!(scheduler.queued.len(), MAX_PENDING);
+        assert_eq!(scheduler.queued.len() + scheduler.urgent.len(), MAX_PENDING);
         assert_eq!(scheduler.counters.queue_drops, 10);
         assert!(
             !scheduler

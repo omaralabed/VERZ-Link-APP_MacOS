@@ -29,6 +29,15 @@ impl NetworkGuard {
             tun.starts_with("utun") && tun.chars().all(|c| c.is_ascii_alphanumeric()),
             "invalid tunnel interface"
         );
+        let internet_route = run("/sbin/route", &["-n", "get", "1.1.1.1"])?;
+        let current = internet_route
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
+            .unwrap_or("");
+        ensure!(
+            !current.starts_with("utun") && !current.starts_with("tun"),
+            "another VPN currently owns internet routing; verified VPN-underlay coexistence is not available in this build"
+        );
         let mut guard = Self::default();
         let mut configured = 0;
         for interface in physical {
@@ -64,7 +73,23 @@ impl NetworkGuard {
             .map(|s| (*s).to_owned())
             .collect();
         if self.routes.contains(&desired) {
-            return Ok(());
+            // macOS may remove interface-scoped routes on unplug. A record
+            // in our cleanup ledger is not proof that the route still exists.
+            let existing =
+                run("/sbin/route", &["-n", "get", "-ifscope", physical, relay]).unwrap_or_default();
+            let field = |key: &str| {
+                existing
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
+                    .unwrap_or("")
+            };
+            if field("destination:") == relay
+                && field("gateway:") == gateway
+                && field("interface:") == physical
+            {
+                return Ok(());
+            }
+            self.routes.retain(|route| route != &desired);
         }
         if let Some(index) = self.routes.iter().position(|route| {
             route.first().map(String::as_str) == Some("-host")
