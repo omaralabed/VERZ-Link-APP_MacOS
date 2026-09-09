@@ -37,20 +37,98 @@ struct PacketWriter {
 }
 impl PacketWriter {
     fn new(tun: Arc<AsyncDevice>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
-        let task = tokio::spawn(async move {
-            while let Some(packet) = receiver.recv().await {
-                tun.send(&packet).await?;
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>(1024);
+        let task = tokio::spawn(run_packet_writer(receiver, move |packet| {
+            let tun = tun.clone();
+            async move {
+                let written = tun.send(&packet).await?;
+                if written != packet.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "short TUN packet write",
+                    ));
+                }
+                Ok(())
             }
-            Ok(())
-        });
+        }));
         Self { sender, task }
     }
-    fn deliver(&self, packets: Vec<Vec<u8>>) -> u64 {
-        packets.into_iter().fold(0, |dropped, packet| {
-            dropped + u64::from(self.sender.try_send(packet).is_err())
-        })
+}
+
+// One bounded admission queue owns packets before they are acknowledged.
+// Reordering lives in the writer: released bursts go straight to the TUN,
+// never through a smaller, lossy intermediate channel. Memory remains bounded
+// by 1,024 admitted packets plus TcpReorder's 8,192-packet global bound.
+async fn run_packet_writer<F, Fut>(
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    mut write: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut reorder = TcpReorder::default();
+    let epoch = Instant::now();
+    let mut tick = time::interval(Duration::from_millis(2));
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    loop {
+        let packets = tokio::select! {
+            packet = receiver.recv() => match packet {
+                Some(packet) => reorder.push(packet, now(epoch)),
+                None => return Ok(()),
+            },
+            _ = tick.tick() => reorder.drain_due(now(epoch)),
+        };
+        write_batch(packets, &mut write).await?;
     }
+}
+
+async fn write_batch<F, Fut>(packets: Vec<Vec<u8>>, write: &mut F) -> std::io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    for (index, packet) in packets.into_iter().enumerate() {
+        write(packet).await?;
+        // Ready writes must not monopolize the single-thread reactor during
+        // a large gap release. Probe, control, and ACK tasks get regular turns.
+        if index % 32 == 31 {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+fn receive_to_writer(
+    scheduler: &mut Scheduler,
+    writer: &PacketWriter,
+    frame: &Frame,
+    moment: u64,
+) -> Result<Vec<Frame>> {
+    let permit = if frame.kind == Kind::Data && !scheduler.has_received(frame.id) {
+        match writer.sender.try_reserve() {
+            Ok(permit) => Some(permit),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                scheduler.counters.receive_backpressure += 1;
+                // No ACK and no receive/replay marking: an outer retry remains
+                // eligible once space is available. Never await a blocked TUN
+                // from the network/control reactor.
+                return Ok(Vec::new());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("tunnel admission queue closed")
+            }
+        }
+    } else {
+        None
+    };
+    let (delivery, responses) = scheduler.receive(frame, moment);
+    if let Some(packet) = delivery {
+        permit
+            .context("new packet has no reserved delivery capacity")?
+            .send(packet);
+    }
+    Ok(responses)
 }
 impl Drop for PacketWriter {
     fn drop(&mut self) {
@@ -264,6 +342,7 @@ fn send_client(
         let packet = transport.seal(IP, &frame.encode())?;
         if let Err(error) = path.socket.try_send(&packet) {
             if error.kind() == std::io::ErrorKind::WouldBlock {
+                scheduler.counters.socket_backpressure += 1;
                 if frame.kind == Kind::Join {
                     path.pending_join = Some(packet);
                 }
@@ -316,7 +395,6 @@ async fn client(args: Client) -> Result<()> {
             .context("create multipath system tunnel")?,
     );
     let mut writer = PacketWriter::new(tun.clone());
-    let mut reorder = TcpReorder::default();
     let epoch = Instant::now();
     let mut last_reset = vec![0_u64; sockets.len()];
     let mut interface_addresses: HashMap<String, String> = HashMap::new();
@@ -396,7 +474,6 @@ async fn client(args: Client) -> Result<()> {
                 let moment = now(epoch);
                 let acknowledgements = sockets.iter_mut().flatten().flat_map(|path| path.acks.drain()).collect();
                 send_client(acknowledgements, &mut transport, &mut sockets, &mut scheduler)?;
-                scheduler.counters.queue_drops += writer.deliver(reorder.drain_due(moment));
                 for index in 0..sockets.len() {
                     if !scheduler.paths[index].enabled || moment.saturating_sub(last_reset[index]) < 500 { continue; }
                     if sockets[index].is_none() || !scheduler.paths[index].ready(moment) {
@@ -429,10 +506,7 @@ async fn client(args: Client) -> Result<()> {
                         if frame.kind == Kind::JoinAck && frame.id & FEATURE_ACK_BATCH != 0
                             && let Some(path) = sockets[index].as_mut() { path.ack_batching = true; }
                         if frame.kind == Kind::Data && validate_ipv4(&frame.body, None, Some(assigned)).is_err() { continue; }
-                        let (delivery, responses) = scheduler.receive(&frame, now(epoch));
-                        if let Some(delivery) = delivery {
-                            scheduler.counters.queue_drops += writer.deliver(reorder.push(delivery, now(epoch)));
-                        }
+                        let responses = receive_to_writer(&mut scheduler, &writer, &frame, now(epoch))?;
                         send_client(responses, &mut transport, &mut sockets, &mut scheduler)?;
                     }
                 }
@@ -481,10 +555,12 @@ fn send_server(socket: &UdpSocket, peer: &mut Peer, frames: Vec<Frame>) -> Resul
             .flatten()
         {
             let packet = peer.transport.seal(IP, &frame.encode())?;
-            if let Err(error) = socket.try_send_to(&packet, address)
-                && error.kind() != std::io::ErrorKind::WouldBlock
-            {
-                peer.scheduler.fail_path(usize::from(frame.path));
+            if let Err(error) = socket.try_send_to(&packet, address) {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    peer.scheduler.counters.socket_backpressure += 1;
+                } else {
+                    peer.scheduler.fail_path(usize::from(frame.path));
+                }
             }
         }
     }
@@ -503,7 +579,6 @@ async fn server(args: Server) -> Result<()> {
             .build_async()?,
     );
     let mut writer = PacketWriter::new(tun.clone());
-    let mut reorder = TcpReorder::default();
     let mut peers: HashMap<[u8; 16], Peer> = HashMap::new();
     let mut wire = [0; MAX_WIRE + 1];
     let mut ip = [0; 65536];
@@ -528,8 +603,6 @@ async fn server(args: Server) -> Result<()> {
                     "clients":peers.values().map(|peer| json!({"ip":Ipv4Addr::from(peer.assigned).to_string(), "ack_batching":peer.ack_batching, "paths":peer.scheduler.paths, "counters":peer.scheduler.counters})).collect::<Vec<_>>()}));
             }
             _ = tick.tick(), if !peers.is_empty() => {
-                let dropped = writer.deliver(reorder.drain_due(now(epoch)));
-                if dropped > 0 { eprintln!("Tunnel delivery queue full: {dropped} packets dropped"); }
                 for peer in peers.values_mut() {
                     let mut frames = peer.acks.drain();
                     frames.extend(peer.scheduler.tick(now(epoch)));
@@ -580,12 +653,9 @@ async fn server(args: Server) -> Result<()> {
                 peer.last_seen = Instant::now();
                 if frame.kind == Kind::Close { peers.remove(&header.session); continue; }
                 if frame.kind == Kind::Data && (validate_ipv4(&frame.body, Some(peer.assigned), None).is_err() || !destination_allowed(&frame.body)) { continue; }
-                let (delivery, mut responses) = peer.scheduler.receive(&frame, now(epoch));
+                let mut responses = receive_to_writer(&mut peer.scheduler, &writer, &frame, now(epoch))?;
                 if frame.kind == Kind::Join && peer.ack_batching {
                     for response in &mut responses { response.kind = Kind::JoinAck; }
-                }
-                if let Some(delivery) = delivery {
-                    peer.scheduler.counters.queue_drops += writer.deliver(reorder.push(delivery, now(epoch)));
                 }
                 send_server(&socket, peer, responses)?;
             }
@@ -655,14 +725,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_tun_writer_cannot_block_the_reactor() {
-        let (sender, _receiver) = mpsc::channel(1024);
+    async fn blocked_tun_writer_refuses_before_ack_and_accepts_retry() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
         let writer = PacketWriter {
             sender,
             task: tokio::spawn(std::future::pending()),
         };
-        assert_eq!(writer.deliver(vec![vec![0; 1200]; 2048]), 1024);
-        // No await on the writer is needed to process control/failover work.
-        assert_eq!(writer.deliver(vec![vec![0; 1200]]), 1);
+        let mut scheduler = Scheduler::new(vec![("one-source".into(), false)], Policy::Smart)?;
+        let first = data(0);
+        let next = data(1);
+        assert_eq!(
+            receive_to_writer(&mut scheduler, &writer, &first, 0)?.len(),
+            1
+        );
+        assert!(receive_to_writer(&mut scheduler, &writer, &next, 1)?.is_empty());
+        assert!(!scheduler.has_received(1));
+        assert_eq!(scheduler.counters.receive_backpressure, 1);
+        assert_eq!(scheduler.counters.delivered_packets, 1);
+        // Existing ACKs and health probes do not require a free data slot.
+        assert_eq!(
+            receive_to_writer(&mut scheduler, &writer, &first, 2)?.len(),
+            1
+        );
+        let probe = Frame::control(Kind::Probe, 0, 7, 2);
+        assert_eq!(
+            receive_to_writer(&mut scheduler, &writer, &probe, 2)?[0].kind,
+            Kind::Pong
+        );
+        assert_eq!(receiver.try_recv()?, first.body);
+        assert_eq!(
+            receive_to_writer(&mut scheduler, &writer, &next, 70)?.len(),
+            1
+        );
+        assert_eq!(receiver.try_recv()?, next.body);
+        assert_eq!(scheduler.counters.delivered_packets, 2);
+        assert_eq!(scheduler.counters.queue_drops, 0);
+        Ok(())
+    }
+
+    fn data(id: u64) -> Frame {
+        let mut ip = vec![0; 140];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&140_u16.to_be_bytes());
+        ip[9] = 6;
+        ip[32] = 0x50;
+        ip[24..28].copy_from_slice(&(id as u32 * 100).to_be_bytes());
+        Frame {
+            kind: Kind::Data,
+            path: 0,
+            id,
+            stamp: 0,
+            body: ip,
+        }
+    }
+
+    #[tokio::test]
+    async fn reordered_burst_larger_than_admission_queue_is_written_without_loss() -> Result<()> {
+        let mut reorder = TcpReorder::default();
+        assert_eq!(reorder.push(data(0).body, 0).len(), 1);
+        for id in 2..1500 {
+            assert!(reorder.push(data(id).body, 1).is_empty());
+        }
+        let burst = reorder.push(data(1).body, 41);
+        assert_eq!(burst.len(), 1499);
+        let mut written = Vec::new();
+        write_batch(burst, &mut |packet| {
+            written.push(packet);
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        assert_eq!(
+            written,
+            (1..1500).map(|id| data(id).body).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_budget_is_shared_between_clients_without_false_acks() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let writer = PacketWriter {
+            sender,
+            task: tokio::spawn(std::future::pending()),
+        };
+        let mut a = Scheduler::new(vec![("a".into(), false)], Policy::Smart)?;
+        let mut b = Scheduler::new(vec![("b".into(), false)], Policy::Smart)?;
+        assert_eq!(receive_to_writer(&mut a, &writer, &data(0), 0)?.len(), 1);
+        assert!(receive_to_writer(&mut b, &writer, &data(0), 1)?.is_empty());
+        assert!(!b.has_received(0));
+        receiver.try_recv()?;
+        assert_eq!(receive_to_writer(&mut b, &writer, &data(0), 2)?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_failure_is_reported_not_silently_discarded() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(data(0).body).await.unwrap();
+        let error = run_packet_writer(receiver, |_| {
+            std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test TUN failure",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn closed_writer_does_not_acknowledge_or_mark_new_data() -> Result<()> {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let writer = PacketWriter {
+            sender,
+            task: tokio::spawn(std::future::pending()),
+        };
+        let mut scheduler = Scheduler::new(vec![("one-source".into(), false)], Policy::Smart)?;
+        assert!(receive_to_writer(&mut scheduler, &writer, &data(0), 0).is_err());
+        assert!(!scheduler.has_received(0));
+        Ok(())
     }
 }

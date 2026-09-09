@@ -314,6 +314,9 @@ pub struct Counters {
     pub repairs: u64,
     pub protection_copies: u64,
     pub queue_drops: u64,
+    /// New packets refused before acknowledgement; the sender may retry them.
+    pub receive_backpressure: u64,
+    pub socket_backpressure: u64,
     pub expired_packets: u64,
     pub path_failures: u64,
 }
@@ -394,6 +397,9 @@ impl Scheduler {
     }
     pub fn pending_packets(&self) -> usize {
         self.pending.len()
+    }
+    pub fn has_received(&self, id: u64) -> bool {
+        self.received.contains(id)
     }
     pub fn fail_path(&mut self, path: usize) {
         let Some(path) = self.paths.get_mut(path) else {

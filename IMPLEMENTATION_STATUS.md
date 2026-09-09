@@ -36,6 +36,12 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
   congestion backoff driven by data repair, not idle heartbeat failure alone.
 - Negotiated ACK batching with individual delivery IDs/timestamps preserved;
   older clients and relays retain the original single-ACK behavior.
+- Version 0.2.3 reserves bounded delivery capacity before acknowledging new
+  data. Reordering now lives in the TUN writer, so released bursts cannot
+  overflow a smaller intermediate channel. Backpressure leaves packets
+  unacknowledged and eligible for outer repair, without blocking the reactor.
+- Separate receive-admission and UDP socket backpressure counters; the existing
+  queue_drops counter now describes outbound scheduler admission drops.
 - UI control writes and TUN delivery cannot block the failover/UI event loops.
 - Connected-only interface list, including carrier present before DHCP completes.
 - Signed SMAppService/XPC launcher replacing per-connection AppleScript.
@@ -44,7 +50,8 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 
 ## Verified on September 8, 2026
 
-- 36 Rust library tests plus 2 runtime regression tests; Rust clippy clean.
+- 36 Rust library tests plus 6 runtime regression tests pass on macOS and
+  release Linux; Rust clippy clean on macOS.
 - 7 Swift tests pass; universal app and helper signatures verified.
 - Controlled isolated Linux test: one 30.97 MB TCP transfer survived two link
   cuts with matching SHA-256; 650/650 ICMP replies, maximum reply gap 46.105 ms.
@@ -73,8 +80,17 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
   streams measured aggregate 256.91 Mbps down / 162.20 Mbps up. This does not
   establish the user's 300+ Mbps target or eliminate the remaining regression.
 - Mixed-version client/relay interoperability preserved TCP/hash integrity in
-  both directions. Latest virtual cut test also preserved TCP/hash integrity,
+  both directions. The version 0.2.2 virtual cut test preserved TCP/hash integrity,
   but its 100.572 ms maximum ICMP reply gap does not pass a strict 100 ms gate.
+- Version 0.2.3 virtual cut retest: matching TCP SHA-256, 650/650 ICMP replies,
+  maximum observed reply gap 73.441 ms. This is one controlled run, not a
+  physical Mac unplug or universal 100 ms acceptance claim.
+- Deployed 0.2.3 Mac/relay: both-adapter and Ethernet-only private TCP/hash
+  checks pass; respective single-stream downloads 202.84 and 231.64 Mbps.
+  Uploads range 151.31-168.61 and 170.03-188.06 Mbps. Relay outbound queue
+  drops and kernel UDP receive drops remained zero in these intervals;
+  receive admission backpressure is tracked separately and preserves retry.
+  These runs do not establish 300+ Mbps or repeatable no-regression throughput.
 
 ## Known open user issues
 
