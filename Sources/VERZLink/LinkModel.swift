@@ -25,6 +25,25 @@ enum ConnectionState: String {
     case connecting = "Connecting", connected = "Connected", reconnecting = "Waiting for networks", disconnecting = "Disconnecting"
 }
 
+enum TransportMode: String, CaseIterable, Identifiable {
+    case direct, hybrid, secure
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .direct: "Direct Smart"
+        case .hybrid: "Automatic Hybrid"
+        case .secure: "Secure Continuity"
+        }
+    }
+    var badge: String {
+        switch self {
+        case .direct: "DIRECT SMART"
+        case .hybrid: "HYBRID PREVIEW"
+        case .secure: "SECURE LINK"
+        }
+    }
+}
+
 struct PathTelemetry: Decodable, Identifiable {
     let id: Int
     let name: String
@@ -68,12 +87,14 @@ final class LinkModel: ObservableObject {
     @Published var uptime = 0
     @Published var selectedPage = "Connection"
     @Published var policy = "smart" { didSet { configurationChanged() } }
+    @Published var mode = TransportMode.direct { didSet { configurationChanged() } }
     @Published var disabledInterfaces = Set<String>()
     @Published var meteredInterfaces = Set<String>()
     @Published var bondTelemetry: BondTelemetry?
     @Published var privateServerIP = "10.78.0.1"
     private var connectedAt: Date?
-    private var lastCounters: (UInt64, UInt64, Date)?
+    private var lastInterfaceCounters: [String: (UInt64, UInt64)] = [:]
+    private var lastSampleAt: Date?
     private var timer: Timer?
     private var interfaceMonitor: InterfaceMonitor?
     private var session: TunnelSession?
@@ -81,11 +102,12 @@ final class LinkModel: ObservableObject {
     private var testTask: Task<Void, Never>?
     private var sessionID = UUID()
     private var restorationFailed = false
+    private var proxyEndpoint: String?
     var whenDisconnected: (() -> Void)?
 
     let storage: URL
     var busy: Bool { state != .disconnected }
-    var canTest: Bool { state == .connected && !testRunning }
+    var canTest: Bool { state == .connected && mode == .secure && !testRunning }
     var enabledInterfaces: [LinkInterface] { interfaces.filter { $0.canConnect && !disabledInterfaces.contains($0.name) } }
     var visibleInterfaces: [LinkInterface] { interfaces.filter(\.isConnected) }
     var hasReadyInterface: Bool { !enabledInterfaces.isEmpty }
@@ -101,6 +123,7 @@ final class LinkModel: ObservableObject {
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
         policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "smart"
+        mode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "direct") ?? .direct
         if let value = UserDefaults.standard.string(forKey: "interface") { selectedInterface = value }
         hasCredential = validSecret((try? Data(contentsOf: keyURL)) ?? Data())
         if let data = try? Data(contentsOf: storage.appendingPathComponent("last-test.json")) {
@@ -128,27 +151,29 @@ final class LinkModel: ObservableObject {
         guard hasReadyInterface else {
             errorMessage = "No usable uplink. Connect Wi-Fi or Ethernet and wait for an IPv4 address."; return
         }
-        let parts = relay.split(separator: ":")
-        var address = in_addr()
-        guard parts.count == 2, inet_pton(AF_INET, String(parts[0]), &address) == 1,
-              let port = Int(parts[1]), (1...65535).contains(port),
-              selectedInterface.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }),
-              !selectedInterface.isEmpty else {
-            errorMessage = "Enter an IPv4 server address and port, and select an active network."; return
-        }
-        guard let secret = try? Data(contentsOf: keyURL), validSecret(secret) else {
-            errorMessage = "Import your VERZ connection key in Settings first."; selectedPage = "Settings"; return
+        var secret = Data()
+        if mode == .secure {
+            let parts = relay.split(separator: ":")
+            var address = in_addr()
+            guard parts.count == 2, inet_pton(AF_INET, String(parts[0]), &address) == 1,
+                  let port = Int(parts[1]), (1...65535).contains(port) else {
+                errorMessage = "Enter a valid Secure Continuity relay IPv4 address and port."; return
+            }
+            guard let installed = try? Data(contentsOf: keyURL), validSecret(installed) else {
+                errorMessage = "Import your Secure Continuity key in Settings first."; selectedPage = "Settings"; return
+            }
+            secret = installed
         }
         UserDefaults.standard.set(relay, forKey: "relay")
         UserDefaults.standard.set(selectedInterface, forKey: "interface")
         state = .authorizing
         restorationFailed = false
-        publicIP = nil; samples = []; lastCounters = nil; bondTelemetry = nil
+        publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
         sessionID = UUID()
         let identifier = sessionID
         let names = enabledInterfaces.map(\.name)
-        log("Connecting to \(relay) using \(names.joined(separator: ", ")) · \(policy)")
+        log("Starting \(mode.title) using \(names.joined(separator: ", ")) · \(policy)")
         do {
             session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: policy, configuration: configurationData()) { [weak self] event in
                 Task { @MainActor in
@@ -176,15 +201,24 @@ final class LinkModel: ObservableObject {
         case "connected":
             guard state != .disconnecting else { session?.disconnect(); return }
             state = .connected; connectedAt = Date(); uptime = 0
-            tunnelInterface = event.line?.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
-            log("Connected · Mac traffic and DNS routed through VERZ")
+            let endpoint = event.line?.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
+            if mode == .secure {
+                tunnelInterface = endpoint
+                log("Secure Continuity connected · traffic and DNS routed through the encrypted relay")
+            } else {
+                proxyEndpoint = endpoint
+                tunnelInterface = ""
+                log("\(mode.title) connected · TCP flows go directly to their destinations")
+                if mode == .hybrid { log("Hybrid preview uses Direct Smart; selective relay escalation is not enabled yet") }
+            }
             let token = sessionID
             Task { [weak self] in
-                let ip = await Self.fetchPublicIP()
+                let ip = await Self.fetchPublicIP(proxy: self?.mode == .secure ? nil : self?.proxyEndpoint)
                 guard let self, self.state == .connected, self.sessionID == token else { return }
                 self.publicIP = ip
-                self.log(ip.map { "Public IPv4 through VERZ: \($0)" } ?? "Public IP check unavailable; tunnel remains connected")
-                if let ip, ip != self.relay.split(separator: ":").first.map(String.init) {
+                self.log(ip.map { self.mode == .secure ? "Public IPv4 through relay: \($0)" : "Direct public IPv4: \($0)" }
+                    ?? "Public IP check unavailable; connection remains active")
+                if self.mode == .secure, let ip, ip != self.relay.split(separator: ":").first.map(String.init) {
                     self.errorMessage = "Public IP does not match the relay. Verify routing before relying on this connection."
                 }
             }
@@ -193,7 +227,8 @@ final class LinkModel: ObservableObject {
                 let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
                 if let report = try? decoder.decode(BondTelemetry.self, from: data) {
                     let previous = bondTelemetry
-                    bondTelemetry = report; privateServerIP = report.serverIp
+                    bondTelemetry = report
+                    if !report.serverIp.isEmpty { privateServerIP = report.serverIp }
                     for path in report.paths {
                         if previous?.paths.first(where: { $0.name == path.name })?.state != path.state {
                             log("\(path.name): \(path.state)")
@@ -214,7 +249,7 @@ final class LinkModel: ObservableObject {
             errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
             log(errorMessage!)
         case "session_ended":
-            state = .disconnected; tunnelInterface = ""; connectedAt = nil; uptime = 0
+            state = .disconnected; tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
             runner?.cancel(); testTask?.cancel(); testRunning = false
             session = nil; receivedMbps = 0; sentMbps = 0; publicIP = nil
             refreshInterfaces()
@@ -339,11 +374,12 @@ final class LinkModel: ObservableObject {
 
     private func configurationData() -> Data {
         let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "address": $0.address ?? "", "metered": meteredInterfaces.contains($0.name)] }
-        return (try? JSONSerialization.data(withJSONObject: ["interfaces": paths, "policy": policy], options: [.sortedKeys])) ?? Data()
+        return (try? JSONSerialization.data(withJSONObject: ["interfaces": paths, "policy": policy, "mode": mode.rawValue], options: [.sortedKeys])) ?? Data()
     }
 
     private func configurationChanged() {
         UserDefaults.standard.set(policy, forKey: "bondPolicy")
+        UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
         session?.updateConfiguration(configurationData())
     }
 
@@ -354,33 +390,45 @@ final class LinkModel: ObservableObject {
         guard getifaddrs(&list) == 0 else { return }
         defer { freeifaddrs(list) }
         var cursor = list
+        let monitored = mode == .secure ? Set([tunnelInterface]) : Set(enabledInterfaces.map(\.name))
+        var current: [String: (UInt64, UInt64)] = [:]
         while let pointer = cursor {
             let item = pointer.pointee
             defer { cursor = item.ifa_next }
-            guard String(cString: item.ifa_name) == tunnelInterface,
+            let name = String(cString: item.ifa_name)
+            guard monitored.contains(name),
                   item.ifa_addr?.pointee.sa_family == UInt8(AF_LINK), let data = item.ifa_data else { continue }
             let counters = data.assumingMemoryBound(to: if_data.self).pointee
-            let received = UInt64(counters.ifi_ibytes), sent = UInt64(counters.ifi_obytes)
-            let now = Date()
-            if let (oldIn, oldOut, previous) = lastCounters {
-                let seconds = max(now.timeIntervalSince(previous), 0.01)
-                receivedMbps = Double(received >= oldIn ? received - oldIn : 0) * 8 / seconds / 1_000_000
-                sentMbps = Double(sent >= oldOut ? sent - oldOut : 0) * 8 / seconds / 1_000_000
-            }
-            receivedBytes = received; sentBytes = sent; lastCounters = (received, sent, now)
-            samples.append(TrafficSample(received: receivedMbps, sent: sentMbps))
-            if samples.count > 60 { samples.removeFirst(samples.count - 60) }
-            break
+            current[name] = (UInt64(counters.ifi_ibytes), UInt64(counters.ifi_obytes))
         }
+        let now = Date()
+        var receivedDelta: UInt64 = 0
+        var sentDelta: UInt64 = 0
+        let previousCounters = lastInterfaceCounters
+        for (name, counters) in current {
+            if let old = previousCounters[name] {
+                receivedDelta += counters.0 >= old.0 ? counters.0 - old.0 : 0
+                sentDelta += counters.1 >= old.1 ? counters.1 - old.1 : 0
+            }
+        }
+        lastInterfaceCounters = current
+        let seconds = max(lastSampleAt.map { now.timeIntervalSince($0) } ?? 1, 0.01)
+        receivedMbps = Double(receivedDelta) * 8 / seconds / 1_000_000
+        sentMbps = Double(sentDelta) * 8 / seconds / 1_000_000
+        receivedBytes += receivedDelta; sentBytes += sentDelta; lastSampleAt = now
+        samples.append(TrafficSample(received: receivedMbps, sent: sentMbps))
+        if samples.count > 60 { samples.removeFirst(samples.count - 60) }
     }
 
-    nonisolated private static func fetchPublicIP() async -> String? {
+    nonisolated private static func fetchPublicIP(proxy: String?) async -> String? {
         // A new curl process has no pre-VPN keep-alive connection to reuse.
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async {
                 let process = Process(); let pipe = Pipe()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                process.arguments = ["-4", "--silent", "--fail", "--noproxy", "*", "--max-time", "10", "https://api.ipify.org"]
+                process.arguments = ["-4", "--silent", "--fail", "--max-time", "10"]
+                    + (proxy.map { ["--socks5-hostname", $0] } ?? ["--noproxy", "*"])
+                    + ["https://api.ipify.org"]
                 process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
                 do {
                     try process.run()

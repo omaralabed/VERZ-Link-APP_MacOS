@@ -4,6 +4,7 @@
 //! carries real IPv4 packets between operating-system network interfaces.
 
 pub mod bond;
+pub mod direct;
 pub mod reorder;
 pub mod tunnel;
 
@@ -499,7 +500,14 @@ pub fn configure_udp_buffers(socket: &impl std::os::fd::AsRawFd) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn bind_ipv4_interface(socket: &StdUdpSocket, interface: &str) -> Result<()> {
-    use std::{ffi::CString, os::fd::AsRawFd};
+    use std::os::fd::AsRawFd;
+
+    bind_ipv4_interface_fd(socket.as_raw_fd(), interface)
+}
+
+#[cfg(target_os = "macos")]
+pub fn bind_ipv4_interface_fd(fd: std::os::fd::RawFd, interface: &str) -> Result<()> {
+    use std::ffi::CString;
 
     let name = CString::new(interface).context("interface name contains a NUL byte")?;
     // SAFETY: name is a valid NUL-terminated C string for this call.
@@ -512,7 +520,7 @@ fn bind_ipv4_interface(socket: &StdUdpSocket, interface: &str) -> Result<()> {
     // duration of setsockopt. IP_BOUND_IF is the macOS IPv4 interface option.
     let result = unsafe {
         libc::setsockopt(
-            socket.as_raw_fd(),
+            fd,
             libc::IPPROTO_IP,
             libc::IP_BOUND_IF,
             (&index as *const libc::c_uint).cast(),
@@ -528,13 +536,20 @@ fn bind_ipv4_interface(socket: &StdUdpSocket, interface: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn bind_ipv4_interface(socket: &StdUdpSocket, interface: &str) -> Result<()> {
-    use std::{ffi::CString, os::fd::AsRawFd};
+    use std::os::fd::AsRawFd;
+
+    bind_ipv4_interface_fd(socket.as_raw_fd(), interface)
+}
+
+#[cfg(target_os = "linux")]
+pub fn bind_ipv4_interface_fd(fd: std::os::fd::RawFd, interface: &str) -> Result<()> {
+    use std::ffi::CString;
 
     let name = CString::new(interface).context("interface name contains a NUL byte")?;
     // SAFETY: the pointer and byte count cover the NUL-terminated interface name.
     let result = unsafe {
         libc::setsockopt(
-            socket.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_BINDTODEVICE,
             name.as_ptr().cast(),
@@ -550,6 +565,11 @@ fn bind_ipv4_interface(socket: &StdUdpSocket, interface: &str) -> Result<()> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn bind_ipv4_interface(_socket: &StdUdpSocket, interface: &str) -> Result<()> {
+    bail!("interface binding is not implemented for this OS: {interface}")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn bind_ipv4_interface_fd(_fd: std::os::fd::RawFd, interface: &str) -> Result<()> {
     bail!("interface binding is not implemented for this OS: {interface}")
 }
 

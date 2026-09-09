@@ -82,28 +82,99 @@ fn main() -> Result<()> {
     let reader = socket.try_clone()?;
     let events: Events = Arc::new(Mutex::new(socket));
     event(&events, json!({"event":"helper_ready"}));
+    reader.set_read_timeout(Some(Duration::from_secs(8)))?;
+    let mut input = BufReader::new(reader);
+    let mut initial_line = Vec::new();
+    let count = input
+        .by_ref()
+        .take(65537)
+        .read_until(b'\n', &mut initial_line)?;
+    ensure!(
+        count > 0 && count <= 65536,
+        "app did not provide initial configuration"
+    );
+    let initial: Value =
+        serde_json::from_slice(&initial_line).context("invalid initial configuration")?;
+    input.get_mut().set_read_timeout(None)?;
+    let mode = initial
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("secure");
+    ensure!(
+        ["direct", "hybrid", "secure"].contains(&mode),
+        "invalid connection mode"
+    );
+    let direct = mode != "secure";
+    let initial_items = initial
+        .get("interfaces")
+        .and_then(Value::as_array)
+        .context("initial interfaces are missing")?;
+    interfaces = initial_items
+        .iter()
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    ensure!(
+        !interfaces.is_empty()
+            && interfaces.len() == initial_items.len()
+            && interfaces.iter().all(|name| valid_interface(name)),
+        "invalid initial interfaces"
+    );
     // Persistent service: only run the engine beside this signed supervisor,
     // never a user-replaceable executable from the session directory.
     let engine = std::env::current_exe()?
         .parent()
         .context("supervisor executable directory")?
         .join("verz-bond");
-    let mut child = Command::new(engine)
-        .args(["client", "--relay", &relay.to_string(), "--interface"])
-        .args(&interfaces)
-        .arg("--secret-file")
-        .arg(directory.join("lab-secret"))
-        .args(["--policy", policy, "--control-stdin"])
+    let configured_policy = initial
+        .get("policy")
+        .and_then(Value::as_str)
+        .unwrap_or(policy);
+    ensure!(
+        ["smart", "performance", "continuity", "data-saver"].contains(&configured_policy),
+        "invalid configured policy"
+    );
+    let mut command = Command::new(engine);
+    if direct {
+        let paths: Vec<String> = initial_items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?;
+                let address = item.get("address")?.as_str()?;
+                address.parse::<std::net::Ipv4Addr>().ok()?;
+                let metered = item
+                    .get("metered")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some(format!("{name}={address},{metered}"))
+            })
+            .collect();
+        ensure!(
+            paths.len() == initial_items.len(),
+            "direct path addresses are invalid"
+        );
+        command
+            .args(["direct", "--listen", "127.0.0.1:0", "--path"])
+            .args(paths)
+            .args(["--policy", configured_policy, "--control-stdin"]);
+    } else {
+        command
+            .args(["client", "--relay", &relay.to_string(), "--interface"])
+            .args(&interfaces)
+            .arg("--secret-file")
+            .arg(directory.join("lab-secret"))
+            .args(["--policy", configured_policy, "--control-stdin"]);
+    }
+    let mut child = command
         .current_dir(&directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("start Rust tunnel")?;
+        .context("start Rust networking engine")?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let input_tx = stop_tx.clone();
     thread::spawn(move || {
-        let mut input = BufReader::new(reader);
         loop {
             let mut line = Vec::new();
             let count = input
@@ -129,10 +200,14 @@ fn main() -> Result<()> {
     let ready_tx = stop_tx.clone();
     let output_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let connected = line.starts_with("TUNNEL CONNECTED:");
+            let connected =
+                line.starts_with("TUNNEL CONNECTED:") || line.starts_with("DIRECT CONNECTED:");
             if connected {
                 let _ = ready_tx.send(Control::Connected(line));
-            } else if let Some(telemetry) = line.strip_prefix("BOND_STATE ") {
+            } else if let Some(telemetry) = line
+                .strip_prefix("BOND_STATE ")
+                .or_else(|| line.strip_prefix("DIRECT_STATE "))
+            {
                 event(&out_events, json!({"event":"telemetry", "line":telemetry}));
             } else {
                 event(&out_events, json!({"event":"log", "line":line}));
@@ -147,25 +222,34 @@ fn main() -> Result<()> {
     });
     drop(stop_tx);
     let mut network: Option<network::NetworkGuard> = None;
+    let mut proxy: Option<network::ProxyGuard> = None;
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(1);
         }
         match stop_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Control::Connected(line)) => {
-                let tun = line
+                let endpoint = line
                     .split_whitespace()
                     .nth(2)
-                    .context("engine omitted interface name")?;
-                event(
-                    &events,
-                    json!({"event":"configuring", "line":"Routing Mac traffic and DNS through VERZ"}),
-                );
-                match network::NetworkGuard::configure(tun, &interfaces, &relay.ip().to_string()) {
-                    Ok(guard) => {
-                        network = Some(guard);
-                        event(&events, json!({"event":"connected", "line":line}));
-                    }
+                    .context("engine omitted connection endpoint")?;
+                let configured = if direct {
+                    event(
+                        &events,
+                        json!({"event":"configuring", "line":"Enabling local Direct Smart flow steering"}),
+                    );
+                    network::ProxyGuard::configure(endpoint, &interfaces)
+                        .map(|guard| proxy = Some(guard))
+                } else {
+                    event(
+                        &events,
+                        json!({"event":"configuring", "line":"Routing Mac traffic and DNS through VERZ"}),
+                    );
+                    network::NetworkGuard::configure(endpoint, &interfaces, &relay.ip().to_string())
+                        .map(|guard| network = Some(guard))
+                };
+                match configured {
+                    Ok(()) => event(&events, json!({"event":"connected", "line":line})),
                     Err(error) => {
                         event(
                             &events,
@@ -208,6 +292,14 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+                if let Some(guard) = proxy.as_mut()
+                    && let Err(error) = guard.sync(&interfaces)
+                {
+                    event(
+                        &events,
+                        json!({"event":"engine_error", "line":format!("Direct proxy configuration: {error}")}),
+                    );
+                }
                 if let Some(input) = child.stdin.as_mut() {
                     let _ = writeln!(input, "{value}");
                 }
@@ -220,6 +312,11 @@ fn main() -> Result<()> {
         }
     };
     if let Some(mut guard) = network {
+        for error in guard.restore() {
+            event(&events, json!({"event":"cleanup_error", "line":error}));
+        }
+    }
+    if let Some(mut guard) = proxy {
         for error in guard.restore() {
             event(&events, json!({"event":"cleanup_error", "line":error}));
         }

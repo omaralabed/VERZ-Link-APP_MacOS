@@ -145,6 +145,7 @@ struct Cli {
 enum Mode {
     Server(Server),
     Client(Client),
+    Direct(verz_link_lab::direct::DirectArgs),
 }
 #[derive(Args)]
 struct Server {
@@ -674,6 +675,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Mode::Server(args) => server(args).await,
         Mode::Client(args) => client(args).await,
+        Mode::Direct(args) => verz_link_lab::direct::run(args).await,
     }
 }
 

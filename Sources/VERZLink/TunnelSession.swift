@@ -82,9 +82,11 @@ final class TunnelSession: @unchecked Sendable {
                 try manager.copyItem(at: binary, to: staged)
                 try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staged.path)
             }
-            let secretURL = directory.appendingPathComponent("lab-secret")
-            try secret.write(to: secretURL, options: .atomic)
-            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
+            if !secret.isEmpty {
+                let secretURL = directory.appendingPathComponent("lab-secret")
+                try secret.write(to: secretURL, options: .atomic)
+                try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
+            }
             try createListener()
             try launch(relay: relay, interfaces: interfaces, policy: policy)
         } catch {

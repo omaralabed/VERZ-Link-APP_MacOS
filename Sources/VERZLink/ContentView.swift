@@ -71,7 +71,8 @@ struct ContentView: View {
                             Text(subtitle).font(.system(size: 12)).foregroundStyle(muted)
                         }
                         Spacer()
-                        Label("\(model.state == .connected ? "SECURE LINK" : "MAC CLIENT")", systemImage: "shield.lefthalf.filled")
+                        Label(model.state == .connected ? model.mode.badge : "MAC CLIENT",
+                              systemImage: model.mode == .secure ? "shield.lefthalf.filled" : "point.3.connected.trianglepath.dotted")
                             .font(.system(size: 9, weight: .bold)).tracking(1)
                             .foregroundStyle(model.state == .connected ? mint : muted)
                             .padding(10).background(panel, in: Capsule())
@@ -99,28 +100,40 @@ struct ContentView: View {
         switch model.selectedPage {
         case "Diagnostics": return "Measure the connection carrying your Mac’s traffic."
         case "Activity": return "A live record of your connection and test results."
-        case "Settings": return "Your relay, credentials, and portable connection profile."
-        default: return "Your networks. One encrypted connection."
+        case "Settings": return "Choose direct acceleration or encrypted continuity."
+        default: return model.mode == .secure ? "Your networks. One encrypted connection." : "Your networks. Direct, adaptive flow steering."
         }
     }
 
     private var connection: some View {
         VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 14) {
+                eyebrow("CONNECTION MODE")
+                Picker("Connection mode", selection: $model.mode) {
+                    ForEach(TransportMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }.pickerStyle(.segmented).disabled(model.busy)
+                Text(model.mode == .direct ? "No relay and no VERZ payload encryption. TCP connections are assigned directly across the selected adapters."
+                     : model.mode == .hybrid ? "Preview: direct-first flow steering is active. Automatic selective relay escalation is the next implementation gate."
+                     : "Encrypted relay with a stable public IP and session-preserving path failover.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+            }.padding(18).card()
             VStack(alignment: .leading, spacing: 24) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 10) {
                         eyebrow("CONNECTION STATUS")
                         Text(model.state.rawValue).font(.system(size: 29, weight: .medium))
-                        Text(model.state == .connected ? "Internet traffic uses your enabled networks through one VERZ tunnel."
-                             : model.state == .reconnecting ? "Waiting for a usable path. Your tunnel stays in place."
-                             : "Connect your Mac’s Wi-Fi and Ethernet networks to your VERZ relay.")
+                        Text(model.state == .connected
+                             ? (model.mode == .secure ? "Internet traffic uses the encrypted VERZ relay." : "Supported TCP applications use direct flows across your enabled networks.")
+                             : model.state == .reconnecting
+                             ? (model.mode == .secure ? "Waiting for a usable path. Your secure tunnel stays in place." : "No direct path is healthy; adapters continue probing.")
+                             : (model.mode == .secure ? "Connect Wi-Fi or Ethernet to Secure Continuity." : "Connect Wi-Fi or Ethernet to start Direct Smart."))
                             .font(.system(size: 12)).foregroundStyle(muted)
                     }
                     Spacer()
                     ZStack {
                         Circle().stroke(mint.opacity(0.12), lineWidth: 1).frame(width: 78, height: 78)
                         Circle().fill(mint.opacity(0.07)).frame(width: 60, height: 60)
-                        Image(systemName: model.state == .connected ? "lock.shield.fill" : "power")
+                        Image(systemName: model.state == .connected ? (model.mode == .secure ? "lock.shield.fill" : "arrow.triangle.branch") : "power")
                             .font(.system(size: 24, weight: .light)).foregroundStyle(mint)
                     }
                 }
@@ -141,11 +154,11 @@ struct ContentView: View {
                 }
                 Divider().overlay(.white.opacity(0.03))
                 HStack(spacing: 16) {
-                    detail("RELAY", model.relay)
+                    detail(model.mode == .secure ? "RELAY" : "DATA PATH", model.mode == .secure ? model.relay : "Direct to destination")
                     Spacer()
                     detail("PUBLIC IPv4", model.publicIP ?? (model.state == .connected ? "Verifying…" : "—"))
                     Spacer()
-                    detail("ENCRYPTION", "ChaCha20-Poly1305")
+                    detail("PAYLOAD SECURITY", model.mode == .secure ? "VERZ + application" : "Application-native")
                 }
             }.padding(24).card()
             networkInterfaces
@@ -169,7 +182,7 @@ struct ContentView: View {
                     .frame(height: 105)
                     .overlay { if model.samples.isEmpty { Text("Live measurements appear when connected").font(.system(size: 11)).foregroundStyle(muted) } }
                 HStack {
-                    Text("Last 60 seconds · actual tunnel interface counters")
+                    Text(model.mode == .secure ? "Last 60 seconds · actual tunnel interface counters" : "Last 60 seconds · aggregate selected-adapter counters")
                     Spacer()
                     Text("Mbps")
                 }.font(.system(size: 9)).foregroundStyle(muted)
@@ -215,7 +228,9 @@ struct ContentView: View {
                         set: { model.setMetered(interface.name, metered: $0) })).controlSize(.small).fixedSize()
                 }.padding(.vertical, 5)
             }
-            Text("Connected adapters appear automatically. Links at 75 ms RTT or above stop carrying data when another usable link exists; probes continue. Recovery below 65 ms avoids rapid switching.")
+            Text(model.mode == .secure
+                 ? "Connected adapters appear automatically. Links at 75 ms RTT or above stop carrying data when another usable link exists; probes continue."
+                 : "Direct Smart assigns each new TCP connection to one adapter. A path at 75 ms RTT or above receives no new flows while a faster healthy path exists; probing continues.")
                 .font(.system(size: 10)).foregroundStyle(muted)
             HStack {
                 Text("Connection preference").font(.system(size: 12))
@@ -244,8 +259,10 @@ struct ContentView: View {
                 if model.testRunning {
                     ProgressView(value: model.testProgress)
                     Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint)
+                } else if model.mode != .secure {
+                    Label("These relay diagnostics belong to Secure Continuity. Use a browser speed test for Direct Smart.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
                 } else if model.state != .connected {
-                    Label("Connect to your relay before starting a new test.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
+                    Label("Connect with Secure Continuity before starting a relay test.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
                 } else if !model.testStage.isEmpty { Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint) }
             }.padding(24).card()
             if let result = model.result {
@@ -296,8 +313,17 @@ struct ContentView: View {
 
     private var settings: some View {
         VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 16) {
+                eyebrow("ARCHITECTURE")
+                settingRow("Selected mode", model.mode.title)
+                settingRow("Data route", model.mode == .secure ? "Encrypted relay" : "Direct to destination")
+                settingRow("VERZ payload encryption", model.mode == .secure ? "ChaCha20-Poly1305" : "None")
+                Text("HTTPS, TLS, and other application encryption remain unchanged in every mode. The Direct Smart engine never decrypts or inspects payloads.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+            }.padding(24).card()
+            if model.mode == .secure {
             VStack(alignment: .leading, spacing: 18) {
-                eyebrow("RELAY CONNECTION")
+                eyebrow("SECURE CONTINUITY RELAY")
                 Text("Server address").font(.system(size: 13, weight: .medium))
                 TextField("IPv4:port", text: $model.relay).textFieldStyle(.roundedBorder).disabled(model.busy)
                 Text("Use the same relay profile on another Mac. Each connection receives its own encrypted session and private IPv4 address.")
@@ -313,17 +339,20 @@ struct ContentView: View {
                 Text("The app never contains your key. Profiles include relay access credentials: transfer them privately. Credentials are stored in a permission-restricted file on this Mac.")
                     .font(.system(size: 11)).foregroundStyle(muted)
             }.padding(24).card()
+            }
             VStack(alignment: .leading, spacing: 16) {
                 eyebrow("THIS BUILD")
-                settingRow("Networking engine", "Rust · native system tunnel")
-                settingRow("Authentication", "Noise PSK + ephemeral X25519")
-                settingRow("Traffic", "IPv4 internet + DNS through relay")
-                settingRow("IPv6", "Blocked by tunnel routes while connected")
+                settingRow("Networking engine", model.mode == .secure ? "Rust · native system tunnel" : "Rust · local TCP flow engine")
+                settingRow("Authentication", model.mode == .secure ? "Noise PSK + ephemeral X25519" : "Local signed helper")
+                settingRow("Traffic", model.mode == .secure ? "IPv4 internet + DNS through relay" : "Proxy-aware IPv4 TCP direct")
+                settingRow("IPv6", model.mode == .secure ? "Blocked by tunnel routes while connected" : "Direct support pending")
                 settingRow("Local network", "Existing more-specific LAN routes remain local")
                 settingRow("Uplinks", "Dynamic Wi-Fi and Ethernet paths")
                 settingRow("Distribution", "Universal · macOS 14+ · development-signed")
                 Divider()
-                Text("This development build uses a shared relay profile. Production device enrollment, audited no-regression performance, corporate-VPN underlay compatibility, and the full V2 release gates are not complete.")
+                Text(model.mode == .secure
+                     ? "Secure Continuity uses the current test relay. Production enrollment and audited release gates are not complete."
+                     : "Direct Smart currently covers macOS applications that honor the system SOCKS proxy. Transparent UDP/QUIC and single-session migration require the Apple Network Extension production gate.")
                     .font(.system(size: 12)).foregroundStyle(muted)
             }.padding(24).card()
         }

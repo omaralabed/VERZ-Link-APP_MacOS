@@ -1,8 +1,9 @@
 # VERZ Link for macOS
 
-Native SwiftUI/Xcode client with a Rust encrypted multipath IPv4 engine and a
-Linux relay. **Development build; not a completed V2 product.** See
-[implementation status](IMPLEMENTATION_STATUS.md) for measured results and gaps.
+Native SwiftUI/Xcode client with a Rust direct multi-flow engine plus an
+optional encrypted multipath relay. **Development build; not a completed V3
+product.** See [architecture V3](ARCHITECTURE_V3.md) and [implementation
+status](IMPLEMENTATION_STATUS.md) for measured results and gaps.
 The current throughput investigation and repeatable test command are in
 [performance notes](PERFORMANCE.md); do not use the deliberately delayed
 continuity stream as a speed benchmark.
@@ -13,15 +14,28 @@ Open `VERZ Link.xcodeproj`, choose **VERZ Link → My Mac**, then Run. Requires
 macOS 14+, Xcode command-line tools and Rust with Apple arm64/x86_64 targets.
 The build phase compiles and bundles the Rust engine automatically.
 
-Import the private connection profile/key in Settings on each test Mac. Keys are
-not included in source or app bundles. The current shared development profile
-does not implement production device enrollment or revocation.
+Direct Smart is the default and needs no relay profile. It sends proxy-aware
+IPv4 TCP connections directly to their destinations, assigning each complete
+connection to one selected adapter. It does not add VERZ payload encryption;
+HTTPS/TLS and other application security remain unchanged.
+
+Secure Continuity retains the encrypted relay tunnel. Import its private
+connection profile/key in Settings on each test Mac. Keys are not included in
+source or app bundles. The current shared development profile does not
+implement production device enrollment or revocation.
 
 Connected Wi-Fi and Ethernet links appear automatically. Unplugged ports are
 hidden; a cable-connected adapter waiting for DHCP remains visible. Each path
 has Use/Metered controls. Multiple Macs get separate tunnel sessions/IP leases.
 
-Smart mode schedules bulk traffic across eligible links using RTT and available
+In Direct Smart, the Rust engine probes every adapter independently and rotates
+new flows across eligible links. A path at 75 ms RTT or above receives no new
+flows while a faster healthy path exists; it remains under observation. The
+current direct path uses the macOS system SOCKS setting, so it covers apps that
+honor that setting. Transparent UDP/QUIC and migration of one established
+session remain Apple Network Extension gates.
+
+In Secure Continuity, Smart mode schedules bulk traffic across eligible links using RTT and available
 congestion-window capacity, not a fixed primary connection. A 40 ms RTT
 difference does not exclude a path. At 75 ms smoothed RTT a path becomes standby,
 with probes retained and recovery below 65 ms. If all paths exceed the cutoff,

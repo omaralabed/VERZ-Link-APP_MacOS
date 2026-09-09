@@ -6,6 +6,33 @@ Source requirements: `VERZ/VERZ_LINK_V2.md`, September 8, 2026, plus the user's
 requirements for native Xcode development, Rust networking, one-CPU relay
 support, simultaneous Macs, and at most 100 ms failover in supported tests.
 
+The user-approved V3 split supersedes relay-always operation: Direct Smart is
+the default local data plane, Secure Continuity preserves the relay tunnel, and
+Automatic Hybrid will select between them per traffic need.
+
+## Implemented V3 Direct Smart milestone
+
+- Rust SOCKS5 CONNECT engine binds every outbound IPv4 TCP connection to the
+  selected physical adapter; application payloads never cross the VERZ relay.
+- No VERZ payload encryption or encapsulation in Direct Smart. HTTPS/TLS and
+  other application encryption remain end to end.
+- Whole-flow round robin for Smart/Performance, stable lowest-RTT selection for
+  Continuity, and unmetered preference for Data Saver.
+- Independent one-second path probes. A path at 75 ms RTT or above receives no
+  new flows while a healthier sub-75 ms path exists; failed paths keep probing.
+- Native app mode selector and mode-specific status/security details. Relay IP
+  and key controls are hidden from the normal Direct Smart experience.
+- Signed helper enables the loopback proxy only on selected macOS network
+  services and records/restores their prior SOCKS settings on disconnect,
+  engine failure, app loss, adapter removal, and normal exit.
+- Direct traffic counters aggregate selected physical adapters. Direct public
+  IP verification explicitly traverses the local flow engine.
+- Automatic Hybrid is explicitly a preview: it currently runs Direct Smart.
+  Selective encrypted-relay escalation is not implemented yet.
+- Current Direct Smart coverage is proxy-aware IPv4 TCP. Transparent UDP/QUIC,
+  non-proxy-aware applications, and migration of one established session are
+  future Network Extension gates; they are not claimed as implemented.
+
 ## Implemented baseline
 
 - Native SwiftUI application and shared Xcode scheme, macOS 14+.
@@ -50,7 +77,7 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 
 ## Verified on September 8, 2026
 
-- 36 Rust library tests plus 6 runtime regression tests pass on macOS and
+- 40 Rust library tests plus 6 runtime regression tests pass on macOS and
   release Linux; Rust clippy clean on macOS.
 - 7 Swift tests pass; universal app and helper signatures verified.
 - Controlled isolated Linux test: one 30.97 MB TCP transfer survived two link
@@ -91,6 +118,13 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
   drops and kernel UDP receive drops remained zero in these intervals;
   receive admission backpressure is tracked separately and preserves retry.
   These runs do not establish 300+ Mbps or repeatable no-regression throughput.
+- Version 0.3.0 Direct Smart was verified locally through a real SOCKS5 HTTPS
+  request bound to en0. It returned the direct Verizon public IPv4 rather than
+  the Linode relay address. Six concurrent HTTPS requests in the signed app
+  produced bytes on both en0 and en7. Forced app termination stopped the child
+  engine and restored both services to SOCKS disabled with blank endpoints.
+  Secure Continuity was then reconnected and verified with the relay public IP.
+  Full browser/Ookla, physical unplug, and second-Mac acceptance remain.
 
 ## Known open user issues
 

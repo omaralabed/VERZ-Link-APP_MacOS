@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, ensure};
-use std::process::{Command, Stdio};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+};
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
@@ -192,5 +195,184 @@ impl Drop for NetworkGuard {
         for error in self.restore() {
             eprintln!("Network restoration: {error}");
         }
+    }
+}
+
+#[derive(Clone)]
+struct SocksState {
+    enabled: bool,
+    server: String,
+    port: u16,
+    authenticated: bool,
+}
+
+/// Enables the macOS system SOCKS setting only for selected, active network
+/// services. The original per-service settings are restored on every exit.
+/// Direct mode changes no route and no DNS setting.
+#[derive(Default)]
+pub struct ProxyGuard {
+    endpoint: Option<(String, u16)>,
+    originals: HashMap<String, SocksState>,
+    active: Vec<String>,
+}
+
+impl ProxyGuard {
+    pub fn configure(endpoint: &str, physical: &[String]) -> Result<Self> {
+        let address: std::net::SocketAddr =
+            endpoint.parse().context("invalid local proxy endpoint")?;
+        ensure!(
+            address.ip().is_loopback() && address.port() > 0,
+            "direct proxy is not loopback-only"
+        );
+        let mut guard = Self {
+            endpoint: Some((address.ip().to_string(), address.port())),
+            originals: HashMap::new(),
+            active: Vec::new(),
+        };
+        guard.sync(physical)?;
+        ensure!(
+            !guard.active.is_empty(),
+            "no macOS network service matches the selected adapters"
+        );
+        Ok(guard)
+    }
+
+    pub fn sync(&mut self, physical: &[String]) -> Result<()> {
+        let services = service_map()?;
+        let desired: Vec<String> = physical
+            .iter()
+            .filter_map(|name| services.get(name).cloned())
+            .collect();
+        for service in self.active.clone() {
+            if !desired.contains(&service) {
+                self.restore_service(&service)?;
+                self.active.retain(|name| name != &service);
+            }
+        }
+        let (server, port) = self.endpoint.clone().context("proxy endpoint is missing")?;
+        let port = port.to_string();
+        for service in desired {
+            if self.active.contains(&service) {
+                continue;
+            }
+            let state = read_socks(&service)?;
+            ensure!(
+                !state.authenticated,
+                "{service} already uses an authenticated SOCKS proxy; disconnect it before enabling Direct Smart"
+            );
+            self.originals.entry(service.clone()).or_insert(state);
+            run(
+                "/usr/sbin/networksetup",
+                &["-setsocksfirewallproxy", &service, &server, &port, "off"],
+            )?;
+            if let Err(error) = run(
+                "/usr/sbin/networksetup",
+                &["-setsocksfirewallproxystate", &service, "on"],
+            ) {
+                let _ = self.restore_service(&service);
+                return Err(error);
+            }
+            self.active.push(service);
+        }
+        Ok(())
+    }
+
+    fn restore_service(&self, service: &str) -> Result<()> {
+        let state = self
+            .originals
+            .get(service)
+            .context("original SOCKS state is missing")?;
+        run(
+            "/usr/sbin/networksetup",
+            &[
+                "-setsocksfirewallproxy",
+                service,
+                &state.server,
+                &state.port.to_string(),
+                "off",
+            ],
+        )?;
+        run(
+            "/usr/sbin/networksetup",
+            &[
+                "-setsocksfirewallproxystate",
+                service,
+                if state.enabled { "on" } else { "off" },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn restore(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for service in self.active.drain(..).rev().collect::<Vec<_>>() {
+            if let Err(error) = self.restore_service(&service) {
+                failures.push(error.to_string());
+            }
+        }
+        failures
+    }
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        for error in self.restore() {
+            eprintln!("SOCKS restoration: {error}");
+        }
+    }
+}
+
+fn read_socks(service: &str) -> Result<SocksState> {
+    let output = run(
+        "/usr/sbin/networksetup",
+        &["-getsocksfirewallproxy", service],
+    )?;
+    let field = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(name).map(str::trim))
+            .unwrap_or("")
+    };
+    Ok(SocksState {
+        enabled: field("Enabled:") == "Yes",
+        server: field("Server:").to_owned(),
+        port: field("Port:").parse().unwrap_or(0),
+        authenticated: field("Authenticated Proxy Enabled:") == "1",
+    })
+}
+
+fn service_map() -> Result<HashMap<String, String>> {
+    let output = run("/usr/sbin/networksetup", &["-listnetworkserviceorder"])?;
+    let mut result = HashMap::new();
+    let mut service: Option<String> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('(') && !trimmed.starts_with("(Hardware Port:") {
+            service = trimmed
+                .split_once(')')
+                .map(|(_, name)| name.trim().trim_start_matches('*').to_owned());
+        } else if let Some(device) = trimmed
+            .strip_prefix("(Hardware Port:")
+            .and_then(|_| trimmed.split("Device: ").nth(1))
+            .and_then(|value| value.strip_suffix(')'))
+            && let Some(name) = service.take()
+        {
+            result.insert(device.to_owned(), name);
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    #[test]
+    fn service_order_parser_assumptions_match_networksetup_shape() {
+        let line = "(Hardware Port: Wi-Fi, Device: en0)";
+        assert_eq!(
+            line.split("Device: ")
+                .nth(1)
+                .and_then(|v| v.strip_suffix(')')),
+            Some("en0")
+        );
     }
 }
