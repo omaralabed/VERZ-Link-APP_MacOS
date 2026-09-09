@@ -7,6 +7,7 @@ pub mod bond;
 pub mod brain;
 pub mod direct;
 pub mod reorder;
+mod tcp_metrics;
 pub mod tunnel;
 
 use std::{

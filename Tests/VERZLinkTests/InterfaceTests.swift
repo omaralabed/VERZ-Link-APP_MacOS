@@ -10,15 +10,18 @@ final class InterfaceTests: XCTestCase {
         let path = try decoder.decode(PathTelemetry.self, from: Data(legacy.utf8))
         XCTAssertNil(path.realtimePreferred)
         XCTAssertNil(path.downloadBps)
-        let current = String(legacy.dropLast()) + #", "realtime_preferred":false,"download_bps":8000000,"upload_bps":2000000,"active_flows":3}"#
+        XCTAssertNil(path.uploadHeld)
+        let current = String(legacy.dropLast()) + #", "realtime_preferred":false,"download_bps":8000000,"upload_bps":2000000,"active_flows":3,"upload_held":true,"tcp_observed":true}"#
         let updated = try decoder.decode(PathTelemetry.self, from: Data(current.utf8))
         XCTAssertEqual(updated.realtimePreferred, false)
         XCTAssertEqual(updated.downloadBps, 8_000_000)
         XCTAssertEqual(updated.activeFlows, 3)
+        XCTAssertEqual(updated.uploadHeld, true)
+        XCTAssertEqual(updated.tcpObserved, true)
     }
 
     func testBrainReportsMeasuredLearningWithoutRequiringItInLegacyMessages() throws {
-        let current = #"{"connected":true,"generation":42,"strategy":"adaptive-goodput-v2","learnedPaths":2}"#
+        let current = #"{"connected":true,"generation":42,"strategy":"delivery-aware-v3","learnedPaths":2}"#
         XCTAssertEqual(try JSONDecoder().decode(BrainState.self, from: Data(current.utf8)).learnedPaths, 2)
         let legacy = #"{"connected":false,"generation":0,"strategy":"local-fallback"}"#
         XCTAssertNil(try JSONDecoder().decode(BrainState.self, from: Data(legacy.utf8)).learnedPaths)

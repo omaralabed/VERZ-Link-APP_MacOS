@@ -28,16 +28,17 @@ Automatic Hybrid keeps Direct Smart and Secure Continuity warm at the same
 time. Proxy-aware TCP goes direct unless its domain suffix is listed under
 Hybrid Security or every direct path fails. Escalated traffic uses the existing
 encrypted relay without reconnecting the Hybrid session. The encrypted server
-brain receives path health and byte-count metadata only and advises weights; the Mac
-keeps a safe local policy if that control channel is unavailable.
+brain receives path health and transport-delivery metadata only and advises
+weights; the Mac keeps a local policy if that control channel is unavailable.
 
 Connected Wi-Fi and Ethernet links appear automatically. Unplugged ports are
 hidden; a cable-connected adapter waiting for DHCP remains visible. Each path
 has Use/Metered controls. Multiple Macs get separate tunnel sessions/IP leases.
 
 In Direct Smart, the Rust engine probes every adapter independently, learns
-directional goodput from live socket IO, and assigns new flows by load and
-observed performance. Higher-ping links remain available for transfers; 75 ms
+directional goodput from TCP delivery/read feedback, and assigns new flows by
+conservative two-way load and observed performance. Higher-ping links remain
+available for transfers; 75 ms
 is a real-time preference, not a blanket cutoff. See [adaptive brain](ADAPTIVE_BRAIN.md)
 for the controller, supported traffic classification, and remaining gates. The
 current direct path uses the macOS system SOCKS setting, so it covers apps that

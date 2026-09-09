@@ -223,7 +223,8 @@ struct ContentView: View {
                     Spacer()
                     if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
-                            Text(path.state == "offline" ? "Offline" : (path.latencyExcluded == true || path.realtimePreferred == false)
+                            Text(path.state == "offline" ? "Offline" : path.uploadHeld == true
+                                 ? "Upload congested · new flows prefer another link" : (path.latencyExcluded == true || path.realtimePreferred == false)
                                  ? "Transfers · calls prefer another link" : path.state.capitalized)
                                 .foregroundStyle(path.state == "healthy" ? mint : muted)
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
@@ -231,6 +232,11 @@ struct ContentView: View {
                             if let down = path.downloadBps, let up = path.uploadBps {
                                 Text(String(format: "↓ %.1f  ↑ %.1f Mbps · %llu flows", down / 1_000_000, up / 1_000_000, path.activeFlows ?? 0))
                                     .foregroundStyle(muted)
+                                if path.tcpObserved == true {
+                                    Text("Upload rate: TCP-acknowledged bytes").foregroundStyle(muted)
+                                } else if path.tcpObserved == false {
+                                    Text("Upload delivery: not measured yet").foregroundStyle(muted)
+                                }
                             }
                         }.font(.system(size: 10))
                     }
@@ -244,8 +250,8 @@ struct ContentView: View {
             Text(model.mode == .secure
                  ? "Transfers can use all responsive links. Calls and recognized live streams prefer links below 75 ms RTT. Local congestion control protects the connection."
                  : model.mode == .hybrid
-                 ? "The brain learns upload and download performance; the Mac assigns new flows and reacts locally to failures. Higher-ping links can still help transfers."
-                 : "Direct Smart learns from live transfers and shares new TCP flows across usable adapters. One established direct connection stays on its original adapter.")
+                 ? "The Mac measures TCP upload delivery and congestion. New connections use conservative two-way estimates; unknown or recovering links get limited trials. Existing direct flows stay on their original ISP."
+                 : "Direct Smart shares new TCP flows using measured delivery and congestion. Unknown or recovering links get limited trials. One established direct connection stays on its original adapter.")
                 .font(.system(size: 10)).foregroundStyle(muted)
             HStack {
                 Text("Connection preference").font(.system(size: 12))
@@ -355,7 +361,7 @@ struct ContentView: View {
                         Text(model.brainConnected ? "ADVICE #\(model.brainGeneration)" : "OFFLINE-SAFE")
                             .font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(muted)
                     }.font(.system(size: 12))
-                    Text("The encrypted brain learns from per-link byte counts, timing and reachability. It advises upload, download and real-time placement. The Mac keeps its own controller for immediate decisions and outages. No payloads or destinations are sent to the brain.")
+                    Text("The encrypted brain learns from per-link TCP delivery, byte counts, timing and reachability. Unknown connections use conservative upload/download estimates, not a previous connection's direction. The Mac detects upload congestion locally and keeps its own controller during outages. No payloads or destinations are sent to the brain.")
                         .font(.system(size: 11)).foregroundStyle(muted)
                     if model.brainConnected {
                         Text(model.brainLearnedPaths == 0 ? "Learning from traffic as you use the connection…"

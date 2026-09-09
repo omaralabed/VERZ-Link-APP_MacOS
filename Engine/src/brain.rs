@@ -36,26 +36,55 @@ pub struct BrainServerArgs {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PathReport {
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
+    #[serde(rename = "l", alias = "rtt_ms")]
     pub rtt_ms: Option<f64>,
+    #[serde(rename = "h", alias = "healthy")]
     pub healthy: bool,
+    #[serde(rename = "m", alias = "metered")]
     pub metered: bool,
+    #[serde(default, skip_serializing)]
     pub failures: u64,
-    /// Cumulative application bytes, not physical interface counters or payloads.
-    #[serde(default, rename = "tx", alias = "sent_bytes")]
+    /// Legacy accepted-write counter is readable but never sent or used to
+    /// learn upload capacity. v3 sends TCP-acknowledged bytes instead.
+    #[serde(default, skip_serializing, rename = "tx", alias = "sent_bytes")]
     pub sent_bytes: u64,
     #[serde(default, rename = "rx", alias = "received_bytes")]
     pub received_bytes: u64,
-    #[serde(default, rename = "flows", alias = "active_flows")]
+    #[serde(default, skip_serializing, rename = "flows", alias = "active_flows")]
     pub active_flows: u64,
-    #[serde(default)]
+    #[serde(default, rename = "j", alias = "jitter_ms")]
     pub jitter_ms: f64,
     /// Failed reachability probes / probes, smoothed locally. NOT packet loss.
-    #[serde(default, rename = "probe_fail", alias = "probe_failure_ratio")]
+    #[serde(
+        default,
+        rename = "p",
+        alias = "probe_fail",
+        alias = "probe_failure_ratio"
+    )]
     pub probe_failure_ratio: f64,
     /// Changes when an adapter changes address; contains no address itself.
-    #[serde(default, rename = "epoch", alias = "incarnation")]
+    #[serde(default, rename = "e", alias = "epoch", alias = "incarnation")]
     pub incarnation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpReport>,
+}
+
+/// TCP transport feedback only; no destinations, payloads or interface IPs.
+/// Short wire keys keep the authenticated 256-adapter report within one frame.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TcpReport {
+    #[serde(rename = "a")]
+    pub acknowledged: u64,
+    #[serde(rename = "r")]
+    pub retransmitted: u64,
+    #[serde(rename = "q")]
+    pub queued: u64,
+    #[serde(rename = "b")]
+    pub busy: u64,
+    #[serde(rename = "h")]
+    pub held: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,7 +120,8 @@ pub type Guidance = Option<(std::time::Instant, BrainAdvice)>;
 #[derive(Default)]
 struct Observation {
     sample_ms: u64,
-    sent: u64,
+    acknowledged: u64,
+    tcp_observed: bool,
     received: u64,
     upload_bps: f64,
     download_bps: f64,
@@ -100,8 +130,8 @@ struct Observation {
 
 /// Online feedback controller, not a pretrained AI model. Learns a decaying
 /// goodput envelope separately in each direction. Goodput is only an observed
-/// lower bound on capacity; exploration and a bounded weight ratio prevent a
-/// quiet or newly connected path from being permanently starved.
+/// lower bound on capacity, not a claim that writes reached the network. The
+/// Mac bounds unknown/recovering-path trials and handles congestion locally.
 #[derive(Default)]
 pub struct Controller {
     observations: BTreeMap<String, Observation>,
@@ -113,9 +143,10 @@ impl Controller {
             .retain(|name, _| report.paths.iter().any(|p| p.name == *name));
         for p in &report.paths {
             let prior = self.observations.entry(p.name.clone()).or_default();
+            let acknowledged = p.tcp.as_ref().map(|t| t.acknowledged).unwrap_or(0);
             let elapsed = report.sample_ms.saturating_sub(prior.sample_ms);
             let same = p.incarnation == prior.incarnation
-                && p.sent_bytes >= prior.sent
+                && acknowledged >= prior.acknowledged
                 && p.received_bytes >= prior.received
                 && (100..=10_000).contains(&elapsed);
             if same {
@@ -123,7 +154,16 @@ impl Controller {
                 // not evidence of poor capacity, so it cannot create a cap.
                 let decay = (-(elapsed as f64) / 30_000.0).exp();
                 let rate = |bytes: u64| bytes as f64 * 8_000.0 / elapsed as f64;
-                prior.upload_bps = (prior.upload_bps * decay).max(rate(p.sent_bytes - prior.sent));
+                prior.upload_bps = if p.tcp.is_some() && prior.tcp_observed {
+                    let observed = rate(acknowledged - prior.acknowledged);
+                    if p.tcp.as_ref().is_some_and(|t| t.held) {
+                        observed // old peak must not immediately refill a congested path
+                    } else {
+                        (prior.upload_bps * decay).max(observed)
+                    }
+                } else {
+                    0.0
+                };
                 prior.download_bps =
                     (prior.download_bps * decay).max(rate(p.received_bytes - prior.received));
             } else {
@@ -131,7 +171,8 @@ impl Controller {
                 prior.download_bps = 0.0;
             }
             prior.sample_ms = report.sample_ms;
-            prior.sent = p.sent_bytes;
+            prior.acknowledged = acknowledged;
+            prior.tcp_observed = p.tcp.is_some();
             prior.received = p.received_bytes;
             prior.incarnation = p.incarnation;
         }
@@ -166,7 +207,7 @@ impl Controller {
             .map(|p| p.name.as_str());
         let mut advice = BrainAdvice {
             generation,
-            strategy: "adaptive-goodput-v2".into(),
+            strategy: "delivery-aware-v3".into(),
             cutoff_ms: CUTOFF_MS,
             recovery_ms: RECOVERY_MS,
             relay_fallback: true,
@@ -187,22 +228,20 @@ impl Controller {
                 if !eligible(p) {
                     return 0;
                 }
-                let relative = if rate >= 64_000.0 {
-                    rate / reference
-                } else {
-                    1.0
-                };
-                (16.0 * relative.sqrt().clamp(0.25, 4.0) * reliability)
+                let relative = if rate > 0.0 { rate / reference } else { 1.0 };
+                (16.0 * relative.clamp(0.0625, 4.0) * reliability)
                     .round()
                     .clamp(1.0, 64.0) as u32
             };
-            let up = weight(o.upload_bps, up_reference);
+            let up = if p.tcp.as_ref().is_some_and(|t| t.held) {
+                0
+            } else {
+                weight(o.upload_bps, up_reference)
+            };
             let down = weight(o.download_bps, down_reference);
             advice.upload_weights.insert(p.name.clone(), up);
             advice.download_weights.insert(p.name.clone(), down);
-            advice
-                .weights
-                .insert(p.name.clone(), (up + down).div_ceil(2));
+            advice.weights.insert(p.name.clone(), up.min(down));
             let realtime = eligible(p)
                 && if has_fast {
                     p.rtt_ms.is_some_and(|v| v > 0.0 && v < CUTOFF_MS)
@@ -436,6 +475,9 @@ mod tests {
     #[test]
     fn learns_opposite_upload_download_strengths_without_starving_new_paths() {
         let mut report = report(Policy::Smart);
+        for p in &mut report.paths {
+            p.tcp = Some(TcpReport::default());
+        }
         let mut controller = Controller::default();
         controller.advise(&report, 1);
         report.sample_ms = 1_000;
@@ -443,6 +485,8 @@ mod tests {
         report.paths[0].sent_bytes = 1_000_000;
         report.paths[1].received_bytes = 1_000_000;
         report.paths[1].sent_bytes = 30_000_000;
+        report.paths[0].tcp.as_mut().unwrap().acknowledged = 1_000_000;
+        report.paths[1].tcp.as_mut().unwrap().acknowledged = 30_000_000;
         let advice = controller.advise(&report, 2);
         assert!(advice.download_weights["en0"] > advice.download_weights["en7"]);
         assert!(advice.upload_weights["en7"] > advice.upload_weights["en0"]);
@@ -503,6 +547,13 @@ mod tests {
                 rtt_ms: Some(123.123456789),
                 jitter_ms: 123.123456789,
                 probe_failure_ratio: 0.123456789,
+                tcp: Some(TcpReport {
+                    acknowledged: u64::MAX,
+                    retransmitted: u64::MAX,
+                    queued: u64::MAX,
+                    busy: 1_024,
+                    held: true,
+                }),
                 ..PathReport::default()
             })
             .collect();
@@ -523,7 +574,7 @@ mod tests {
         let mut client = BrainClient::connect(address, &secret).await?;
         let advice = client.exchange(&report(Policy::Smart)).await?;
         assert_eq!(advice.generation, 1);
-        assert_eq!(advice.strategy, "adaptive-goodput-v2");
+        assert_eq!(advice.strategy, "delivery-aware-v3");
         drop(client);
         assert!(server.await?.is_err());
         Ok(())
@@ -540,5 +591,28 @@ mod tests {
         assert!(BrainClient::connect(address, &[2; 32]).await.is_err());
         let _ = server.await?;
         Ok(())
+    }
+
+    #[test]
+    fn buffered_uploads_and_downloads_cannot_invent_upload_capacity() {
+        let mut report = report(Policy::Smart);
+        for p in &mut report.paths {
+            p.tcp = Some(TcpReport::default());
+        }
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        report.sample_ms = 1_000;
+        report.paths[0].sent_bytes = 30_000_000;
+        report.paths[0].received_bytes = 50_000_000;
+        report.paths[0].tcp.as_mut().unwrap().acknowledged = 100_000;
+        report.paths[1].tcp.as_mut().unwrap().acknowledged = 30_000_000;
+        let advice = controller.advise(&report, 1);
+        assert_eq!(controller.observations["en0"].upload_bps, 800_000.0);
+        assert!(advice.weights["en0"] < advice.weights["en7"]);
+        report.paths[0].tcp.as_mut().unwrap().held = true;
+        report.sample_ms += 1_000;
+        let advice = controller.advise(&report, 2);
+        assert_eq!(advice.weights["en0"], 0);
+        assert!(advice.download_weights["en0"] > 0);
     }
 }

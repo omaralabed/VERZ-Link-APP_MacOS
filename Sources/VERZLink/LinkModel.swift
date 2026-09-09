@@ -60,6 +60,8 @@ struct PathTelemetry: Decodable, Identifiable {
     var uploadBps: Double?
     var downloadBps: Double?
     var activeFlows: UInt64?
+    var uploadHeld: Bool?
+    var tcpObserved: Bool?
 }
 struct BondTelemetry: Decodable {
     let paths: [PathTelemetry]
