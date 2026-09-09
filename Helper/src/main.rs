@@ -259,6 +259,7 @@ fn main() -> Result<()> {
     let mut network: Option<network::NetworkGuard> = None;
     let mut proxy: Option<network::ProxyGuard> = None;
     let mut hybrid_proxy_endpoint: Option<String> = None;
+    let mut hybrid_tun: Option<String> = None;
     let mut hybrid_announced = false;
     let code = loop {
         if let Some(status) = child.try_wait()? {
@@ -272,28 +273,34 @@ fn main() -> Result<()> {
                     .context("engine omitted connection endpoint")?;
                 let configured: Result<()> = if hybrid {
                     (|| {
-                        if line.starts_with("TUNNEL CONNECTED:") && network.is_none() {
-                            event(
-                                &events,
-                                json!({"event":"configuring", "line":"Keeping Secure Continuity warm for selective relay escalation"}),
-                            );
-                            network = Some(network::NetworkGuard::configure(
-                                endpoint,
-                                &interfaces,
-                                &relay.ip().to_string(),
-                            )?);
+                        if line.starts_with("TUNNEL CONNECTED:") {
+                            hybrid_tun = Some(endpoint.to_owned());
                         } else if line.starts_with("DIRECT CONNECTED:") {
                             hybrid_proxy_endpoint = Some(endpoint.to_owned());
                         }
-                        if network.is_some()
-                            && proxy.is_none()
+                        if network.is_none()
+                            && let Some(tun) = hybrid_tun.as_deref()
                             && let Some(endpoint) = hybrid_proxy_endpoint.as_deref()
                         {
+                            let started = Instant::now();
                             event(
                                 &events,
-                                json!({"event":"configuring", "line":"Enabling direct-first flow steering with secure escalation"}),
+                                json!({"event":"configuring", "line":"Preparing and verifying direct + encrypted paths; existing DNS unchanged"}),
+                            );
+                            network = Some(network::NetworkGuard::prepare(
+                                tun,
+                                &interfaces,
+                                &relay.ip().to_string(),
+                                true,
+                            )?);
+                            network::verify_tunnel(tun)?;
+                            network::verify_socks(endpoint)?;
+                            event(
+                                &events,
+                                json!({"event":"configuring", "line":format!("Paths verified in {} ms; enabling prepared Hybrid routing", started.elapsed().as_millis())}),
                             );
                             proxy = Some(network::ProxyGuard::configure(endpoint, &interfaces)?);
+                            network.as_mut().expect("prepared network").capture()?;
                         }
                         Ok(())
                     })()

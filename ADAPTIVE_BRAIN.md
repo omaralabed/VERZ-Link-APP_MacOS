@@ -1,4 +1,4 @@
-# Adaptive brain — 0.5.1
+# Adaptive brain — 0.5.2
 
 The server is an advisory controller. It is not in the payload path for direct
 flows, and the Mac never waits for it to detect or react to a path failure.
@@ -71,6 +71,32 @@ Continuity preference relays all new proxy-aware TCP flows. Unknown traffic on
 call or stream, or use Secure Continuity. Non-proxy-aware IPv4, including UDP,
 continues through the Hybrid system tunnel; transparent selective direct UDP
 is not implemented. Direct Smart alone covers proxy-aware IPv4 TCP, not all apps.
+
+### Connection startup
+
+Hybrid prepares interface-scoped physical and tunnel routes before changing
+global internet routing. It verifies the encrypted peer with a bounded ICMP
+check and a real SOCKS DNS/TCP handshake to example.com:443, then publishes the
+prepared proxy and captures non-proxy traffic. Failure before activation
+restores only session-owned preparation. A site blocking this readiness target
+can prevent activation; the check transfers no application payload.
+
+Hybrid preserves the Mac's DNS configuration instead of replacing it at Connect.
+This is not a promise that Hybrid DNS uses the relay: a local ISP/router resolver
+can remain local. Secure Continuity still installs and restores relay DNS.
+Hybrid relay TCP sockets explicitly bind to the assigned utun and tunnel source
+address, so protected flows cannot fall through to the old physical default
+while routes are being prepared or removed.
+
+New direct TCP handshakes give the preferred path a 150 ms head start, race at
+most two attempts, cancel losing sockets before sending application bytes, and
+share a three-second direct setup budget. Each attempt is bounded to 1.2 seconds;
+optional relay fallback shares a separate two-second budget. DNS has a two-second
+application deadline; an underlying OS resolver worker may finish later.
+This bounds connection establishment, not retransmission on an existing session.
+Existing TCP sessions are not deliberately reset or migrated. A controlled
+pre-update test already preserved one IPv4 HTTPS connection across Connect;
+that does not establish that all browsers/protocols tolerate proxy/route changes.
 
 The secure scheduler reserves bounded congestion-window headroom for urgent
 packets, and keeps all responsive paths available for bulk. The 75/65 ms
@@ -147,3 +173,28 @@ separate acceptance measurements; unit tests are not performance results.
 Still pending: a matched-server, repeated Ethernet-only / hotspot-only /
 combined throughput comparison. Existing browser connections should be closed
 between cases; refreshing a page alone may retain an old TCP connection.
+
+### v0.5.2 handover verification — September 9, 2026
+
+- Mac: 69 engine-library tests, 6 relay-runtime tests, 6 helper tests, and
+  9 Swift tests passed. Engine all-target and helper Clippy checks passed.
+- Debug Xcode and development-signed universal Release builds passed;
+  deep/strict codesign verification passed. No server update was required.
+- Two live Connect tests using `scripts/check-mac-handover.swift` completed
+  280 one-byte HTTPS requests with zero failures. Both persistent-session and
+  fresh-session lanes automatically changed from unproxied to proxy connections
+  in URLSession metrics, without manual page refresh. The first test's slowest
+  persistent/fresh requests were 0.183/1.688 seconds; the second's were
+  0.106/0.228 seconds. This is a functional handover test, not a speed benchmark.
+- Preparation and readiness took 95 ms and 113 ms in Activity. The second run
+  temporarily protected example.com (the readiness destination), verifying an
+  explicitly tunnel-bound TCP connection before global capture. A safety check
+  confirmed preparation had not captured the global internet route.
+- A temporary api.ipify.org rule returned the relay's public IP through SOCKS;
+  removing that rule returned the ISP's public IP again. Test rules were restored
+  to their original empty value. DNS preferences stayed unchanged on both
+  adapters; disconnect restored the original default route and disabled SOCKS.
+
+The reported 15-second browser freeze was not reproduced in these controlled
+tests. Re-test the user's already-open page during Connect; HTTP/2, QUIC, long
+uploads and application-specific proxy handling remain separate acceptance cases.

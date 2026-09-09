@@ -397,6 +397,7 @@ struct ContentView: View {
                 settingRow("Authentication", model.mode == .direct ? "Local signed helper" : "Noise PSK + ephemeral X25519")
                 settingRow("Traffic", model.mode == .secure ? "IPv4 internet + DNS through relay"
                            : model.mode == .hybrid ? "Proxy-aware TCP direct or selectively relayed" : "Proxy-aware IPv4 TCP direct")
+                settingRow("DNS", model.mode == .secure ? "Relay DNS while connected" : "Existing Mac DNS settings preserved")
                 settingRow("IPv6", model.mode == .secure ? "Blocked by tunnel routes while connected" : "Direct support pending")
                 settingRow("Local network", "Existing more-specific LAN routes remain local")
                 settingRow("Uplinks", "Dynamic Wi-Fi and Ethernet paths")

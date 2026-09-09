@@ -382,13 +382,14 @@ fn send_client(
 }
 
 async fn client(args: Client) -> Result<()> {
-    client_with_controls(args, None, None).await
+    client_with_controls(args, None, None, None).await
 }
 
 async fn client_with_controls(
     args: Client,
     external_controls: Option<mpsc::Receiver<Control>>,
     mut guidance: Option<tokio::sync::watch::Receiver<verz_link_lab::brain::Guidance>>,
+    relay_route: Option<tokio::sync::watch::Sender<Option<verz_link_lab::direct::RelayRoute>>>,
 ) -> Result<()> {
     ensure!(
         unsafe { libc::geteuid() } == 0,
@@ -445,6 +446,12 @@ async fn client_with_controls(
         })
         .collect();
     send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
+    if let Some(route) = &relay_route {
+        route.send_replace(Some(verz_link_lab::direct::RelayRoute {
+            interface: tun.name()?,
+            address: Ipv4Addr::from(assigned),
+        }));
+    }
     println!(
         "TUNNEL CONNECTED: {} {} -> 10.78.0.1 over {} -> {}",
         tun.name()?,
@@ -577,6 +584,7 @@ async fn hybrid(args: Hybrid) -> Result<()> {
     let (client_tx, client_rx) = mpsc::channel(8);
     let (direct_tx, direct_rx) = mpsc::channel(8);
     let (advice_tx, advice_rx) = tokio::sync::watch::channel(None);
+    let (route_tx, route_rx) = tokio::sync::watch::channel(None);
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
             if line.len() > 65_536 {
@@ -622,8 +630,18 @@ async fn hybrid(args: Hybrid) -> Result<()> {
         brain_secret_file: Some(args.secret_file),
     };
     tokio::try_join!(
-        client_with_controls(client_args, Some(client_rx), Some(advice_rx)),
-        verz_link_lab::direct::run_with_guidance(direct_args, Some(direct_rx), Some(advice_tx))
+        client_with_controls(
+            client_args,
+            Some(client_rx),
+            Some(advice_rx),
+            Some(route_tx)
+        ),
+        verz_link_lab::direct::run_with_guidance(
+            direct_args,
+            Some(direct_rx),
+            Some(advice_tx),
+            Some(route_rx)
+        )
     )?;
     Ok(())
 }

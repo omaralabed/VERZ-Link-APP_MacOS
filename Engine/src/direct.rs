@@ -12,7 +12,7 @@ use clap::Args;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::fd::AsRawFd,
@@ -34,7 +34,19 @@ use tokio::{
 
 const DEFAULT_LATENCY_CUTOFF_US: u64 = 75_000;
 const PROBE_DESTINATION: &str = "1.1.1.1:443";
+const CONNECT_BUDGET: Duration = Duration::from_secs(3);
+const CONNECT_ATTEMPT: Duration = Duration::from_millis(1_200);
+const CONNECT_STAGGER: Duration = Duration::from_millis(150);
 static INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+/// Published only after the encrypted client has created its assigned utun.
+/// Binding relay sockets explicitly keeps protected flows off the physical
+/// default route during Hybrid startup and rollback.
+#[derive(Clone)]
+pub struct RelayRoute {
+    pub interface: String,
+    pub address: Ipv4Addr,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Intent {
@@ -179,6 +191,7 @@ struct Runtime {
     direct_connections: Arc<AtomicU64>,
     relay_connections: Arc<AtomicU64>,
     relay_fallback: Arc<AtomicBool>,
+    relay_route: Option<watch::Receiver<Option<RelayRoute>>>,
     cutoff_us: Arc<AtomicU64>,
     brain_advice: Arc<RwLock<Option<(Instant, BrainAdvice)>>>,
     local_advice: Arc<RwLock<Option<BrainAdvice>>>,
@@ -664,12 +677,75 @@ async fn connect_on(path: &Path, destination: SocketAddr) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn connect_via_system_route(destination: SocketAddr) -> Result<TcpStream> {
-    let stream = time::timeout(Duration::from_secs(6), TcpStream::connect(destination))
+async fn connect_via_relay(
+    destination: SocketAddr,
+    route: Option<watch::Receiver<Option<RelayRoute>>>,
+) -> Result<TcpStream> {
+    let socket = TcpSocket::new_v4()?;
+    if let Some(route) = route {
+        let route = route
+            .borrow()
+            .clone()
+            .context("encrypted route is not ready")?;
+        bind_ipv4_interface_fd(socket.as_raw_fd(), &route.interface)?;
+        socket.bind(SocketAddrV4::new(route.address, 0).into())?;
+    }
+    let stream = time::timeout(CONNECT_ATTEMPT, socket.connect(destination))
         .await
         .context("secure relay fallback timed out")??;
     stream.set_nodelay(true)?;
     Ok(stream)
+}
+
+/// Race TCP handshakes only; application bytes are sent once, to the winner.
+/// At most two attempts are live. Cancellation drops losing sockets and their
+/// path reservations before returning; a blackholed path cannot add repeated
+/// six-second waits for every address/adapter.
+async fn race_connections<T, F>(
+    attempts: impl IntoIterator<Item = F>,
+    budget: Duration,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    let mut waiting: VecDeque<_> = attempts.into_iter().take(16).collect();
+    let mut pending = tokio::task::JoinSet::new();
+    let deadline = time::Instant::now() + budget;
+    let mut next_launch = time::Instant::now();
+    loop {
+        if time::Instant::now() >= deadline {
+            break;
+        }
+        if pending.len() < 2
+            && (pending.is_empty() || time::Instant::now() >= next_launch)
+            && let Some(attempt) = waiting.pop_front()
+        {
+            pending.spawn(async move {
+                time::timeout(CONNECT_ATTEMPT, attempt)
+                    .await
+                    .context("TCP attempt timed out")?
+            });
+            next_launch = time::Instant::now() + CONNECT_STAGGER;
+        }
+        if pending.is_empty() && waiting.is_empty() {
+            break;
+        }
+        tokio::select! {
+            _ = time::sleep_until(deadline) => break,
+            result = pending.join_next(), if !pending.is_empty() => {
+                if let Some(Ok(Ok(winner))) = result {
+                    pending.shutdown().await;
+                    return Ok(winner);
+                }
+                // An immediate refusal need not delay the next candidate.
+                next_launch = time::Instant::now();
+            }
+            _ = time::sleep_until(next_launch), if pending.len() < 2 && !waiting.is_empty() => {}
+        }
+    }
+    pending.shutdown().await;
+    bail!("no TCP candidate connected within the setup budget")
 }
 
 fn normalize_domains(domains: Vec<String>) -> Result<Vec<String>> {
@@ -701,8 +777,9 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(address) = host.parse::<Ipv4Addr>() {
         return Ok(vec![SocketAddrV4::new(address, port).into()]);
     }
-    let addresses: Vec<_> = lookup_host((host, port))
-        .await?
+    let addresses: Vec<_> = time::timeout(Duration::from_secs(2), lookup_host((host, port)))
+        .await
+        .context("destination DNS lookup timed out")??
         .filter(SocketAddr::is_ipv4)
         .collect();
     ensure!(!addresses.is_empty(), "destination has no IPv4 address");
@@ -753,8 +830,16 @@ async fn socks_target(stream: &mut TcpStream) -> Result<(String, u16)> {
 }
 
 async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()> {
-    let (host, port) = socks_target(&mut client).await?;
-    let destinations = resolve(&host, port).await?;
+    let (host, port) = time::timeout(Duration::from_secs(3), socks_target(&mut client))
+        .await
+        .context("SOCKS negotiation timed out")??;
+    let destinations = match resolve(&host, port).await {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            client.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            return Err(error);
+        }
+    };
     let intent = if known_realtime_port(port) {
         Intent::Realtime
     } else {
@@ -767,35 +852,35 @@ async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()
     let mut lease = None;
     let mut selected: Option<(Option<Arc<Path>>, TcpStream)> = None;
     if !forced_relay {
-        for path in runtime.candidates(intent).await {
-            let mut reservation = PathLease::new(path.clone());
-            for destination in &destinations {
-                match connect_on(&path, *destination).await {
-                    Ok(stream) => {
-                        // Destination latency is not uplink latency. Mixing
-                        // them made a distant site mark a good ISP "slow".
-                        path.healthy.store(true, Ordering::Relaxed);
-                        selected = Some((Some(path), stream));
-                        break;
-                    }
-                    Err(_) => {
-                        path.failures.fetch_add(1, Ordering::Relaxed);
-                    }
+        let paths = runtime.candidates(intent).await;
+        let candidates: Vec<_> = destinations
+            .iter()
+            .flat_map(|destination| paths.iter().map(move |path| (path.clone(), *destination)))
+            .collect();
+        let attempts = candidates
+            .into_iter()
+            .map(|(path, destination)| async move {
+                let mut reservation = PathLease::new(path.clone());
+                let result = connect_on(&path, destination).await;
+                if result.is_err() {
+                    path.failures.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            if selected.is_some() {
+                let stream = result?;
+                path.healthy.store(true, Ordering::Relaxed);
                 reservation.connected();
-                lease = Some(reservation);
-                break;
-            }
+                Ok((path, stream, reservation))
+            });
+        if let Ok((path, stream, reservation)) = race_connections(attempts, CONNECT_BUDGET).await {
+            selected = Some((Some(path), stream));
+            lease = Some(reservation);
         }
     }
     if selected.is_none() && (forced_relay || runtime.relay_fallback.load(Ordering::Relaxed)) {
-        for destination in &destinations {
-            if let Ok(stream) = connect_via_system_route(*destination).await {
-                selected = Some((None, stream));
-                break;
-            }
+        let attempts = destinations
+            .into_iter()
+            .map(|destination| connect_via_relay(destination, runtime.relay_route.clone()));
+        if let Ok(stream) = race_connections(attempts, Duration::from_secs(2)).await {
+            selected = Some((None, stream));
         }
     }
     let Some((path, outbound)) = selected else {
@@ -1096,13 +1181,14 @@ pub async fn run_with_controls(
     args: DirectArgs,
     external: Option<mpsc::Receiver<Control>>,
 ) -> Result<()> {
-    run_with_guidance(args, external, None).await
+    run_with_guidance(args, external, None, None).await
 }
 
 pub async fn run_with_guidance(
     args: DirectArgs,
     external: Option<mpsc::Receiver<Control>>,
     guidance: Option<watch::Sender<Guidance>>,
+    relay_route: Option<watch::Receiver<Option<RelayRoute>>>,
 ) -> Result<()> {
     ensure!(
         args.listen.ip().is_loopback(),
@@ -1131,6 +1217,7 @@ pub async fn run_with_guidance(
         direct_connections: Arc::new(AtomicU64::new(0)),
         relay_connections: Arc::new(AtomicU64::new(0)),
         relay_fallback: Arc::new(AtomicBool::new(args.relay_fallback)),
+        relay_route,
         cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
         brain_advice: Arc::new(RwLock::new(None)),
         local_advice: Arc::new(RwLock::new(None)),
@@ -1178,6 +1265,99 @@ pub async fn run_with_guidance(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn preferred_connection_wins_without_opening_a_backup() {
+        let launched = Arc::new(AtomicUsize::new(0));
+        let attempts = (0..4).map(|index| {
+            let launched = launched.clone();
+            async move {
+                launched.fetch_add(1, Ordering::Relaxed);
+                Ok(index)
+            }
+        });
+        assert_eq!(race_connections(attempts, CONNECT_BUDGET).await.unwrap(), 0);
+        assert_eq!(launched.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_primary_does_not_hold_backup_and_losing_leases_are_dropped() {
+        let primary = parse_path("en0=192.0.2.1,false").unwrap();
+        let backup = parse_path("en7=192.0.2.2,false").unwrap();
+        let started = Instant::now();
+        let attempts = [primary.clone(), backup.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| async move {
+                let mut lease = PathLease::new(path);
+                if index == 0 {
+                    std::future::pending::<()>().await;
+                }
+                lease.connected();
+                Ok(lease)
+            });
+        let winner = race_connections(attempts, CONNECT_BUDGET).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(primary.active.load(Ordering::Relaxed), 0);
+        assert_eq!(primary.connecting.load(Ordering::Relaxed), 0);
+        assert_eq!(backup.active.load(Ordering::Relaxed), 1);
+        drop(winner);
+        assert_eq!(backup.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn all_stalled_candidates_share_one_deadline_and_release_reservations() {
+        let path = parse_path("en0=192.0.2.1,false").unwrap();
+        let attempts = (0..16).map(|_| {
+            let path = path.clone();
+            async move {
+                let _lease = PathLease::new(path);
+                std::future::pending::<Result<()>>().await
+            }
+        });
+        let started = Instant::now();
+        assert!(
+            race_connections(attempts, Duration::from_millis(220))
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(path.active.load(Ordering::Relaxed), 0);
+        assert_eq!(path.connecting.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn refused_candidates_do_not_add_a_stagger_delay_each() {
+        let started = Instant::now();
+        let attempts = (0..8).map(|index| async move {
+            ensure!(index == 7, "refused");
+            Ok(index)
+        });
+        assert_eq!(race_connections(attempts, CONNECT_BUDGET).await.unwrap(), 7);
+        assert!(started.elapsed() < CONNECT_STAGGER);
+    }
+
+    #[tokio::test]
+    async fn hybrid_relay_cannot_fall_through_to_default_when_unready_or_invalid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (route_tx, route_rx) = watch::channel(None);
+        assert!(
+            connect_via_relay(endpoint, Some(route_rx.clone()))
+                .await
+                .is_err()
+        );
+        route_tx.send_replace(Some(RelayRoute {
+            interface: "utun4294967294".into(),
+            address: Ipv4Addr::LOCALHOST,
+        }));
+        assert!(connect_via_relay(endpoint, Some(route_rx)).await.is_err());
+        assert!(
+            time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     fn runtime(paths: Vec<Arc<Path>>, policy: Policy) -> Runtime {
         Runtime {
             paths: Arc::new(RwLock::new(paths)),
@@ -1188,6 +1368,7 @@ mod tests {
             direct_connections: Arc::new(AtomicU64::new(0)),
             relay_connections: Arc::new(AtomicU64::new(0)),
             relay_fallback: Arc::new(AtomicBool::new(false)),
+            relay_route: None,
             cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
             brain_advice: Arc::new(RwLock::new(None)),
             local_advice: Arc::new(RwLock::new(None)),

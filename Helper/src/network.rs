@@ -59,10 +59,26 @@ fn run(program: &str, args: &[&str]) -> Result<String> {
 pub struct NetworkGuard {
     routes: Vec<Vec<String>>,
     dns: Vec<(String, Vec<String>)>,
+    tun: String,
+    preserve_dns: bool,
+    captured: bool,
 }
 
 impl NetworkGuard {
     pub fn configure(tun: &str, physical: &[String], relay: &str) -> Result<Self> {
+        let mut guard = Self::prepare(tun, physical, relay, false)?;
+        guard.capture()?;
+        Ok(guard)
+    }
+
+    /// Prepare only interface-scoped routes. Existing global routing and DNS
+    /// remain untouched while the helper verifies direct and encrypted paths.
+    pub fn prepare(
+        tun: &str,
+        physical: &[String],
+        relay: &str,
+        preserve_dns: bool,
+    ) -> Result<Self> {
         ensure!(
             tun.starts_with("utun") && tun.chars().all(|c| c.is_ascii_alphanumeric()),
             "invalid tunnel interface"
@@ -76,7 +92,13 @@ impl NetworkGuard {
             !current.starts_with("utun") && !current.starts_with("tun"),
             "another VPN currently owns internet routing; verified VPN-underlay coexistence is not available in this build"
         );
-        let mut guard = Self::default();
+        let mut guard = Self {
+            tun: tun.to_owned(),
+            preserve_dns,
+            routes: Vec::new(),
+            dns: Vec::new(),
+            captured: false,
+        };
         let mut configured = 0;
         for interface in physical {
             if guard.add_uplink(interface, relay).is_ok() {
@@ -84,16 +106,34 @@ impl NetworkGuard {
             }
         }
         ensure!(configured > 0, "no selected interface has a usable gateway");
-        guard.add_route(&["-net", "0.0.0.0/1", "-interface", tun])?;
-        guard.add_route(&["-net", "128.0.0.0/1", "-interface", tun])?;
-        guard.add_route(&["-inet6", "-net", "::/1", "-interface", tun])?;
-        guard.add_route(&["-inet6", "-net", "8000::/1", "-interface", tun])?;
-        guard.refresh_dns()?;
+        // Hybrid relay sockets bind explicitly to utun, so protected traffic
+        // cannot escape via the old default during preparation/rollback.
+        guard.add_route(&["-net", "default", "-interface", tun, "-ifscope", tun])?;
+        let prepared_default = run("/sbin/route", &["-n", "get", "1.1.1.1"])?;
         ensure!(
-            !guard.dns.is_empty(),
-            "no active network service found for tunnel DNS"
+            !prepared_default.lines().any(|line| line
+                .trim()
+                .strip_prefix("interface:")
+                .is_some_and(|name| name.trim() == tun)),
+            "preparation unexpectedly captured the global internet route"
         );
         Ok(guard)
+    }
+
+    pub fn capture(&mut self) -> Result<()> {
+        ensure!(!self.captured, "traffic capture is already active");
+        let tun = self.tun.clone();
+        self.add_route(&["-net", "0.0.0.0/1", "-interface", &tun])?;
+        self.add_route(&["-net", "128.0.0.0/1", "-interface", &tun])?;
+        self.add_route(&["-inet6", "-net", "::/1", "-interface", &tun])?;
+        self.add_route(&["-inet6", "-net", "8000::/1", "-interface", &tun])?;
+        self.refresh_dns()?;
+        ensure!(
+            self.preserve_dns || !self.dns.is_empty(),
+            "no active network service found for tunnel DNS"
+        );
+        self.captured = true;
+        Ok(())
     }
 
     pub fn add_uplink(&mut self, physical: &str, relay: &str) -> Result<()> {
@@ -171,6 +211,9 @@ impl NetworkGuard {
     }
 
     pub fn refresh_dns(&mut self) -> Result<()> {
+        if self.preserve_dns {
+            return Ok(());
+        }
         let services = run("/usr/sbin/networksetup", &["-listallnetworkservices"])?;
         for service in services
             .lines()
@@ -266,6 +309,74 @@ impl NetworkGuard {
     }
 }
 
+/// No bulk transfer and no changes to the user's network preferences. This
+/// exercises DNS and a real outbound TCP connection before publishing SOCKS.
+pub fn verify_socks(endpoint: &str) -> Result<()> {
+    verify_socks_with_budget(endpoint, std::time::Duration::from_secs(6))
+}
+
+fn verify_socks_with_budget(endpoint: &str, budget: std::time::Duration) -> Result<()> {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::{Duration, Instant},
+    };
+    let address: std::net::SocketAddr = endpoint.parse()?;
+    ensure!(
+        address.ip().is_loopback(),
+        "readiness endpoint must be loopback"
+    );
+    let deadline = Instant::now() + budget;
+    let mut stream = TcpStream::connect_timeout(&address, budget.min(Duration::from_millis(500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    stream.write_all(&[5, 1, 0])?;
+    let read = |stream: &mut TcpStream, mut data: &mut [u8]| -> Result<()> {
+        while !data.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .context("direct readiness timed out")?;
+            stream.set_read_timeout(Some(remaining))?;
+            let count = stream.read(data)?;
+            ensure!(count > 0, "direct readiness connection closed");
+            data = &mut data[count..];
+        }
+        Ok(())
+    };
+    let mut greeting = [0; 2];
+    read(&mut stream, &mut greeting)?;
+    ensure!(greeting == [5, 0], "direct readiness authentication failed");
+    let hostname = b"example.com";
+    let mut request = vec![5, 1, 0, 3, hostname.len() as u8];
+    request.extend_from_slice(hostname);
+    request.extend_from_slice(&443_u16.to_be_bytes());
+    stream.write_all(&request)?;
+    let mut response = [0; 10];
+    read(&mut stream, &mut response)?;
+    ensure!(
+        response[..4] == [5, 0, 0, 1],
+        "direct DNS/TCP readiness failed"
+    );
+    Ok(())
+}
+
+pub fn verify_tunnel(tun: &str) -> Result<()> {
+    // The point-to-point peer has a connected /32 route even before capture.
+    let route = run("/sbin/route", &["-n", "get", "10.78.0.1"])?;
+    ensure!(
+        route.lines().any(|line| line
+            .trim()
+            .strip_prefix("interface:")
+            .is_some_and(|name| name.trim() == tun)),
+        "relay peer is not routed through the prepared tunnel"
+    );
+    run(
+        "/sbin/ping",
+        &["-n", "-c", "1", "-W", "1000", "-t", "2", "10.78.0.1"],
+    )
+    .context("encrypted relay readiness failed")?;
+    Ok(())
+}
+
 impl Drop for NetworkGuard {
     fn drop(&mut self) {
         for error in self.restore() {
@@ -277,6 +388,71 @@ impl Drop for NetworkGuard {
 #[cfg(test)]
 mod gateway_tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn hybrid_dns_refresh_is_a_noop_before_and_after_capture() {
+        let mut guard = NetworkGuard {
+            preserve_dns: true,
+            tun: String::new(),
+            routes: Vec::new(),
+            dns: Vec::new(),
+            captured: false,
+        };
+        guard.refresh_dns().unwrap();
+        assert!(guard.dns.is_empty());
+        guard.captured = true;
+        guard.refresh_dns().unwrap();
+        assert!(guard.dns.is_empty());
+        assert!(guard.restore().is_empty());
+    }
+
+    #[test]
+    fn readiness_requires_a_successful_outbound_socks_reply() {
+        for status in [0, 4] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = listener.local_addr().unwrap().to_string();
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut hello = [0; 3];
+                socket.read_exact(&mut hello).unwrap();
+                assert_eq!(hello, [5, 1, 0]);
+                socket.write_all(&[5, 0]).unwrap();
+                let mut request = [0; 18];
+                socket.read_exact(&mut request).unwrap();
+                assert_eq!(&request[5..16], b"example.com");
+                assert_eq!(&request[16..], &443_u16.to_be_bytes());
+                socket
+                    .write_all(&[5, status, 0, 1, 127, 0, 0, 1, 1, 1])
+                    .unwrap();
+            });
+            assert_eq!(verify_socks(&endpoint).is_ok(), status == 0);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn readiness_timeout_does_not_wait_for_a_stalled_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let started = Instant::now();
+        assert!(verify_socks_with_budget(&endpoint, Duration::from_millis(30)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(150));
+        server.join().unwrap();
+        assert!(verify_socks("192.0.2.1:1080").is_err());
+    }
     #[test]
     fn gateway_is_scoped_to_its_adapter_even_with_overlapping_subnets() {
         let route = "gateway: 192.168.1.1\ninterface: en7\nflags: <UP,GATEWAY,IFSCOPE>";
