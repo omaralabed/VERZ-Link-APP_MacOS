@@ -56,6 +56,10 @@ struct PathTelemetry: Decodable, Identifiable {
     let acknowledgedBytes: UInt64
     let deliveryBps: Double
     var latencyExcluded: Bool?
+    var realtimePreferred: Bool?
+    var uploadBps: Double?
+    var downloadBps: Double?
+    var activeFlows: UInt64?
 }
 struct BondTelemetry: Decodable {
     let paths: [PathTelemetry]
@@ -68,6 +72,7 @@ struct BrainState: Decodable {
     let connected: Bool
     let generation: UInt64
     let strategy: String
+    var learnedPaths: Int?
 }
 
 @MainActor
@@ -102,6 +107,7 @@ final class LinkModel: ObservableObject {
     @Published var brainConnected = false
     @Published var brainGeneration: UInt64 = 0
     @Published var brainStrategy = "local-fallback"
+    @Published var brainLearnedPaths = 0
     private var directHealthyPaths = 0
     private var secureHealthyPaths = 0
     private var connectedAt: Date?
@@ -292,6 +298,7 @@ final class LinkModel: ObservableObject {
                 brainConnected = report.connected
                 brainGeneration = report.generation
                 brainStrategy = report.strategy
+                brainLearnedPaths = report.learnedPaths ?? 0
                 if changed {
                     log(report.connected ? "Encrypted server brain connected · adaptive path advice active"
                         : "Server brain unavailable · local safe policy remains active")

@@ -223,10 +223,15 @@ struct ContentView: View {
                     Spacer()
                     if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
-                            Text(path.latencyExcluded == true ? "High RTT · standby / last resort" : path.state.capitalized)
-                                .foregroundStyle(path.state == "healthy" && path.latencyExcluded != true ? mint : muted)
+                            Text(path.state == "offline" ? "Offline" : (path.latencyExcluded == true || path.realtimePreferred == false)
+                                 ? "Transfers · calls prefer another link" : path.state.capitalized)
+                                .foregroundStyle(path.state == "healthy" ? mint : muted)
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
                             Text("↑ \(ByteCountFormatter.string(fromByteCount: Int64(path.sentBytes), countStyle: .decimal))  ↓ \(ByteCountFormatter.string(fromByteCount: Int64(path.receivedBytes), countStyle: .decimal))").foregroundStyle(muted)
+                            if let down = path.downloadBps, let up = path.uploadBps {
+                                Text(String(format: "↓ %.1f  ↑ %.1f Mbps · %llu flows", down / 1_000_000, up / 1_000_000, path.activeFlows ?? 0))
+                                    .foregroundStyle(muted)
+                            }
                         }.font(.system(size: 10))
                     }
                     Toggle("Use", isOn: Binding(get: { !model.disabledInterfaces.contains(interface.name) },
@@ -237,10 +242,10 @@ struct ContentView: View {
                 }.padding(.vertical, 5)
             }
             Text(model.mode == .secure
-                 ? "Connected adapters appear automatically. Links at 75 ms RTT or above stop carrying data when another usable link exists; probes continue."
+                 ? "Transfers can use all responsive links. Calls and recognized live streams prefer links below 75 ms RTT. Local congestion control protects the connection."
                  : model.mode == .hybrid
-                 ? "Both engines keep every usable adapter warm. The server brain advises weights; 75 ms paths become standby while faster links exist."
-                 : "Direct Smart assigns each new TCP connection to one adapter. A path at 75 ms RTT or above receives no new flows while a faster healthy path exists; probing continues.")
+                 ? "The brain learns upload and download performance; the Mac assigns new flows and reacts locally to failures. Higher-ping links can still help transfers."
+                 : "Direct Smart learns from live transfers and shares new TCP flows across usable adapters. One established direct connection stays on its original adapter.")
                 .font(.system(size: 10)).foregroundStyle(muted)
             HStack {
                 Text("Connection preference").font(.system(size: 12))
@@ -350,8 +355,13 @@ struct ContentView: View {
                         Text(model.brainConnected ? "ADVICE #\(model.brainGeneration)" : "OFFLINE-SAFE")
                             .font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(muted)
                     }.font(.system(size: 12))
-                    Text("The control channel is authenticated and encrypted. It sends path health only—never application payloads, destinations, or browsing data.")
+                    Text("The encrypted brain learns from per-link byte counts, timing and reachability. It advises upload, download and real-time placement. The Mac keeps its own controller for immediate decisions and outages. No payloads or destinations are sent to the brain.")
                         .font(.system(size: 11)).foregroundStyle(muted)
+                    if model.brainConnected {
+                        Text(model.brainLearnedPaths == 0 ? "Learning from traffic as you use the connection…"
+                             : "Transfer performance observed on \(model.brainLearnedPaths) links")
+                            .font(.system(size: 11)).foregroundStyle(mint)
+                    }
                     Divider()
                     Text("Always use Secure Continuity for these domains").font(.system(size: 13, weight: .medium))
                     TextEditor(text: $model.secureDomainsText)
@@ -359,7 +369,7 @@ struct ContentView: View {
                         .frame(height: 76).padding(6)
                         .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 7))
                         .disabled(model.busy)
-                    Text("One suffix per line or separated by commas. Subdomains match automatically. Other supported TCP flows remain direct and fall back to the warm relay only if every direct path fails.")
+                    Text("Add call and live-stream domains before starting them; encrypted traffic on port 443 cannot be identified reliably. Recognized RTMP/RTSP/SIP/TURN ports also use the warm relay. Continuity preference relays all new supported TCP flows. Direct sessions cannot migrate to a different public IP.")
                         .font(.system(size: 11)).foregroundStyle(muted)
                 }
                 Divider()

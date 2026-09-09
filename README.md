@@ -28,25 +28,29 @@ Automatic Hybrid keeps Direct Smart and Secure Continuity warm at the same
 time. Proxy-aware TCP goes direct unless its domain suffix is listed under
 Hybrid Security or every direct path fails. Escalated traffic uses the existing
 encrypted relay without reconnecting the Hybrid session. The encrypted server
-brain receives path health metadata only and advises weights/cutoffs; the Mac
+brain receives path health and byte-count metadata only and advises weights; the Mac
 keeps a safe local policy if that control channel is unavailable.
 
 Connected Wi-Fi and Ethernet links appear automatically. Unplugged ports are
 hidden; a cable-connected adapter waiting for DHCP remains visible. Each path
 has Use/Metered controls. Multiple Macs get separate tunnel sessions/IP leases.
 
-In Direct Smart, the Rust engine probes every adapter independently and rotates
-new flows across eligible links. A path at 75 ms RTT or above receives no new
-flows while a faster healthy path exists; it remains under observation. The
+In Direct Smart, the Rust engine probes every adapter independently, learns
+directional goodput from live socket IO, and assigns new flows by load and
+observed performance. Higher-ping links remain available for transfers; 75 ms
+is a real-time preference, not a blanket cutoff. See [adaptive brain](ADAPTIVE_BRAIN.md)
+for the controller, supported traffic classification, and remaining gates. The
 current direct path uses the macOS system SOCKS setting, so it covers apps that
 honor that setting. Transparent UDP/QUIC and migration of one established
 session remain Apple Network Extension gates.
 
 In Secure Continuity, Smart mode schedules bulk traffic across eligible links using RTT and available
 congestion-window capacity, not a fixed primary connection. A 40 ms RTT
-difference does not exclude a path. At 75 ms smoothed RTT a path becomes standby,
-with probes retained and recovery below 65 ms. If all paths exceed the cutoff,
-the least-latency responsive path remains a last resort to avoid a blackhole.
+difference does not exclude a path. At 75 ms smoothed RTT a path remains eligible
+for bulk but is not preferred for latency-sensitive packets, with recovery below
+65 ms. If all paths exceed the cutoff, real-time traffic uses the least-latency
+responsive path as a last resort. Recognized video is prioritized but not
+duplicated in full; small/control/EF-marked packets retain selective redundancy.
 
 The signed app registers its macOS-managed connection helper once. Enable VERZ
 Link in System Settings → General → Login Items & Extensions when requested,

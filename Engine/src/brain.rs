@@ -34,19 +34,36 @@ pub struct BrainServerArgs {
     pub secret_file: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PathReport {
     pub name: String,
     pub rtt_ms: Option<f64>,
     pub healthy: bool,
     pub metered: bool,
     pub failures: u64,
+    /// Cumulative application bytes, not physical interface counters or payloads.
+    #[serde(default, rename = "tx", alias = "sent_bytes")]
+    pub sent_bytes: u64,
+    #[serde(default, rename = "rx", alias = "received_bytes")]
+    pub received_bytes: u64,
+    #[serde(default, rename = "flows", alias = "active_flows")]
+    pub active_flows: u64,
+    #[serde(default)]
+    pub jitter_ms: f64,
+    /// Failed reachability probes / probes, smoothed locally. NOT packet loss.
+    #[serde(default, rename = "probe_fail", alias = "probe_failure_ratio")]
+    pub probe_failure_ratio: f64,
+    /// Changes when an adapter changes address; contains no address itself.
+    #[serde(default, rename = "epoch", alias = "incarnation")]
+    pub incarnation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientReport {
     pub policy: Policy,
     pub paths: Vec<PathReport>,
+    #[serde(default)]
+    pub sample_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -57,6 +74,161 @@ pub struct BrainAdvice {
     pub recovery_ms: f64,
     pub relay_fallback: bool,
     pub weights: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub download_weights: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub upload_weights: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub realtime_weights: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub learned_paths: usize,
+    #[serde(default)]
+    pub valid_for_ms: u64,
+}
+
+pub type Guidance = Option<(std::time::Instant, BrainAdvice)>;
+
+#[derive(Default)]
+struct Observation {
+    sample_ms: u64,
+    sent: u64,
+    received: u64,
+    upload_bps: f64,
+    download_bps: f64,
+    incarnation: u64,
+}
+
+/// Online feedback controller, not a pretrained AI model. Learns a decaying
+/// goodput envelope separately in each direction. Goodput is only an observed
+/// lower bound on capacity; exploration and a bounded weight ratio prevent a
+/// quiet or newly connected path from being permanently starved.
+#[derive(Default)]
+pub struct Controller {
+    observations: BTreeMap<String, Observation>,
+}
+
+impl Controller {
+    pub fn advise(&mut self, report: &ClientReport, generation: u64) -> BrainAdvice {
+        self.observations
+            .retain(|name, _| report.paths.iter().any(|p| p.name == *name));
+        for p in &report.paths {
+            let prior = self.observations.entry(p.name.clone()).or_default();
+            let elapsed = report.sample_ms.saturating_sub(prior.sample_ms);
+            let same = p.incarnation == prior.incarnation
+                && p.sent_bytes >= prior.sent
+                && p.received_bytes >= prior.received
+                && (100..=10_000).contains(&elapsed);
+            if same {
+                // Decay old evidence over 30 seconds. Sparse/idle traffic is
+                // not evidence of poor capacity, so it cannot create a cap.
+                let decay = (-(elapsed as f64) / 30_000.0).exp();
+                let rate = |bytes: u64| bytes as f64 * 8_000.0 / elapsed as f64;
+                prior.upload_bps = (prior.upload_bps * decay).max(rate(p.sent_bytes - prior.sent));
+                prior.download_bps =
+                    (prior.download_bps * decay).max(rate(p.received_bytes - prior.received));
+            } else {
+                prior.upload_bps = 0.0;
+                prior.download_bps = 0.0;
+            }
+            prior.sample_ms = report.sample_ms;
+            prior.sent = p.sent_bytes;
+            prior.received = p.received_bytes;
+            prior.incarnation = p.incarnation;
+        }
+        let usable: Vec<_> = report.paths.iter().filter(|p| p.healthy).collect();
+        let has_unmetered = usable.iter().any(|p| !p.metered);
+        let eligible = |p: &PathReport| {
+            p.healthy && !(report.policy == Policy::DataSaver && p.metered && has_unmetered)
+        };
+        let reference = |upload: bool| {
+            let mut rates: Vec<f64> = report
+                .paths
+                .iter()
+                .filter(|p| eligible(p))
+                .filter_map(|p| self.observations.get(&p.name))
+                .map(|o| if upload { o.upload_bps } else { o.download_bps })
+                .filter(|v| *v >= 64_000.0)
+                .collect();
+            rates.sort_by(f64::total_cmp);
+            rates.get(rates.len() / 2).copied().unwrap_or(1_000_000.0)
+        };
+        let up_reference = reference(true);
+        let down_reference = reference(false);
+        let has_fast = report
+            .paths
+            .iter()
+            .any(|p| eligible(p) && p.rtt_ms.is_some_and(|v| v > 0.0 && v < CUTOFF_MS));
+        let best = report
+            .paths
+            .iter()
+            .filter(|p| eligible(p))
+            .min_by(|a, b| realtime_cost(a).total_cmp(&realtime_cost(b)))
+            .map(|p| p.name.as_str());
+        let mut advice = BrainAdvice {
+            generation,
+            strategy: "adaptive-goodput-v2".into(),
+            cutoff_ms: CUTOFF_MS,
+            recovery_ms: RECOVERY_MS,
+            relay_fallback: true,
+            weights: BTreeMap::new(),
+            download_weights: BTreeMap::new(),
+            upload_weights: BTreeMap::new(),
+            realtime_weights: BTreeMap::new(),
+            learned_paths: 0,
+            valid_for_ms: 5_000,
+        };
+        for p in &report.paths {
+            let o = &self.observations[&p.name];
+            if o.upload_bps >= 64_000.0 || o.download_bps >= 64_000.0 {
+                advice.learned_paths += 1;
+            }
+            let reliability = 1.0 - finite(p.probe_failure_ratio, 0.0).clamp(0.0, 1.0) * 0.8;
+            let weight = |rate: f64, reference: f64| {
+                if !eligible(p) {
+                    return 0;
+                }
+                let relative = if rate >= 64_000.0 {
+                    rate / reference
+                } else {
+                    1.0
+                };
+                (16.0 * relative.sqrt().clamp(0.25, 4.0) * reliability)
+                    .round()
+                    .clamp(1.0, 64.0) as u32
+            };
+            let up = weight(o.upload_bps, up_reference);
+            let down = weight(o.download_bps, down_reference);
+            advice.upload_weights.insert(p.name.clone(), up);
+            advice.download_weights.insert(p.name.clone(), down);
+            advice
+                .weights
+                .insert(p.name.clone(), (up + down).div_ceil(2));
+            let realtime = eligible(p)
+                && if has_fast {
+                    p.rtt_ms.is_some_and(|v| v > 0.0 && v < CUTOFF_MS)
+                } else {
+                    best == Some(p.name.as_str())
+                };
+            advice.realtime_weights.insert(
+                p.name.clone(),
+                if realtime {
+                    (640.0 / realtime_cost(p)).round().clamp(1.0, 64.0) as u32
+                } else {
+                    0
+                },
+            );
+        }
+        advice
+    }
+}
+
+fn finite(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+fn realtime_cost(p: &PathReport) -> f64 {
+    finite(p.rtt_ms.unwrap_or(1_000.0), 1_000.0).clamp(1.0, 10_000.0)
+        + 4.0 * finite(p.jitter_ms, 0.0).clamp(0.0, 1_000.0)
+        + 500.0 * finite(p.probe_failure_ratio, 0.0).clamp(0.0, 1.0)
 }
 
 pub struct BrainClient {
@@ -146,44 +318,7 @@ impl BrainClient {
 }
 
 pub fn advise(report: &ClientReport, generation: u64) -> BrainAdvice {
-    let mut weights = BTreeMap::new();
-    let healthy: Vec<_> = report.paths.iter().filter(|path| path.healthy).collect();
-    let has_unmetered = healthy.iter().any(|path| !path.metered);
-    let has_fast = healthy
-        .iter()
-        .any(|path| path.rtt_ms.is_some_and(|rtt| rtt < CUTOFF_MS));
-    let best_slow = (!has_fast)
-        .then(|| {
-            healthy
-                .iter()
-                .filter_map(|path| path.rtt_ms)
-                .min_by(f64::total_cmp)
-        })
-        .flatten();
-
-    for path in &report.paths {
-        let excluded = !path.healthy
-            || (report.policy == Policy::DataSaver && path.metered && has_unmetered)
-            || (has_fast && path.rtt_ms.is_some_and(|rtt| rtt >= CUTOFF_MS))
-            || best_slow.is_some_and(|best| path.rtt_ms.is_some_and(|rtt| rtt > best));
-        let weight = if excluded {
-            0
-        } else if report.policy == Policy::Continuity {
-            1
-        } else {
-            let rtt = path.rtt_ms.unwrap_or(25.0).clamp(1.0, CUTOFF_MS);
-            ((CUTOFF_MS / rtt).round() as u32).clamp(1, 8)
-        };
-        weights.insert(path.name.clone(), weight);
-    }
-    BrainAdvice {
-        generation,
-        strategy: "adaptive-weighted-flow-v1".into(),
-        cutoff_ms: CUTOFF_MS,
-        recovery_ms: RECOVERY_MS,
-        relay_fallback: true,
-        weights,
-    }
+    Controller::default().advise(report, generation)
 }
 
 async fn serve_connection(
@@ -192,15 +327,22 @@ async fn serve_connection(
     generations: Arc<AtomicU64>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
-    let mut noise = server_handshake(&mut stream, &secret).await?;
+    let mut noise = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server_handshake(&mut stream, &secret),
+    )
+    .await??;
+    let mut controller = Controller::default();
     loop {
-        let encrypted = read_frame(&mut stream).await?;
+        let encrypted =
+            tokio::time::timeout(std::time::Duration::from_secs(15), read_frame(&mut stream))
+                .await??;
         let mut plain = vec![0; encrypted.len()];
         let size = noise.read_message(&encrypted, &mut plain)?;
         let report: ClientReport = serde_json::from_slice(&plain[..size])?;
         ensure!(report.paths.len() <= 256, "too many reported paths");
         let generation = generations.fetch_add(1, Ordering::Relaxed) + 1;
-        let advice = advise(&report, generation);
+        let advice = controller.advise(&report, generation);
         let plain = serde_json::to_vec(&advice)?;
         let mut encrypted = vec![0; plain.len() + 64];
         let size = noise.write_message(&plain, &mut encrypted)?;
@@ -231,6 +373,7 @@ mod tests {
     fn report(policy: Policy) -> ClientReport {
         ClientReport {
             policy,
+            sample_ms: 0,
             paths: vec![
                 PathReport {
                     name: "en0".into(),
@@ -238,6 +381,7 @@ mod tests {
                     healthy: true,
                     metered: false,
                     failures: 0,
+                    ..PathReport::default()
                 },
                 PathReport {
                     name: "en7".into(),
@@ -245,6 +389,7 @@ mod tests {
                     healthy: true,
                     metered: false,
                     failures: 0,
+                    ..PathReport::default()
                 },
                 PathReport {
                     name: "en8".into(),
@@ -252,16 +397,18 @@ mod tests {
                     healthy: true,
                     metered: true,
                     failures: 0,
+                    ..PathReport::default()
                 },
             ],
         }
     }
 
     #[test]
-    fn advice_weights_fast_paths_and_excludes_slow_path() {
+    fn high_latency_is_bulk_capacity_but_not_realtime_preferred() {
         let advice = advise(&report(Policy::Performance), 9);
-        assert!(advice.weights["en0"] > advice.weights["en7"]);
-        assert_eq!(advice.weights["en8"], 0);
+        assert_eq!(advice.weights["en0"], advice.weights["en7"]);
+        assert!(advice.weights["en8"] > 0);
+        assert_eq!(advice.realtime_weights["en8"], 0);
         assert_eq!(advice.generation, 9);
         assert!(advice.relay_fallback);
     }
@@ -274,15 +421,94 @@ mod tests {
     }
 
     #[test]
-    fn all_slow_uses_only_lowest_rtt() {
+    fn all_slow_keeps_bulk_paths_and_best_realtime_last_resort() {
         let mut report = report(Policy::Smart);
         report.paths[0].rtt_ms = Some(100.0);
         report.paths[1].rtt_ms = Some(90.0);
         report.paths[2].rtt_ms = Some(110.0);
         let advice = advise(&report, 1);
-        assert_eq!(advice.weights["en7"], 1);
+        assert!(advice.weights.values().all(|v| *v > 0));
+        assert!(advice.realtime_weights["en7"] > 0);
+        assert_eq!(advice.realtime_weights["en0"], 0);
+        assert_eq!(advice.realtime_weights["en8"], 0);
+    }
+
+    #[test]
+    fn learns_opposite_upload_download_strengths_without_starving_new_paths() {
+        let mut report = report(Policy::Smart);
+        let mut controller = Controller::default();
+        controller.advise(&report, 1);
+        report.sample_ms = 1_000;
+        report.paths[0].received_bytes = 30_000_000;
+        report.paths[0].sent_bytes = 1_000_000;
+        report.paths[1].received_bytes = 1_000_000;
+        report.paths[1].sent_bytes = 30_000_000;
+        let advice = controller.advise(&report, 2);
+        assert!(advice.download_weights["en0"] > advice.download_weights["en7"]);
+        assert!(advice.upload_weights["en7"] > advice.upload_weights["en0"]);
+        assert!(advice.weights["en8"] > 0);
+        assert_eq!(advice.learned_paths, 2);
+        report.paths[0].incarnation += 1;
+        report.sample_ms += 1_000;
+        assert_eq!(controller.advise(&report, 3).learned_paths, 1);
+    }
+
+    #[test]
+    fn evidence_adapts_after_capacity_changes_and_counters_reset() {
+        let mut report = report(Policy::Smart);
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        for second in 1..=180 {
+            report.sample_ms = second * 1_000;
+            report.paths[0].received_bytes += if second <= 5 { 30_000_000 } else { 100_000 };
+            report.paths[1].received_bytes += 10_000_000;
+            controller.advise(&report, second);
+        }
+        let advice = controller.advise(
+            &ClientReport {
+                sample_ms: 181_000,
+                ..report.clone()
+            },
+            181,
+        );
+        assert!(advice.download_weights["en7"] > advice.download_weights["en0"]);
+        report.paths[0].received_bytes = 0;
+        report.sample_ms = 182_000;
+        controller.advise(&report, 182);
+        assert_eq!(controller.observations["en0"].download_bps, 0.0);
+    }
+
+    #[test]
+    fn failed_paths_are_excluded_and_invalid_metrics_are_bounded() {
+        let mut report = report(Policy::Smart);
+        report.paths[0].healthy = false;
+        report.paths[1].jitter_ms = f64::NAN;
+        report.paths[1].probe_failure_ratio = f64::INFINITY;
+        let advice = advise(&report, 1);
         assert_eq!(advice.weights["en0"], 0);
-        assert_eq!(advice.weights["en8"], 0);
+        assert!(advice.weights.values().all(|v| *v <= 64));
+        assert!(advice.realtime_weights["en7"] > 0);
+    }
+
+    #[test]
+    fn metadata_is_bounded_for_256_adapters_and_v1_is_readable() {
+        let mut report = report(Policy::Smart);
+        report.paths = (0..256)
+            .map(|i| PathReport {
+                name: format!("en{i}"),
+                sent_bytes: u64::MAX,
+                received_bytes: u64::MAX,
+                incarnation: u64::MAX,
+                active_flows: 1_024,
+                rtt_ms: Some(123.123456789),
+                jitter_ms: 123.123456789,
+                probe_failure_ratio: 0.123456789,
+                ..PathReport::default()
+            })
+            .collect();
+        assert!(serde_json::to_vec(&report).unwrap().len() + 16 < MAX_FRAME);
+        let legacy: ClientReport = serde_json::from_str(r#"{"policy":"smart","paths":[{"name":"en0","rtt_ms":20,"healthy":true,"metered":false,"failures":0}]}"#).unwrap();
+        assert!(advise(&legacy, 1).weights["en0"] > 0);
     }
 
     #[tokio::test]
@@ -297,7 +523,7 @@ mod tests {
         let mut client = BrainClient::connect(address, &secret).await?;
         let advice = client.exchange(&report(Policy::Smart)).await?;
         assert_eq!(advice.generation, 1);
-        assert_eq!(advice.strategy, "adaptive-weighted-flow-v1");
+        assert_eq!(advice.strategy, "adaptive-goodput-v2");
         drop(client);
         assert!(server.await?.is_err());
         Ok(())

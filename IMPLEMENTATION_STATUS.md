@@ -163,3 +163,71 @@ Automatic Hybrid selects between them per supported TCP flow.
 
 Do not label a baseline connection, a synthetic probe, a predicted timeout, or a
 partial feature set as a completed V2 product or a passed 100 ms failover gate.
+# Adaptive brain 0.5.0 — September 9
+
+Implemented the stateful, per-client Rust adaptive controller described in
+[ADAPTIVE_BRAIN.md](ADAPTIVE_BRAIN.md): live directional byte accounting,
+load-aware flow assignment, high-RTT bulk eligibility, expiring brain advice,
+local fallback, conservative real-time classification and prioritized relay
+queues. This is statistical online adaptation, not a pretrained AI model.
+
+Verification: 58 library + 6 runtime Rust tests, 3 helper tests, 9 Swift tests,
+and warning-free Rust clippy. Signed universal macOS builds are development
+products, not notarized distribution or a finished all-app Network Extension.
+
+Controlled relay cut comparison (same 38,610,560-byte generated TCP stream;
+two shaped 10 Mbps virtual WANs, not the physical Mac or Speedtest):
+
+| Build | Transfer bytes/sec | Max observed ICMP reply gap | Replies | Integrity |
+| --- | ---: | ---: | ---: | --- |
+| Previous deployed relay | 1,595,127 | 72.244 ms | 650/650 | SHA-256 matched |
+| Initial all-path bulk change, rejected | 1,429,428 | 135.534 ms | 650/650 | SHA-256 matched |
+| Added-delay-controlled revision | 1,732,509 | 39.754 ms | 650/650 | SHA-256 matched |
+
+Remote artifacts: `/tmp/verz-bond-check.qAcU6d`,
+`/tmp/verz-bond-check.vBk5AI`, `/tmp/verz-bond-check.8FXi4K` respectively.
+The rejected revision built queues and failed the 100 ms gap target. Its
+separate 20/200 ms RTT no-cut run also reached a 165.005 ms gap
+(`/tmp/verz-bond-check.uq73Im`). These failures are retained, not hidden.
+The delay-controlled cut result is one controlled trial, not an unconditional
+100 ms guarantee. Sustained real voice/video and independent-ISP throughput
+acceptance remain open.
+
+The final 20/200 ms RTT no-cut fixture transferred the same file with a matched
+SHA-256 at 1,510,037 bytes/sec, 650/650 replies and a 32.421 ms maximum reply
+gap (`/tmp/verz-bond-check.Y5W2V4`). No physical failover claim follows.
+
+The signed 0.5.0 Debug/Release app and updated relay/brain services were built
+and deployed. The previous server binary is preserved at
+`/opt/verz-link-lab/verz-bond.before-v0.5.0`. On the Mac, the new app reported
+encrypted brain advice and observed transfer performance on two links.
+
+Live inspection also found en0 had a DHCP router but no scoped default route;
+interface-bound connections failed immediately. The helper now recovers the
+route using en0's own DHCP lease and records it for cleanup. Verified the
+new en0 default route and nonzero direct byte/flow counters after reconnect.
+Both adapter switches and the user's metered preferences remain unchanged.
+
+The Wi-Fi connection remains unstable (roughly 0.9–4.5 seconds observed path
+RTT at different times; a Wi-Fi-bound HTTPS request timed out). Ethernet and
+system-relayed requests completed. Four parallel 1 MiB direct-proxy downloads
+completed three HTTP 200 transfers (~0.15 seconds each); one TLS handshake
+timed out at eight seconds. An earlier attempt with four-second connect limits
+timed out on all four. A subsequent proxied HTTPS request succeeded. These are
+bounded functional checks, not a validated aggregate speed result. Do not
+claim the two-ISP throughput or zero-interruption voice/video gate has passed.
+
+Two additional 1 MiB zero-data uploads through the app's SOCKS endpoint
+completed with HTTP 200 in 3.427 and 2.288 seconds. These checks establish
+successful upload IO, not saturated upload bandwidth. Final connected telemetry
+showed nonzero direct traffic on Wi-Fi and Ethernet, with Wi-Fi still near
+2.8 seconds RTT versus Ethernet near 14 ms.
+
+The user then switched Wi-Fi to a phone hotspot. Read-only app inspection
+showed en0 at 172.20.10.2 (~49 ms), Ethernet at ~18 ms, both with active flows
+and nonzero direct traffic. This supersedes the prior home-Wi-Fi health snapshot,
+but is not a matched-baseline aggregate speed result. No further adapter
+selection changes were made after the user confirmed hotspot use.
+The latest helper build also guards route cleanup against roaming: a stale
+home-router ledger entry cannot remove a replacement hotspot route with a
+different gateway. Unit-tested; it takes effect in a newly started session.

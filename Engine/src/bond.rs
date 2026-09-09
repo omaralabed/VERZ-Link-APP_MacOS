@@ -188,6 +188,8 @@ pub struct Path {
     last_congestion: Option<u64>,
     #[serde(skip)]
     growth_credit: usize,
+    #[serde(skip)]
+    last_delay_adjust: Option<u64>,
 }
 impl Path {
     fn new(id: u8, name: String, metered: bool) -> Self {
@@ -216,6 +218,7 @@ impl Path {
             rate_bytes: 0,
             last_congestion: None,
             growth_credit: 0,
+            last_delay_adjust: None,
         }
     }
     pub fn failure_ms(&self) -> u64 {
@@ -246,6 +249,22 @@ impl Path {
             self.jitter_ms = sample / 2.0;
         }
         self.minimum_rtt_ms = self.minimum_rtt_ms.min(sample);
+        let rtt = self.rtt_ms.unwrap_or(sample);
+        // Using a high-baseline-RTT path for bulk is useful; building an ISP
+        // queue on it is not. Back off on added queue delay without calling
+        // geographic latency packet loss or waiting for a retransmit timeout.
+        if rtt - self.minimum_rtt_ms > 10.0
+            && self
+                .last_delay_adjust
+                .is_none_or(|last| now.saturating_sub(last) as f64 >= rtt)
+        {
+            let ratio = ((self.minimum_rtt_ms + 5.0) / rtt).clamp(0.5, 0.9);
+            self.congestion_window =
+                ((self.congestion_window as f64 * ratio) as usize).max(4 * BOND_MTU);
+            self.slow_start_threshold = self.congestion_window;
+            self.growth_credit = 0;
+            self.last_delay_adjust = Some(now);
+        }
         self.last_response = Some(now);
         self.good_samples = self.good_samples.saturating_add(1);
         if self.rtt_ms.unwrap_or(sample) >= LATENCY_CUTOFF_MS {
@@ -268,6 +287,12 @@ impl Path {
     }
 
     fn acknowledge_capacity(&mut self, bytes: usize) {
+        if self
+            .rtt_ms
+            .is_some_and(|rtt| rtt - self.minimum_rtt_ms > 10.0)
+        {
+            return;
+        }
         if self.congestion_window < self.slow_start_threshold {
             // Discover available capacity in RTTs, not tens of seconds of
             // fixed additive growth from the initial 19 KB window.
@@ -328,9 +353,12 @@ pub struct Scheduler {
     pending: BTreeMap<u64, Pending>,
     queued: VecDeque<Vec<u8>>,
     urgent: VecDeque<Vec<u8>>,
+    streaming: VecDeque<Vec<u8>>,
     received: ReplayWindow,
     next_id: u64,
     last_probe: Option<u64>,
+    realtime_advice: BTreeMap<String, u32>,
+    advice_until: u64,
 }
 impl Scheduler {
     pub fn new(names: Vec<(String, bool)>, policy: Policy) -> Result<Self> {
@@ -350,10 +378,17 @@ impl Scheduler {
             pending: BTreeMap::new(),
             queued: VecDeque::new(),
             urgent: VecDeque::new(),
+            streaming: VecDeque::new(),
             received: ReplayWindow::new(16384),
             next_id: 0,
             last_probe: None,
+            realtime_advice: BTreeMap::new(),
+            advice_until: 0,
         })
+    }
+    pub fn set_realtime_advice(&mut self, weights: BTreeMap<String, u32>, until: u64) {
+        self.realtime_advice = weights;
+        self.advice_until = until;
     }
     pub fn enqueue(&mut self, ip: Vec<u8>) {
         let limit = if interactive(&ip) {
@@ -363,12 +398,15 @@ impl Scheduler {
         };
         if ip.len() > BOND_MTU
             || ip.len() < 20
-            || self.queued.len() + self.urgent.len() + self.pending.len() >= limit
+            || self.queued.len() + self.urgent.len() + self.streaming.len() + self.pending.len()
+                >= limit
         {
             self.counters.queue_drops += 1;
         } else {
             if interactive(&ip) {
                 self.urgent.push_back(ip);
+            } else if streaming(&ip) {
+                self.streaming.push_back(ip);
             } else {
                 self.queued.push_back(ip);
             }
@@ -529,16 +567,6 @@ impl Scheduler {
                 .unwrap_or(f64::MAX)
                 .total_cmp(&self.paths[b].rtt_ms.unwrap_or(f64::MAX))
         });
-        if ready
-            .iter()
-            .any(|&index| !self.paths[index].latency_excluded)
-        {
-            ready.retain(|&index| !self.paths[index].latency_excluded);
-        } else {
-            // If every link is above the limit, preserve basic connectivity
-            // over the best one rather than silently blackholing the Mac.
-            ready.truncate(1);
-        }
         if self.policy == Policy::DataSaver && ready.iter().any(|&index| !self.paths[index].metered)
         {
             ready.retain(|&index| !self.paths[index].metered);
@@ -547,11 +575,27 @@ impl Scheduler {
     }
     fn targets(&self, bytes: usize, interactive: bool, now: u64) -> Vec<usize> {
         let mut ready = self.data_paths(now);
-        // No relative-RTT cutoff: a 40 ms difference still adds capacity when
-        // both links remain below the explicit 75 ms ceiling.
+        // 75 ms is now a latency-sensitive placement rule, not a blanket
+        // capacity cutoff. Keep all responsive bulk paths, but keep calls and
+        // recognized streams on low-delay paths when possible.
+        if interactive {
+            if ready.iter().any(|&i| !self.paths[i].latency_excluded) {
+                ready.retain(|&i| !self.paths[i].latency_excluded);
+            } else {
+                ready.truncate(1);
+            }
+        }
         ready.retain(|&index| {
             let path = &self.paths[index];
-            path.in_flight + bytes <= path.congestion_window && path.next_send <= now as f64
+            let reserve = if interactive {
+                0
+            } else {
+                (4 * BOND_MTU)
+                    .min(path.congestion_window / 4)
+                    .min(path.congestion_window.saturating_sub(bytes))
+            };
+            path.in_flight + bytes <= path.congestion_window.saturating_sub(reserve)
+                && path.next_send <= now as f64
         });
         if !interactive {
             ready.sort_by(|&a, &b| {
@@ -559,6 +603,23 @@ impl Scheduler {
                     let p = &self.paths[index];
                     p.rtt_ms.unwrap_or(30.0) / 2.0
                         + (p.in_flight + bytes) as f64 / p.estimated_bytes_per_ms()
+                };
+                cost(a).total_cmp(&cost(b))
+            });
+        } else if now < self.advice_until {
+            ready.sort_by(|&a, &b| {
+                let cost = |i: usize| {
+                    let p = &self.paths[i];
+                    // Remote advice is only a bounded tie-break/bias. Local
+                    // readiness, 75 ms policy, pacing and windows win first.
+                    let weight = self
+                        .realtime_advice
+                        .get(&p.name)
+                        .copied()
+                        .unwrap_or(16)
+                        .clamp(1, 64);
+                    (p.rtt_ms.unwrap_or(30.0) + 4.0 * p.jitter_ms)
+                        / (weight as f64 / 16.0).sqrt().clamp(0.5, 2.0)
                 };
                 cost(a).total_cmp(&cost(b))
             });
@@ -623,7 +684,11 @@ impl Scheduler {
                 self.counters.expired_packets += 1;
                 continue;
             }
-            let mut candidates = self.targets(packet.body.len(), true, now);
+            let mut candidates = self.targets(
+                packet.body.len(),
+                interactive(&packet.body) || streaming(&packet.body),
+                now,
+            );
             // A resend on the same path does not add in-flight bytes. An
             // exhausted congestion window must not deadlock its own repairs.
             for &index in packet.attempts.keys() {
@@ -663,7 +728,11 @@ impl Scheduler {
         // imposed by 32 packets at a 2 ms tick.
         for _ in 0..128 {
             let queue = if self.urgent.is_empty() {
-                &self.queued
+                if self.streaming.is_empty() {
+                    &self.queued
+                } else {
+                    &self.streaming
+                }
             } else {
                 &self.urgent
             };
@@ -671,12 +740,16 @@ impl Scheduler {
                 break;
             };
             let is_interactive = interactive(body);
-            let targets = self.targets(body.len(), is_interactive, now);
+            let targets = self.targets(body.len(), is_interactive || streaming(body), now);
             let Some(&primary) = targets.first() else {
                 break;
             };
             let body = if self.urgent.is_empty() {
-                self.queued.pop_front()
+                if self.streaming.is_empty() {
+                    self.queued.pop_front()
+                } else {
+                    self.streaming.pop_front()
+                }
             } else {
                 self.urgent.pop_front()
             }
@@ -716,7 +789,38 @@ impl Scheduler {
 fn interactive(ip: &[u8]) -> bool {
     // Large UDP/QUIC transfers are bulk too. Treating every UDP packet as
     // interactive duplicated downloads and consumed the capacity being bonded.
-    ip.len() < 600 || ip.get(9) == Some(&1)
+    ip.len() < 600 || ip.get(9) == Some(&1) || ip.get(1).is_some_and(|v| v >> 2 == 46)
+}
+
+fn streaming(ip: &[u8]) -> bool {
+    // Honor explicit video DSCP and recognizable RTMP/RTSP endpoints. Large
+    // unmarked UDP/QUIC is not guessed to be video and is never duplicated.
+    if ip
+        .get(1)
+        .is_some_and(|v| matches!(v >> 2, 34 | 36 | 38 | 40))
+    {
+        return true;
+    }
+    let Some(&version) = ip.first() else {
+        return false;
+    };
+    if version >> 4 != 4
+        || ip.get(9) != Some(&6)
+        || ip.get(6).is_none_or(|v| v & 0x1f != 0)
+        || ip.get(7) != Some(&0)
+    {
+        return false;
+    }
+    let header = usize::from(version & 15) * 4;
+    if header < 20 || ip.len() < header + 4 {
+        return false;
+    }
+    [
+        u16::from_be_bytes([ip[header], ip[header + 1]]),
+        u16::from_be_bytes([ip[header + 2], ip[header + 3]]),
+    ]
+    .iter()
+    .any(|p| matches!(p, 554 | 1935))
 }
 
 #[cfg(test)]
@@ -733,11 +837,13 @@ mod tests {
         s
     }
     #[test]
-    fn seventy_five_ms_path_is_probe_only_until_stable_recovery() {
+    fn seventy_five_ms_path_remains_bulk_only_until_stable_recovery() {
         let mut s = unequal_latency();
         s.paths[1].rtt_ms = Some(75.0);
         s.receive(&Frame::control(Kind::Pong, 1, 100, 25), 100);
-        assert_eq!(s.data_paths(100), vec![0]);
+        assert_eq!(s.data_paths(100), vec![0, 1]);
+        assert_eq!(s.targets(100, true, 100), vec![0]);
+        assert!(s.targets(1200, false, 100).contains(&1));
         assert!(
             s.tick(100)
                 .iter()
@@ -746,7 +852,7 @@ mod tests {
         for now in 101..120 {
             s.receive(&Frame::control(Kind::Pong, 1, now, now - 40), now);
         }
-        assert!(s.data_paths(120).contains(&1));
+        assert!(s.targets(100, true, 120).contains(&1));
     }
     #[test]
     fn all_high_latency_keeps_best_last_resort_instead_of_blackholing() {
@@ -754,7 +860,8 @@ mod tests {
         for p in &mut s.paths {
             p.latency_excluded = true;
         }
-        assert_eq!(s.data_paths(100), vec![0]);
+        assert_eq!(s.data_paths(100), vec![0, 1]);
+        assert_eq!(s.targets(100, true, 100), vec![0]);
     }
     fn bulk() -> Vec<u8> {
         let mut p = vec![0; 1200];
@@ -773,6 +880,71 @@ mod tests {
             s.tick(100).iter().filter(|f| f.kind == Kind::Data).count(),
             1
         );
+    }
+
+    #[test]
+    fn voice_precedes_marked_stream_and_stream_precedes_bulk_without_video_duplication() {
+        let mut s = unequal_latency();
+        let mut video = bulk();
+        video[1] = 34 << 2;
+        let mut voice = packet();
+        voice[1] = 46 << 2;
+        s.enqueue(bulk());
+        s.enqueue(video.clone());
+        s.enqueue(voice.clone());
+        let frames: Vec<_> = s
+            .tick(100)
+            .into_iter()
+            .filter(|f| f.kind == Kind::Data)
+            .collect();
+        assert_eq!(frames[0].body, voice);
+        let video_index = frames.iter().position(|f| f.body == video).unwrap();
+        let bulk_index = frames.iter().position(|f| f.body == bulk()).unwrap();
+        assert!(video_index < bulk_index);
+        assert_eq!(frames.iter().filter(|f| f.body == video).count(), 1);
+        let mut rtmp = bulk();
+        rtmp[22..24].copy_from_slice(&1935_u16.to_be_bytes());
+        assert!(streaming(&rtmp));
+    }
+
+    #[test]
+    fn bulk_reserves_window_space_for_voice() {
+        let mut s = unequal_latency();
+        s.paths[0].congestion_window = 16 * BOND_MTU;
+        s.paths[0].in_flight = 12 * BOND_MTU;
+        s.paths[1].latency_excluded = true;
+        assert!(!s.targets(BOND_MTU, false, 100).contains(&0));
+        assert!(s.targets(200, true, 100).contains(&0));
+    }
+
+    #[test]
+    fn brain_realtime_bias_expires_and_cannot_revive_failed_paths() {
+        let mut s = unequal_latency();
+        s.paths[1].rtt_ms = Some(25.0);
+        s.set_realtime_advice(
+            BTreeMap::from([("wifi".into(), 1), ("ethernet".into(), 64)]),
+            110,
+        );
+        assert_eq!(s.targets(100, true, 100)[0], 1);
+        assert_eq!(s.targets(100, true, 111)[0], 0);
+        s.remove_path(1);
+        assert_eq!(s.targets(100, true, 100), vec![0]);
+    }
+
+    #[test]
+    fn added_queue_delay_reduces_bulk_window_but_high_baseline_rtt_does_not() {
+        let mut p = Path::new(0, "wifi".into(), false);
+        p.congestion_window = 1_000_000;
+        p.observe(500, 300); // 200 ms baseline is not congestion.
+        assert_eq!(p.congestion_window, 1_000_000);
+        for now in 501..520 {
+            p.observe(now, now - 240);
+        }
+        assert!(p.congestion_window < 1_000_000);
+        let window = p.congestion_window;
+        p.acknowledge_capacity(1200);
+        assert_eq!(p.congestion_window, window);
+        assert_eq!(p.timeouts, 0); // Do not label queue-delay backoff packet loss.
     }
 
     #[test]

@@ -3,6 +3,27 @@ import Darwin
 @testable import VERZLink
 
 final class InterfaceTests: XCTestCase {
+    func testAdaptiveTelemetryAcceptsLiveRatesAndLegacyReports() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let legacy = #"{"id":0,"name":"en0","state":"healthy","enabled":true,"rtt_ms":90,"jitter_ms":2,"sent_bytes":100,"received_bytes":200,"acknowledged_bytes":0,"delivery_bps":0}"#
+        let path = try decoder.decode(PathTelemetry.self, from: Data(legacy.utf8))
+        XCTAssertNil(path.realtimePreferred)
+        XCTAssertNil(path.downloadBps)
+        let current = String(legacy.dropLast()) + #", "realtime_preferred":false,"download_bps":8000000,"upload_bps":2000000,"active_flows":3}"#
+        let updated = try decoder.decode(PathTelemetry.self, from: Data(current.utf8))
+        XCTAssertEqual(updated.realtimePreferred, false)
+        XCTAssertEqual(updated.downloadBps, 8_000_000)
+        XCTAssertEqual(updated.activeFlows, 3)
+    }
+
+    func testBrainReportsMeasuredLearningWithoutRequiringItInLegacyMessages() throws {
+        let current = #"{"connected":true,"generation":42,"strategy":"adaptive-goodput-v2","learnedPaths":2}"#
+        XCTAssertEqual(try JSONDecoder().decode(BrainState.self, from: Data(current.utf8)).learnedPaths, 2)
+        let legacy = #"{"connected":false,"generation":0,"strategy":"local-fallback"}"#
+        XCTAssertNil(try JSONDecoder().decode(BrainState.self, from: Data(legacy.utf8)).learnedPaths)
+    }
+
     func testControlSocketBackpressureReturnsWithoutIndefiniteBlocking() {
         var pair: [Int32] = [-1, -1]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair), 0)

@@ -1,8 +1,43 @@
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::HashMap,
+    net::Ipv4Addr,
     process::{Command, Stdio},
 };
+
+fn gateway_for_interface(route: &str, physical: &str) -> Option<Ipv4Addr> {
+    let field = |key: &str| {
+        route
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
+    };
+    // Two ISPs can use the same 192.168.1.1 gateway address. A global route
+    // belonging to Ethernet is not evidence about Wi-Fi's own gateway.
+    if field("interface:") != Some(physical) {
+        return None;
+    }
+    field("gateway:")?.parse().ok()
+}
+
+fn dhcp_gateway(value: &str) -> Option<Ipv4Addr> {
+    value
+        .split_whitespace()
+        .filter_map(|v| v.parse::<Ipv4Addr>().ok())
+        .find(|ip| !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast())
+}
+
+fn matches_owned_scoped_route(record: &[String], snapshot: &str) -> bool {
+    if record.len() != 5 || record[3] != "-ifscope" {
+        return false;
+    }
+    let destination = snapshot
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("destination:").map(str::trim));
+    let same_destination = destination == Some(record[1].as_str())
+        || (record[1] == "default" && destination == Some("0.0.0.0"));
+    same_destination
+        && gateway_for_interface(snapshot, &record[4]).is_some_and(|ip| ip.to_string() == record[2])
+}
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
@@ -65,22 +100,32 @@ impl NetworkGuard {
         let default = run(
             "/sbin/route",
             &["-n", "get", "-ifscope", physical, "default"],
-        )?;
-        let gateway = default
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("gateway:").map(str::trim))
-            .context("selected interface has no default gateway")?;
-        let _: std::net::Ipv4Addr = gateway.parse().context("expected IPv4 gateway")?;
+        )
+        .unwrap_or_default();
+        let routed_gateway = gateway_for_interface(&default, physical);
+        let gateway = routed_gateway
+            .or_else(|| {
+                // Roaming/unplugging may remove a secondary scoped default even
+                // while DHCP remains valid. Use this adapter's lease, never the
+                // other ISP's/global gateway, and add a session-owned route.
+                run("/usr/sbin/ipconfig", &["getoption", physical, "router"])
+                    .ok()
+                    .and_then(|value| dhcp_gateway(&value))
+            })
+            .context("selected interface has no route or DHCP gateway")?
+            .to_string();
+        let gateway = gateway.as_str();
         // IP_BOUND_IF uses the interface-scoped routing table. macOS commonly
         // leaves the currently preferred Ethernet default route global rather
         // than scoped; once the Hybrid /1 routes exist, that makes otherwise
         // valid direct sockets fail with ENETUNREACH. Add only the missing
         // scoped default and record it for exact session cleanup.
-        let scoped = default.lines().any(|line| {
-            line.trim()
-                .strip_prefix("flags:")
-                .is_some_and(|flags| flags.contains("IFSCOPE"))
-        });
+        let scoped = routed_gateway.is_some()
+            && default.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("flags:")
+                    .is_some_and(|flags| flags.contains("IFSCOPE"))
+            });
         let scoped_default: Vec<String> = ["-net", "default", gateway, "-ifscope", physical]
             .iter()
             .map(|value| (*value).to_owned())
@@ -183,6 +228,19 @@ impl NetworkGuard {
             }
         }
         for route in self.routes.drain(..).rev() {
+            if route.get(3).map(String::as_str) == Some("-ifscope") {
+                // Roaming (e.g. home Wi-Fi -> phone hotspot) can replace an
+                // owned route with an OS-created route before cleanup. Never
+                // delete that new network's route using a stale ledger entry.
+                let snapshot = run(
+                    "/sbin/route",
+                    &["-n", "get", "-ifscope", &route[4], &route[1]],
+                )
+                .unwrap_or_default();
+                if !matches_owned_scoped_route(&route, &snapshot) {
+                    continue;
+                }
+            }
             if let Some(name) = route.last().filter(|name| name.starts_with("utun")) {
                 let name = std::ffi::CString::new(name.as_str()).expect("validated interface name");
                 // A closed utun and its interface routes are already removed
@@ -213,6 +271,47 @@ impl Drop for NetworkGuard {
         for error in self.restore() {
             eprintln!("Network restoration: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    #[test]
+    fn gateway_is_scoped_to_its_adapter_even_with_overlapping_subnets() {
+        let route = "gateway: 192.168.1.1\ninterface: en7\nflags: <UP,GATEWAY,IFSCOPE>";
+        assert_eq!(
+            gateway_for_interface(route, "en7"),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(gateway_for_interface(route, "en0"), None);
+        assert_eq!(gateway_for_interface("", "en0"), None);
+        assert_eq!(
+            dhcp_gateway("192.168.1.1\n"),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(dhcp_gateway("0.0.0.0"), None);
+        assert_eq!(dhcp_gateway("link#15"), None);
+    }
+    #[test]
+    fn cleanup_preserves_new_hotspot_route_after_roaming() {
+        let record: Vec<_> = ["-net", "default", "192.168.1.1", "-ifscope", "en0"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(matches_owned_scoped_route(
+            &record,
+            "destination: default\ngateway: 192.168.1.1\ninterface: en0"
+        ));
+        assert!(!matches_owned_scoped_route(
+            &record,
+            "destination: default\ngateway: 172.20.10.1\ninterface: en0"
+        ));
+        assert!(!matches_owned_scoped_route(
+            &record,
+            "destination: default\ngateway: 192.168.1.1\ninterface: en7"
+        ));
+        assert!(!matches_owned_scoped_route(&record, ""));
     }
 }
 

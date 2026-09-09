@@ -18,7 +18,7 @@ brain sends advisory weights over an authenticated Noise/ChaCha20-Poly1305
 channel, but it never receives the user's payload, destination, or browsing
 data. The normal Direct Smart interface does not expose or require a relay.
 
-Version 0.4.0 implements this for proxy-aware IPv4 TCP using a loopback SOCKS5
+Version 0.5.0 implements this for proxy-aware IPv4 TCP using a loopback SOCKS5
 engine. Connections are balanced as whole flows, never striped packet by packet.
 This preserves TCP ordering and avoids tunnel encryption/encapsulation overhead.
 
@@ -31,7 +31,7 @@ encapsulation, and relay-capacity costs.
 
 ### Automatic Hybrid
 
-Version 0.4.0 runs Direct Smart and a warm Secure Continuity tunnel together.
+Version 0.5.0 runs Direct Smart and a warm Secure Continuity tunnel together.
 Proxy-aware TCP is sent direct by default. Explicit domain-suffix rules use the
 encrypted relay, and a flow falls back to it if every direct connection attempt
 fails. A secure rule never downgrades to direct. Non-proxy-aware IPv4 traffic
@@ -66,13 +66,25 @@ the same session-migration guarantee.
   Stable single-session failover belongs to Secure Continuity.
 - Transparent system-wide UDP/QUIC and non-proxy-aware traffic require the
   Apple Network Extension entitlement and a production packet-tunnel/app-proxy
-  integration. The current SOCKS milestone does not claim that coverage.
+integration. The current SOCKS milestone does not claim that coverage.
+
+## Adaptive controller milestone (0.5.0)
+
+See [ADAPTIVE_BRAIN.md](ADAPTIVE_BRAIN.md). The former global 75 ms cutoff
+has become traffic-specific. A stateful Rust controller learns directional
+goodput from live byte counters, retains exploration, and supplies expiring
+advice. The Mac retains authoritative health/cost/security checks and a local
+controller. Known real-time ports and Continuity preference use the warm relay
+from connection establishment. Unknown TLS traffic still needs explicit rules.
+This is online statistical adaptation, not a pretrained AI model or a claim of
+automatic application recognition, universal bonding, or zero interruption.
 
 ## Next acceptance gates
 
 1. Verify app-managed SOCKS setup and exact restoration on the development Mac.
 2. Measure matched-server browser throughput with one and multiple adapters.
-3. Verify whole-flow distribution and 75 ms exclusion with controlled links.
+3. Verify whole-flow distribution, directional learning and traffic-specific
+   latency preferences with controlled links.
 4. Verify physical unplug/replug without app or macOS networking freezes.
 5. Expand classification beyond explicit suffixes using local, privacy-safe
    connection requirements and measured continuity risk.

@@ -382,12 +382,13 @@ fn send_client(
 }
 
 async fn client(args: Client) -> Result<()> {
-    client_with_controls(args, None).await
+    client_with_controls(args, None, None).await
 }
 
 async fn client_with_controls(
     args: Client,
     external_controls: Option<mpsc::Receiver<Control>>,
+    mut guidance: Option<tokio::sync::watch::Receiver<verz_link_lab::brain::Guidance>>,
 ) -> Result<()> {
     ensure!(
         unsafe { libc::geteuid() } == 0,
@@ -522,6 +523,16 @@ async fn client_with_controls(
                         send_client(vec![Frame::control(Kind::Join, index as u8, id, moment)], &mut transport, &mut sockets, &mut scheduler)?;
                     }
                 }
+                if let Some(receiver) = &mut guidance
+                    && receiver.has_changed().unwrap_or(false) {
+                        let advice = receiver.borrow_and_update().clone();
+                        if let Some((at, advice)) = advice {
+                            let remaining = advice.valid_for_ms.min(5_000).saturating_sub(at.elapsed().as_millis() as u64);
+                            scheduler.set_realtime_advice(advice.realtime_weights, moment.saturating_add(remaining));
+                        } else {
+                            scheduler.set_realtime_advice(Default::default(), 0);
+                        }
+                }
                 let frames = scheduler.tick(moment);
                 send_client(frames, &mut transport, &mut sockets, &mut scheduler)?;
             }
@@ -565,6 +576,7 @@ async fn client_with_controls(
 async fn hybrid(args: Hybrid) -> Result<()> {
     let (client_tx, client_rx) = mpsc::channel(8);
     let (direct_tx, direct_rx) = mpsc::channel(8);
+    let (advice_tx, advice_rx) = tokio::sync::watch::channel(None);
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
             if line.len() > 65_536 {
@@ -610,8 +622,8 @@ async fn hybrid(args: Hybrid) -> Result<()> {
         brain_secret_file: Some(args.secret_file),
     };
     tokio::try_join!(
-        client_with_controls(client_args, Some(client_rx)),
-        verz_link_lab::direct::run_with_controls(direct_args, Some(direct_rx))
+        client_with_controls(client_args, Some(client_rx), Some(advice_rx)),
+        verz_link_lab::direct::run_with_guidance(direct_args, Some(direct_rx), Some(advice_tx))
     )?;
     Ok(())
 }
