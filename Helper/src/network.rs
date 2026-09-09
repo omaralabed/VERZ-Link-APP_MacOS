@@ -71,6 +71,24 @@ impl NetworkGuard {
             .find_map(|line| line.trim().strip_prefix("gateway:").map(str::trim))
             .context("selected interface has no default gateway")?;
         let _: std::net::Ipv4Addr = gateway.parse().context("expected IPv4 gateway")?;
+        // IP_BOUND_IF uses the interface-scoped routing table. macOS commonly
+        // leaves the currently preferred Ethernet default route global rather
+        // than scoped; once the Hybrid /1 routes exist, that makes otherwise
+        // valid direct sockets fail with ENETUNREACH. Add only the missing
+        // scoped default and record it for exact session cleanup.
+        let scoped = default.lines().any(|line| {
+            line.trim()
+                .strip_prefix("flags:")
+                .is_some_and(|flags| flags.contains("IFSCOPE"))
+        });
+        let scoped_default: Vec<String> = ["-net", "default", gateway, "-ifscope", physical]
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+        if !scoped {
+            self.routes.retain(|route| route != &scoped_default);
+            self.add_route(&["-net", "default", gateway, "-ifscope", physical])?;
+        }
         let desired: Vec<String> = ["-host", relay, gateway, "-ifscope", physical]
             .iter()
             .map(|s| (*s).to_owned())

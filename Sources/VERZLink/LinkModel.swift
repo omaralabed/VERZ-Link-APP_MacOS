@@ -38,7 +38,7 @@ enum TransportMode: String, CaseIterable, Identifiable {
     var badge: String {
         switch self {
         case .direct: "DIRECT SMART"
-        case .hybrid: "HYBRID PREVIEW"
+        case .hybrid: "AUTOMATIC HYBRID"
         case .secure: "SECURE LINK"
         }
     }
@@ -62,6 +62,12 @@ struct BondTelemetry: Decodable {
     let healthyPaths: Int
     let assignedIp: String
     let serverIp: String
+}
+
+struct BrainState: Decodable {
+    let connected: Bool
+    let generation: UInt64
+    let strategy: String
 }
 
 @MainActor
@@ -88,10 +94,16 @@ final class LinkModel: ObservableObject {
     @Published var selectedPage = "Connection"
     @Published var policy = "smart" { didSet { configurationChanged() } }
     @Published var mode = TransportMode.direct { didSet { configurationChanged() } }
+    @Published var secureDomainsText = "" { didSet { configurationChanged() } }
     @Published var disabledInterfaces = Set<String>()
     @Published var meteredInterfaces = Set<String>()
     @Published var bondTelemetry: BondTelemetry?
     @Published var privateServerIP = "10.78.0.1"
+    @Published var brainConnected = false
+    @Published var brainGeneration: UInt64 = 0
+    @Published var brainStrategy = "local-fallback"
+    private var directHealthyPaths = 0
+    private var secureHealthyPaths = 0
     private var connectedAt: Date?
     private var lastInterfaceCounters: [String: (UInt64, UInt64)] = [:]
     private var lastSampleAt: Date?
@@ -103,11 +115,12 @@ final class LinkModel: ObservableObject {
     private var sessionID = UUID()
     private var restorationFailed = false
     private var proxyEndpoint: String?
+    private var initialized = false
     var whenDisconnected: (() -> Void)?
 
     let storage: URL
     var busy: Bool { state != .disconnected }
-    var canTest: Bool { state == .connected && mode == .secure && !testRunning }
+    var canTest: Bool { state == .connected && mode != .direct && !testRunning }
     var enabledInterfaces: [LinkInterface] { interfaces.filter { $0.canConnect && !disabledInterfaces.contains($0.name) } }
     var visibleInterfaces: [LinkInterface] { interfaces.filter(\.isConnected) }
     var hasReadyInterface: Bool { !enabledInterfaces.isEmpty }
@@ -124,6 +137,7 @@ final class LinkModel: ObservableObject {
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
         policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "smart"
         mode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "direct") ?? .direct
+        secureDomainsText = UserDefaults.standard.string(forKey: "secureDomains") ?? ""
         if let value = UserDefaults.standard.string(forKey: "interface") { selectedInterface = value }
         hasCredential = validSecret((try? Data(contentsOf: keyURL)) ?? Data())
         if let data = try? Data(contentsOf: storage.appendingPathComponent("last-test.json")) {
@@ -137,6 +151,7 @@ final class LinkModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.sampleTraffic() }
         }
+        initialized = true
     }
 
     func log(_ text: String) {
@@ -152,7 +167,7 @@ final class LinkModel: ObservableObject {
             errorMessage = "No usable uplink. Connect Wi-Fi or Ethernet and wait for an IPv4 address."; return
         }
         var secret = Data()
-        if mode == .secure {
+        if mode != .direct {
             let parts = relay.split(separator: ":")
             var address = in_addr()
             guard parts.count == 2, inet_pton(AF_INET, String(parts[0]), &address) == 1,
@@ -163,6 +178,11 @@ final class LinkModel: ObservableObject {
                 errorMessage = "Import your Secure Continuity key in Settings first."; selectedPage = "Settings"; return
             }
             secret = installed
+            if mode == .hybrid && secureDomains() == nil {
+                errorMessage = "Secure-domain rules must be valid domain suffixes, one per line or separated by commas."
+                selectedPage = "Settings"
+                return
+            }
         }
         UserDefaults.standard.set(relay, forKey: "relay")
         UserDefaults.standard.set(selectedInterface, forKey: "interface")
@@ -170,6 +190,8 @@ final class LinkModel: ObservableObject {
         restorationFailed = false
         publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
+        brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
+        directHealthyPaths = 0; secureHealthyPaths = 0
         sessionID = UUID()
         let identifier = sessionID
         let names = enabledInterfaces.map(\.name)
@@ -208,8 +230,11 @@ final class LinkModel: ObservableObject {
             } else {
                 proxyEndpoint = endpoint
                 tunnelInterface = ""
-                log("\(mode.title) connected · TCP flows go directly to their destinations")
-                if mode == .hybrid { log("Hybrid preview uses Direct Smart; selective relay escalation is not enabled yet") }
+                if mode == .hybrid {
+                    log("Automatic Hybrid connected · direct-first flows with encrypted selective relay escalation")
+                } else {
+                    log("Direct Smart connected · TCP flows go directly to their destinations")
+                }
             }
             let token = sessionID
             Task { [weak self] in
@@ -226,6 +251,12 @@ final class LinkModel: ObservableObject {
             if let line = event.line, let data = line.data(using: .utf8) {
                 let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
                 if let report = try? decoder.decode(BondTelemetry.self, from: data) {
+                    secureHealthyPaths = report.healthyPaths
+                    if mode == .hybrid {
+                        if !report.serverIp.isEmpty { privateServerIP = report.serverIp }
+                        evaluateAvailability()
+                        return
+                    }
                     let previous = bondTelemetry
                     bondTelemetry = report
                     if !report.serverIp.isEmpty { privateServerIP = report.serverIp }
@@ -241,6 +272,31 @@ final class LinkModel: ObservableObject {
                     }
                 }
             }
+        case "direct_telemetry":
+            if let line = event.line, let data = line.data(using: .utf8) {
+                let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+                if let report = try? decoder.decode(BondTelemetry.self, from: data) {
+                    let previous = bondTelemetry
+                    bondTelemetry = report
+                    directHealthyPaths = report.healthyPaths
+                    for path in report.paths where previous?.paths.first(where: { $0.name == path.name })?.state != path.state {
+                        log("\(path.name): \(path.state)")
+                    }
+                    evaluateAvailability()
+                }
+            }
+        case "brain":
+            if let line = event.line, let data = line.data(using: .utf8),
+               let report = try? JSONDecoder().decode(BrainState.self, from: data) {
+                let changed = brainConnected != report.connected
+                brainConnected = report.connected
+                brainGeneration = report.generation
+                brainStrategy = report.strategy
+                if changed {
+                    log(report.connected ? "Encrypted server brain connected · adaptive path advice active"
+                        : "Server brain unavailable · local safe policy remains active")
+                }
+            }
         case "engine_error", "cleanup_error":
             if event.event == "cleanup_error" { restorationFailed = true }
             if let line = event.line { log(line); errorMessage = line }
@@ -250,6 +306,7 @@ final class LinkModel: ObservableObject {
             log(errorMessage!)
         case "session_ended":
             state = .disconnected; tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
+            brainConnected = false; brainGeneration = 0; directHealthyPaths = 0; secureHealthyPaths = 0
             runner?.cancel(); testTask?.cancel(); testRunning = false
             session = nil; receivedMbps = 0; sentMbps = 0; publicIP = nil
             refreshInterfaces()
@@ -374,13 +431,51 @@ final class LinkModel: ObservableObject {
 
     private func configurationData() -> Data {
         let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "address": $0.address ?? "", "metered": meteredInterfaces.contains($0.name)] }
-        return (try? JSONSerialization.data(withJSONObject: ["interfaces": paths, "policy": policy, "mode": mode.rawValue], options: [.sortedKeys])) ?? Data()
+        return (try? JSONSerialization.data(withJSONObject: [
+            "interfaces": paths,
+            "policy": policy,
+            "mode": mode.rawValue,
+            "secureDomains": secureDomains() ?? []
+        ], options: [.sortedKeys])) ?? Data()
     }
 
     private func configurationChanged() {
+        guard initialized else { return }
         UserDefaults.standard.set(policy, forKey: "bondPolicy")
         UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
+        UserDefaults.standard.set(secureDomainsText, forKey: "secureDomains")
         session?.updateConfiguration(configurationData())
+    }
+
+    private func secureDomains() -> [String]? {
+        var output: [String] = []
+        let pieces = secureDomainsText.components(separatedBy: CharacterSet(charactersIn: ",\n"))
+        for piece in pieces {
+            let domain = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                .lowercased()
+            if domain.isEmpty { continue }
+            let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
+            guard domain.utf8.count <= 253, !labels.isEmpty,
+                  labels.allSatisfy({ label in
+                      label.utf8.count <= 63 && !label.isEmpty && !label.hasPrefix("-") && !label.hasSuffix("-")
+                          && label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+                  }) else { return nil }
+            if !output.contains(domain) { output.append(domain) }
+        }
+        return output
+    }
+
+    private func evaluateAvailability() {
+        guard state == .connected || state == .reconnecting else { return }
+        let available = mode == .hybrid ? directHealthyPaths + secureHealthyPaths : directHealthyPaths
+        if available == 0 && state == .connected {
+            state = .reconnecting
+            log("All paths unavailable · engines stay warm while networks recover")
+        } else if available > 0 && state == .reconnecting {
+            state = .connected
+            log("Delivery restored without creating a new Hybrid session")
+        }
     }
 
     private func sampleTraffic() {

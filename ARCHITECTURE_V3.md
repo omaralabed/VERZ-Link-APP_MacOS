@@ -13,11 +13,12 @@ encapsulated, or encrypted by VERZ. Application protocols such as HTTPS retain
 their normal end-to-end encryption.
 
 The local scheduler owns fast decisions: path health, RTT, metered status,
-connection assignment, exclusion, and recovery. A remote control service may
-later send signed advisory policy and learned weights over TLS, but it never
-needs the user's payload or a relay IP in the normal interface.
+connection assignment, exclusion, and recovery. In Automatic Hybrid, a remote
+brain sends advisory weights over an authenticated Noise/ChaCha20-Poly1305
+channel, but it never receives the user's payload, destination, or browsing
+data. The normal Direct Smart interface does not expose or require a relay.
 
-Version 0.3.0 implements this for proxy-aware IPv4 TCP using a loopback SOCKS5
+Version 0.4.0 implements this for proxy-aware IPv4 TCP using a loopback SOCKS5
 engine. Connections are balanced as whole flows, never striped packet by packet.
 This preserves TCP ordering and avoids tunnel encryption/encapsulation overhead.
 
@@ -30,16 +31,24 @@ encapsulation, and relay-capacity costs.
 
 ### Automatic Hybrid
 
-The target mode chooses Direct Smart for ordinary traffic and escalates only
-eligible traffic to Secure Continuity when its requirements demand a stable
-identity, privacy, or session continuity. Version 0.3.0 exposes this as a preview
-and runs the direct data path; selective escalation is not implemented yet.
+Version 0.4.0 runs Direct Smart and a warm Secure Continuity tunnel together.
+Proxy-aware TCP is sent direct by default. Explicit domain-suffix rules use the
+encrypted relay, and a flow falls back to it if every direct connection attempt
+fails. A secure rule never downgrades to direct. Non-proxy-aware IPv4 traffic
+currently follows the warm system tunnel; transparent per-flow classification
+for that traffic and UDP/QUIC remains the Network Extension stage.
+
+Both relay subflows remain authenticated and warm. Dropping an uplink does not
+replace the tunnel session, private IP, or public relay identity. Direct TCP
+flows retain the physical limit described below and therefore cannot be given
+the same session-migration guarantee.
 
 ## Control and trust boundaries
 
 - Payload data stays local/direct in Direct Smart.
-- A future brain/control service exchanges only authenticated policy, path
-  summaries, capability information, and aggregate measurements over TLS.
+- The implemented brain/control service exchanges only authenticated policy,
+  path names, RTT/health/metered state, failure counts, and path weights over
+  Noise NNpsk0 with X25519 and ChaCha20-Poly1305.
 - The Mac validates advisory policy and makes immediate local decisions when a
   path changes; internet reachability never waits for the control service.
 - The control service is optional for direct connectivity. Its outage cannot be
@@ -65,7 +74,8 @@ and runs the direct data path; selective escalation is not implemented yet.
 2. Measure matched-server browser throughput with one and multiple adapters.
 3. Verify whole-flow distribution and 75 ms exclusion with controlled links.
 4. Verify physical unplug/replug without app or macOS networking freezes.
-5. Build the authenticated advisory control service and signed policy format.
-6. Implement selective Direct/Secure classification for Automatic Hybrid.
-7. Obtain Apple Network Extension capability for transparent UDP/QUIC coverage.
+5. Expand classification beyond explicit suffixes using local, privacy-safe
+   connection requirements and measured continuity risk.
+6. Obtain Apple Network Extension capability for transparent UDP/QUIC coverage.
+7. Repeat physical failover and throughput matrices on independent WANs.
 8. Repeat on a clean second Mac, then complete Developer ID signing/notarization.

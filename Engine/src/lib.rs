@@ -4,6 +4,7 @@
 //! carries real IPv4 packets between operating-system network interfaces.
 
 pub mod bond;
+pub mod brain;
 pub mod direct;
 pub mod reorder;
 pub mod tunnel;

@@ -24,6 +24,13 @@ connection profile/key in Settings on each test Mac. Keys are not included in
 source or app bundles. The current shared development profile does not
 implement production device enrollment or revocation.
 
+Automatic Hybrid keeps Direct Smart and Secure Continuity warm at the same
+time. Proxy-aware TCP goes direct unless its domain suffix is listed under
+Hybrid Security or every direct path fails. Escalated traffic uses the existing
+encrypted relay without reconnecting the Hybrid session. The encrypted server
+brain receives path health metadata only and advises weights/cutoffs; the Mac
+keeps a safe local policy if that control channel is unavailable.
+
 Connected Wi-Fi and Ethernet links appear automatically. Unplugged ports are
 hidden; a cable-connected adapter waiting for DHCP remains visible. Each path
 has Use/Metered controls. Multiple Macs get separate tunnel sessions/IP leases.

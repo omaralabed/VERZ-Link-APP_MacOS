@@ -1,0 +1,28 @@
+[Unit]
+Description=VERZ encrypted hybrid scheduling brain
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/verz-link-lab/verz-bond brain-server --listen 0.0.0.0:39003 --secret-file %d/lab-secret
+LoadCredential=lab-secret:/etc/verz-link-lab/secret
+Restart=on-failure
+RestartSec=2
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

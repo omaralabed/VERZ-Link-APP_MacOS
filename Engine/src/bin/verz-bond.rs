@@ -144,8 +144,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Mode {
     Server(Server),
+    BrainServer(verz_link_lab::brain::BrainServerArgs),
     Client(Client),
     Direct(verz_link_lab::direct::DirectArgs),
+    Hybrid(Hybrid),
 }
 #[derive(Args)]
 struct Server {
@@ -171,17 +173,40 @@ struct Client {
     #[arg(long)]
     control_stdin: bool,
 }
-#[derive(Deserialize)]
+#[derive(Args)]
+struct Hybrid {
+    #[arg(long, default_value = DEFAULT_RELAY)]
+    relay: SocketAddr,
+    #[arg(long, num_args = 1.., required = true)]
+    interface: Vec<String>,
+    #[arg(long)]
+    secret_file: PathBuf,
+    #[arg(long, value_enum, default_value_t = Policy::Smart)]
+    policy: Policy,
+    #[arg(long, default_value = "127.0.0.1:0")]
+    listen: SocketAddr,
+    /// name=IPv4,metered; repeated once per physical adapter.
+    #[arg(long, num_args = 1.., required = true)]
+    path: Vec<String>,
+    #[arg(long)]
+    secure_domain: Vec<String>,
+    #[arg(long)]
+    brain: SocketAddr,
+}
+
+#[derive(Clone, Deserialize)]
 struct InterfaceConfig {
     name: String,
     address: Option<String>,
     #[serde(default)]
     metered: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Control {
     interfaces: Vec<InterfaceConfig>,
     policy: Option<String>,
+    #[serde(default, alias = "secureDomains")]
+    secure_domains: Option<Vec<String>>,
 }
 
 fn now(epoch: Instant) -> u64 {
@@ -357,6 +382,13 @@ fn send_client(
 }
 
 async fn client(args: Client) -> Result<()> {
+    client_with_controls(args, None).await
+}
+
+async fn client_with_controls(
+    args: Client,
+    external_controls: Option<mpsc::Receiver<Control>>,
+) -> Result<()> {
     ensure!(
         unsafe { libc::geteuid() } == 0,
         "administrator authorization is required"
@@ -419,7 +451,9 @@ async fn client(args: Client) -> Result<()> {
         names.join(","),
         args.relay
     );
-    let (control_tx, mut control_rx) = mpsc::channel(8);
+    let controls_enabled = args.control_stdin || external_controls.is_some();
+    let (control_tx, generated_control_rx) = mpsc::channel(8);
+    let mut control_rx = external_controls.unwrap_or(generated_control_rx);
     if args.control_stdin {
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -448,7 +482,7 @@ async fn client(args: Client) -> Result<()> {
                     "healthy_paths":scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count(),
                     "assigned_ip":Ipv4Addr::from(assigned).to_string(), "server_ip":"10.78.0.1"}));
             }
-            Some(control) = control_rx.recv(), if args.control_stdin => {
+            Some(control) = control_rx.recv(), if controls_enabled => {
                 if control.interfaces.len() > MAX_PATHS || !control.interfaces.iter().all(|item| valid_interface(&item.name)) { continue; }
                 if let Some(policy) = control.policy { scheduler.policy = match policy.as_str() { "performance" => Policy::Performance, "continuity" => Policy::Continuity, "data-saver" => Policy::DataSaver, _ => Policy::Smart }; }
                 for (index, socket) in sockets.iter_mut().enumerate() {
@@ -525,6 +559,60 @@ async fn client(args: Client) -> Result<()> {
         .collect();
     let _ = send_client(closes, &mut transport, &mut sockets, &mut scheduler);
     println!("TUNNEL CLOSED; {}", json!({"counters":scheduler.counters}));
+    Ok(())
+}
+
+async fn hybrid(args: Hybrid) -> Result<()> {
+    let (client_tx, client_rx) = mpsc::channel(8);
+    let (direct_tx, direct_rx) = mpsc::channel(8);
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if line.len() > 65_536 {
+                break;
+            }
+            let Ok(control) = serde_json::from_str::<Control>(&line) else {
+                break;
+            };
+            let direct = verz_link_lab::direct::Control {
+                interfaces: control
+                    .interfaces
+                    .iter()
+                    .map(|item| verz_link_lab::direct::InterfaceConfig {
+                        name: item.name.clone(),
+                        address: item.address.clone(),
+                        metered: item.metered,
+                    })
+                    .collect(),
+                policy: control.policy.clone(),
+                secure_domains: control.secure_domains.clone(),
+            };
+            if client_tx.blocking_send(control).is_err() || direct_tx.blocking_send(direct).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let client_args = Client {
+        relay: args.relay,
+        interface: args.interface,
+        secret_file: args.secret_file.clone(),
+        policy: args.policy,
+        control_stdin: false,
+    };
+    let direct_args = verz_link_lab::direct::DirectArgs {
+        listen: args.listen,
+        path: args.path,
+        policy: args.policy,
+        control_stdin: false,
+        relay_fallback: true,
+        secure_domain: args.secure_domain,
+        brain: Some(args.brain),
+        brain_secret_file: Some(args.secret_file),
+    };
+    tokio::try_join!(
+        client_with_controls(client_args, Some(client_rx)),
+        verz_link_lab::direct::run_with_controls(direct_args, Some(direct_rx))
+    )?;
     Ok(())
 }
 
@@ -674,8 +762,10 @@ async fn server(args: Server) -> Result<()> {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Mode::Server(args) => server(args).await,
+        Mode::BrainServer(args) => verz_link_lab::brain::run_server(args).await,
         Mode::Client(args) => client(args).await,
         Mode::Direct(args) => verz_link_lab::direct::run(args).await,
+        Mode::Hybrid(args) => hybrid(args).await,
     }
 }
 

@@ -3,7 +3,7 @@
 //! Path ACKs measure delivered tunnel bytes, not application-level TCP goodput.
 use crate::ReplayWindow;
 use anyhow::{Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 pub const BOND_MTU: usize = 1200;
@@ -34,7 +34,7 @@ pub fn handshake(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Policy {
     Smart,

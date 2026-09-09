@@ -8,7 +8,7 @@ support, simultaneous Macs, and at most 100 ms failover in supported tests.
 
 The user-approved V3 split supersedes relay-always operation: Direct Smart is
 the default local data plane, Secure Continuity preserves the relay tunnel, and
-Automatic Hybrid will select between them per traffic need.
+Automatic Hybrid selects between them per supported TCP flow.
 
 ## Implemented V3 Direct Smart milestone
 
@@ -27,8 +27,13 @@ Automatic Hybrid will select between them per traffic need.
   engine failure, app loss, adapter removal, and normal exit.
 - Direct traffic counters aggregate selected physical adapters. Direct public
   IP verification explicitly traverses the local flow engine.
-- Automatic Hybrid is explicitly a preview: it currently runs Direct Smart.
-  Selective encrypted-relay escalation is not implemented yet.
+- Automatic Hybrid runs the direct engine and a warm Secure Continuity tunnel
+  in one Rust process. Explicit domain suffixes use the encrypted relay, all
+  other proxy-aware TCP is direct, and failed direct connection attempts fall
+  back to the relay without restarting the Hybrid session.
+- The authenticated encrypted brain service receives metadata-only path reports
+  and returns bounded path weights plus cutoff policy. Loss of the brain channel
+  leaves the local safe policy running and reconnects in the background.
 - Current Direct Smart coverage is proxy-aware IPv4 TCP. Transparent UDP/QUIC,
   non-proxy-aware applications, and migration of one established session are
   future Network Extension gates; they are not claimed as implemented.
@@ -77,7 +82,7 @@ Automatic Hybrid will select between them per traffic need.
 
 ## Verified on September 8, 2026
 
-- 40 Rust library tests plus 6 runtime regression tests pass on macOS and
+- 46 Rust library tests plus 6 runtime regression tests pass on macOS and
   release Linux; Rust clippy clean on macOS.
 - 7 Swift tests pass; universal app and helper signatures verified.
 - Controlled isolated Linux test: one 30.97 MB TCP transfer survived two link
@@ -125,11 +130,20 @@ Automatic Hybrid will select between them per traffic need.
   engine and restored both services to SOCKS disabled with blank endpoints.
   Secure Continuity was then reconnected and verified with the relay public IP.
   Full browser/Ookla, physical unplug, and second-Mac acceptance remain.
+- Version 0.4.0 signed-app Hybrid verification used one live session for both
+  routes: a configured `api.ipify.org` secure rule exited through the Linode
+  (`69.164.213.57`), while an unlisted domain exited directly through Verizon
+  (`72.68.150.247`). The app received advancing encrypted-brain advice.
+- With Ethernet retained, Wi-Fi was powered off for two seconds and restored
+  during 250 ICMP probes through the same warm tunnel session: 250/250 replies,
+  zero observed loss, 51.130 ms maximum RTT. This run passes the 100 ms gate for
+  that tested event and showed no packet interruption; it is not a universal
+  no-interruption claim for every failure mode.
 
 ## Known open user issues
 
-- Physical Mac unplug/replug and application-goodput regression matrix remain
-  unverified; do not claim the user's freeze/speed complaints fully resolved.
+- Physical cable unplug/replug and application-goodput regression matrix remain
+  unverified; the Wi-Fi software-power failover result above does not replace it.
 - User reports 300+ Mbps direct access on the shared-router setup. That target
   and repeatable no-regression throughput are not yet established in the app.
 - The user added an Apple Development signing identity and selected Mina Alabed

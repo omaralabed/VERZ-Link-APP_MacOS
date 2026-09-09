@@ -104,7 +104,8 @@ fn main() -> Result<()> {
         ["direct", "hybrid", "secure"].contains(&mode),
         "invalid connection mode"
     );
-    let direct = mode != "secure";
+    let direct = mode == "direct";
+    let hybrid = mode == "hybrid";
     let initial_items = initial
         .get("interfaces")
         .and_then(Value::as_array)
@@ -135,7 +136,7 @@ fn main() -> Result<()> {
         "invalid configured policy"
     );
     let mut command = Command::new(engine);
-    if direct {
+    if direct || hybrid {
         let paths: Vec<String> = initial_items
             .iter()
             .filter_map(|item| {
@@ -153,10 +154,40 @@ fn main() -> Result<()> {
             paths.len() == initial_items.len(),
             "direct path addresses are invalid"
         );
-        command
-            .args(["direct", "--listen", "127.0.0.1:0", "--path"])
-            .args(paths)
-            .args(["--policy", configured_policy, "--control-stdin"]);
+        if hybrid {
+            let domains = initial
+                .get("secureDomains")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().context("secure domain must be text"))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            ensure!(
+                domains.iter().all(|domain| valid_domain(domain)),
+                "invalid secure domain"
+            );
+            let brain = std::net::SocketAddr::new((*relay.ip()).into(), 39003);
+            command
+                .args(["hybrid", "--relay", &relay.to_string(), "--interface"])
+                .args(&interfaces)
+                .arg("--secret-file")
+                .arg(directory.join("lab-secret"))
+                .args(["--listen", "127.0.0.1:0", "--path"])
+                .args(paths)
+                .args(["--policy", configured_policy, "--brain", &brain.to_string()]);
+            for domain in domains {
+                command.args(["--secure-domain", domain]);
+            }
+        } else {
+            command
+                .args(["direct", "--listen", "127.0.0.1:0", "--path"])
+                .args(paths)
+                .args(["--policy", configured_policy, "--control-stdin"]);
+        }
     } else {
         command
             .args(["client", "--relay", &relay.to_string(), "--interface"])
@@ -204,11 +235,15 @@ fn main() -> Result<()> {
                 line.starts_with("TUNNEL CONNECTED:") || line.starts_with("DIRECT CONNECTED:");
             if connected {
                 let _ = ready_tx.send(Control::Connected(line));
-            } else if let Some(telemetry) = line
-                .strip_prefix("BOND_STATE ")
-                .or_else(|| line.strip_prefix("DIRECT_STATE "))
-            {
+            } else if let Some(telemetry) = line.strip_prefix("BOND_STATE ") {
                 event(&out_events, json!({"event":"telemetry", "line":telemetry}));
+            } else if let Some(telemetry) = line.strip_prefix("DIRECT_STATE ") {
+                event(
+                    &out_events,
+                    json!({"event":"direct_telemetry", "line":telemetry}),
+                );
+            } else if let Some(state) = line.strip_prefix("BRAIN_STATE ") {
+                event(&out_events, json!({"event":"brain", "line":state}));
             } else {
                 event(&out_events, json!({"event":"log", "line":line}));
             }
@@ -223,6 +258,8 @@ fn main() -> Result<()> {
     drop(stop_tx);
     let mut network: Option<network::NetworkGuard> = None;
     let mut proxy: Option<network::ProxyGuard> = None;
+    let mut hybrid_proxy_endpoint: Option<String> = None;
+    let mut hybrid_announced = false;
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(1);
@@ -233,7 +270,34 @@ fn main() -> Result<()> {
                     .split_whitespace()
                     .nth(2)
                     .context("engine omitted connection endpoint")?;
-                let configured = if direct {
+                let configured: Result<()> = if hybrid {
+                    (|| {
+                        if line.starts_with("TUNNEL CONNECTED:") && network.is_none() {
+                            event(
+                                &events,
+                                json!({"event":"configuring", "line":"Keeping Secure Continuity warm for selective relay escalation"}),
+                            );
+                            network = Some(network::NetworkGuard::configure(
+                                endpoint,
+                                &interfaces,
+                                &relay.ip().to_string(),
+                            )?);
+                        } else if line.starts_with("DIRECT CONNECTED:") {
+                            hybrid_proxy_endpoint = Some(endpoint.to_owned());
+                        }
+                        if network.is_some()
+                            && proxy.is_none()
+                            && let Some(endpoint) = hybrid_proxy_endpoint.as_deref()
+                        {
+                            event(
+                                &events,
+                                json!({"event":"configuring", "line":"Enabling direct-first flow steering with secure escalation"}),
+                            );
+                            proxy = Some(network::ProxyGuard::configure(endpoint, &interfaces)?);
+                        }
+                        Ok(())
+                    })()
+                } else if direct {
                     event(
                         &events,
                         json!({"event":"configuring", "line":"Enabling local Direct Smart flow steering"}),
@@ -249,7 +313,17 @@ fn main() -> Result<()> {
                         .map(|guard| network = Some(guard))
                 };
                 match configured {
-                    Ok(()) => event(&events, json!({"event":"connected", "line":line})),
+                    Ok(())
+                        if hybrid && network.is_some() && proxy.is_some() && !hybrid_announced =>
+                    {
+                        hybrid_announced = true;
+                        event(
+                            &events,
+                            json!({"event":"connected", "line":format!("HYBRID CONNECTED: {}", hybrid_proxy_endpoint.as_deref().unwrap_or(""))}),
+                        );
+                    }
+                    Ok(()) if !hybrid => event(&events, json!({"event":"connected", "line":line})),
+                    Ok(()) => {}
                     Err(error) => {
                         event(
                             &events,
@@ -311,12 +385,12 @@ fn main() -> Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
-    if let Some(mut guard) = network {
+    if let Some(mut guard) = proxy {
         for error in guard.restore() {
             event(&events, json!({"event":"cleanup_error", "line":error}));
         }
     }
-    if let Some(mut guard) = proxy {
+    if let Some(mut guard) = network {
         for error in guard.restore() {
             event(&events, json!({"event":"cleanup_error", "line":error}));
         }
@@ -329,4 +403,17 @@ fn main() -> Result<()> {
 
 fn valid_interface(name: &str) -> bool {
     !name.is_empty() && name.len() < 16 && name.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn valid_domain(domain: &str) -> bool {
+    let domain = domain.trim().trim_start_matches('.').trim_end_matches('.');
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }

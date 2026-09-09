@@ -1,14 +1,21 @@
 //! Direct Smart mode: a local SOCKS5 TCP flow engine. Application payloads go
 //! straight to their destinations and retain only the application's own
 //! encryption. Each TCP connection is pinned to one selected physical uplink.
-use crate::{bind_ipv4_interface_fd, bond::Policy};
+use crate::{
+    bind_ipv4_interface_fd,
+    bond::Policy,
+    brain::{BrainClient, ClientReport, PathReport},
+    load_secret,
+};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::fd::AsRawFd,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -18,38 +25,51 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpSocket, TcpStream, lookup_host},
-    sync::RwLock,
+    sync::{RwLock, mpsc},
     time,
 };
 
-const LATENCY_CUTOFF_US: u64 = 75_000;
+const DEFAULT_LATENCY_CUTOFF_US: u64 = 75_000;
 const PROBE_DESTINATION: &str = "1.1.1.1:443";
 
 #[derive(Args, Debug)]
 pub struct DirectArgs {
     #[arg(long, default_value = "127.0.0.1:0")]
-    listen: SocketAddr,
+    pub listen: SocketAddr,
     /// name=IPv4,metered; repeated once per physical adapter.
     #[arg(long, num_args = 1.., required = true)]
-    path: Vec<String>,
+    pub path: Vec<String>,
     #[arg(long, value_enum, default_value_t = Policy::Smart)]
-    policy: Policy,
+    pub policy: Policy,
     #[arg(long)]
-    control_stdin: bool,
+    pub control_stdin: bool,
+    /// Use the system-routed secure tunnel if every direct path fails.
+    #[arg(long)]
+    pub relay_fallback: bool,
+    /// Domain suffix that must use Secure Continuity; repeatable.
+    #[arg(long)]
+    pub secure_domain: Vec<String>,
+    /// Encrypted scheduling-control service. No application payload is sent.
+    #[arg(long)]
+    pub brain: Option<SocketAddr>,
+    #[arg(long)]
+    pub brain_secret_file: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
-struct InterfaceConfig {
-    name: String,
-    address: Option<String>,
+#[derive(Clone, Deserialize)]
+pub struct InterfaceConfig {
+    pub name: String,
+    pub address: Option<String>,
     #[serde(default)]
-    metered: bool,
+    pub metered: bool,
 }
 
-#[derive(Deserialize)]
-struct Control {
-    interfaces: Vec<InterfaceConfig>,
-    policy: Option<String>,
+#[derive(Clone, Deserialize)]
+pub struct Control {
+    pub interfaces: Vec<InterfaceConfig>,
+    pub policy: Option<String>,
+    #[serde(default, alias = "secureDomains")]
+    pub secure_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -91,6 +111,12 @@ struct Runtime {
     cursor: Arc<AtomicUsize>,
     active: Arc<AtomicU64>,
     accepted: Arc<AtomicU64>,
+    direct_connections: Arc<AtomicU64>,
+    relay_connections: Arc<AtomicU64>,
+    relay_fallback: Arc<AtomicBool>,
+    cutoff_us: Arc<AtomicU64>,
+    brain_weights: Arc<RwLock<BTreeMap<String, u32>>>,
+    secure_domains: Arc<RwLock<Vec<String>>>,
 }
 
 impl Runtime {
@@ -109,12 +135,12 @@ impl Runtime {
         }
         let has_low_latency = eligible.iter().any(|p| {
             let rtt = p.rtt_us.load(Ordering::Relaxed);
-            rtt > 0 && rtt < LATENCY_CUTOFF_US
+            rtt > 0 && rtt < self.cutoff_us.load(Ordering::Relaxed)
         });
         if has_low_latency {
             eligible.retain(|p| {
                 let rtt = p.rtt_us.load(Ordering::Relaxed);
-                rtt == 0 || rtt < LATENCY_CUTOFF_US
+                rtt == 0 || rtt < self.cutoff_us.load(Ordering::Relaxed)
             });
         } else if eligible.len() > 1
             && eligible
@@ -130,16 +156,47 @@ impl Runtime {
         if policy == Policy::DataSaver && eligible.iter().any(|p| !p.metered) {
             eligible.retain(|p| !p.metered);
         }
+        let weights = self.brain_weights.read().await;
+        if !weights.is_empty()
+            && eligible
+                .iter()
+                .any(|path| weights.get(&path.name).copied().unwrap_or(0) > 0)
+        {
+            eligible.retain(|path| weights.get(&path.name).copied().unwrap_or(0) > 0);
+        }
         if policy == Policy::Continuity {
             eligible.sort_by_key(|p| {
                 let rtt = p.rtt_us.load(Ordering::Relaxed);
                 if rtt == 0 { u64::MAX - 1 } else { rtt }
             });
         } else {
-            let offset = self.cursor.fetch_add(1, Ordering::Relaxed) % eligible.len();
+            let total: usize = eligible
+                .iter()
+                .map(|path| weights.get(&path.name).copied().unwrap_or(1).max(1) as usize)
+                .sum();
+            let mut ticket = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
+            let mut offset = 0;
+            for (index, path) in eligible.iter().enumerate() {
+                let weight = weights.get(&path.name).copied().unwrap_or(1).max(1) as usize;
+                if ticket < weight {
+                    offset = index;
+                    break;
+                }
+                ticket -= weight;
+            }
             eligible.rotate_left(offset);
         }
         eligible
+    }
+
+    async fn must_relay(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.secure_domains.read().await.iter().any(|suffix| {
+            host == *suffix
+                || host
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     }
 }
 
@@ -207,6 +264,39 @@ async fn connect_on(path: &Path, destination: SocketAddr) -> Result<TcpStream> {
     Ok(stream)
 }
 
+async fn connect_via_system_route(destination: SocketAddr) -> Result<TcpStream> {
+    let stream = time::timeout(Duration::from_secs(6), TcpStream::connect(destination))
+        .await
+        .context("secure relay fallback timed out")??;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+fn normalize_domains(domains: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for domain in domains {
+        let domain = domain
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        ensure!(
+            !domain.is_empty()
+                && domain.len() <= 253
+                && domain.split('.').all(|label| !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
+            "invalid secure domain suffix"
+        );
+        if !normalized.contains(&domain) {
+            normalized.push(domain);
+        }
+    }
+    Ok(normalized)
+}
+
 async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(address) = host.parse::<Ipv4Addr>() {
         return Ok(vec![SocketAddrV4::new(address, port).into()]);
@@ -265,41 +355,51 @@ async fn socks_target(stream: &mut TcpStream) -> Result<(String, u16)> {
 async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()> {
     let (host, port) = socks_target(&mut client).await?;
     let destinations = resolve(&host, port).await?;
-    let candidates = runtime.candidates().await;
-    ensure!(!candidates.is_empty(), "no direct path is available");
-    let mut selected = None;
-    for path in candidates {
-        for destination in &destinations {
-            let started = Instant::now();
-            match connect_on(&path, *destination).await {
-                Ok(stream) => {
-                    let observed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                    let prior = path.rtt_us.load(Ordering::Relaxed);
-                    path.rtt_us.store(
-                        if prior == 0 {
-                            observed
-                        } else {
-                            (prior * 7 + observed) / 8
-                        },
-                        Ordering::Relaxed,
-                    );
-                    path.healthy.store(true, Ordering::Relaxed);
-                    selected = Some((path, stream));
-                    break;
-                }
-                Err(_) => {
-                    path.failures.fetch_add(1, Ordering::Relaxed);
-                    path.healthy.store(false, Ordering::Relaxed);
+    let forced_relay = runtime.must_relay(&host).await;
+    let mut selected: Option<(Option<Arc<Path>>, TcpStream)> = None;
+    if !forced_relay {
+        for path in runtime.candidates().await {
+            for destination in &destinations {
+                let started = Instant::now();
+                match connect_on(&path, *destination).await {
+                    Ok(stream) => {
+                        let observed =
+                            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                        let prior = path.rtt_us.load(Ordering::Relaxed);
+                        path.rtt_us.store(
+                            if prior == 0 {
+                                observed
+                            } else {
+                                (prior * 7 + observed) / 8
+                            },
+                            Ordering::Relaxed,
+                        );
+                        path.healthy.store(true, Ordering::Relaxed);
+                        selected = Some((Some(path), stream));
+                        break;
+                    }
+                    Err(_) => {
+                        path.failures.fetch_add(1, Ordering::Relaxed);
+                        path.healthy.store(false, Ordering::Relaxed);
+                    }
                 }
             }
+            if selected.is_some() {
+                break;
+            }
         }
-        if selected.is_some() {
-            break;
+    }
+    if selected.is_none() && (forced_relay || runtime.relay_fallback.load(Ordering::Relaxed)) {
+        for destination in &destinations {
+            if let Ok(stream) = connect_via_system_route(*destination).await {
+                selected = Some((None, stream));
+                break;
+            }
         }
     }
     let Some((path, mut outbound)) = selected else {
         client.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        bail!("all direct paths failed for {host}:{port}");
+        bail!("no route succeeded for {host}:{port}");
     };
     let local = match outbound.local_addr()? {
         SocketAddr::V4(address) => address,
@@ -311,11 +411,18 @@ async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()
     client.write_all(&reply).await?;
     runtime.active.fetch_add(1, Ordering::Relaxed);
     runtime.accepted.fetch_add(1, Ordering::Relaxed);
+    if path.is_some() {
+        runtime.direct_connections.fetch_add(1, Ordering::Relaxed);
+    } else {
+        runtime.relay_connections.fetch_add(1, Ordering::Relaxed);
+    }
     let result = tokio::io::copy_bidirectional(&mut client, &mut outbound).await;
     runtime.active.fetch_sub(1, Ordering::Relaxed);
     let (uploaded, downloaded) = result?;
-    path.sent.fetch_add(uploaded, Ordering::Relaxed);
-    path.received.fetch_add(downloaded, Ordering::Relaxed);
+    if let Some(path) = path {
+        path.sent.fetch_add(uploaded, Ordering::Relaxed);
+        path.received.fetch_add(downloaded, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -359,9 +466,10 @@ async fn telemetry(runtime: Runtime) {
     loop {
         interval.tick().await;
         let paths = runtime.paths.read().await.clone();
+        let cutoff = runtime.cutoff_us.load(Ordering::Relaxed);
         let has_fast = paths.iter().any(|p| {
             let rtt = p.rtt_us.load(Ordering::Relaxed);
-            p.healthy.load(Ordering::Relaxed) && rtt > 0 && rtt < LATENCY_CUTOFF_US
+            p.healthy.load(Ordering::Relaxed) && rtt > 0 && rtt < cutoff
         });
         let best_slow = (!has_fast).then(|| {
             paths
@@ -376,7 +484,7 @@ async fn telemetry(runtime: Runtime) {
             let healthy = path.healthy.load(Ordering::Relaxed);
             let rtt = path.rtt_us.load(Ordering::Relaxed);
             let excluded = if has_fast {
-                rtt >= LATENCY_CUTOFF_US
+                rtt >= cutoff
             } else {
                 best_slow.is_some_and(|best| best > 0 && rtt > best)
             };
@@ -398,37 +506,140 @@ async fn telemetry(runtime: Runtime) {
             json!({
                 "paths": reports, "healthy_paths": healthy, "assigned_ip": "", "server_ip": "",
                 "active_connections": runtime.active.load(Ordering::Relaxed),
-                "accepted_connections": runtime.accepted.load(Ordering::Relaxed)
+                "accepted_connections": runtime.accepted.load(Ordering::Relaxed),
+                "direct_connections": runtime.direct_connections.load(Ordering::Relaxed),
+                "relay_connections": runtime.relay_connections.load(Ordering::Relaxed),
+                "cutoff_ms": cutoff as f64 / 1000.0
             })
         );
+    }
+}
+
+async fn brain(runtime: Runtime, address: SocketAddr, secret_file: PathBuf) {
+    let Ok(secret) = load_secret(&secret_file) else {
+        println!(
+            "BRAIN_STATE {}",
+            json!({"connected":false,"generation":0,"strategy":"local-fallback"})
+        );
+        return;
+    };
+    loop {
+        let mut connected = None;
+        for path in runtime.candidates().await {
+            let stream = time::timeout(Duration::from_secs(4), connect_on(&path, address)).await;
+            if let Ok(Ok(stream)) = stream
+                && let Ok(Ok(client)) = time::timeout(
+                    Duration::from_secs(4),
+                    BrainClient::from_stream(stream, &secret),
+                )
+                .await
+            {
+                connected = Some(client);
+                break;
+            }
+        }
+        let Some(mut client) = connected else {
+            println!(
+                "BRAIN_STATE {}",
+                json!({"connected":false,"generation":0,"strategy":"local-fallback"})
+            );
+            time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        loop {
+            let paths = runtime.paths.read().await.clone();
+            let report = ClientReport {
+                policy: number_policy(runtime.policy.load(Ordering::Relaxed)),
+                paths: paths
+                    .iter()
+                    .map(|path| {
+                        let rtt = path.rtt_us.load(Ordering::Relaxed);
+                        PathReport {
+                            name: path.name.clone(),
+                            rtt_ms: (rtt > 0).then_some(rtt as f64 / 1000.0),
+                            healthy: path.healthy.load(Ordering::Relaxed),
+                            metered: path.metered,
+                            failures: path.failures.load(Ordering::Relaxed),
+                        }
+                    })
+                    .collect(),
+            };
+            let response = time::timeout(Duration::from_secs(3), client.exchange(&report)).await;
+            let Ok(Ok(advice)) = response else {
+                break;
+            };
+            if (10.0..=1000.0).contains(&advice.cutoff_ms) {
+                runtime
+                    .cutoff_us
+                    .store((advice.cutoff_ms * 1000.0) as u64, Ordering::Relaxed);
+            }
+            *runtime.brain_weights.write().await = advice.weights.clone();
+            runtime
+                .relay_fallback
+                .store(advice.relay_fallback, Ordering::Relaxed);
+            println!(
+                "BRAIN_STATE {}",
+                json!({"connected":true,"generation":advice.generation,"strategy":advice.strategy})
+            );
+            time::sleep(Duration::from_secs(1)).await;
+        }
+        println!(
+            "BRAIN_STATE {}",
+            json!({"connected":false,"generation":0,"strategy":"local-fallback"})
+        );
+        time::sleep(Duration::from_secs(2)).await;
     }
 }
 
 async fn controls(runtime: Runtime) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
-        let value: Control = serde_json::from_str(&line)?;
-        let paths: Vec<_> = value
-            .interfaces
-            .into_iter()
-            .filter_map(|item| {
-                item.address
-                    .and_then(|address| {
-                        Path::new(item.name, address.parse().ok()?, item.metered).ok()
-                    })
-                    .map(Arc::new)
-            })
-            .collect();
-        if !paths.is_empty() {
-            *runtime.paths.write().await = paths;
-        }
-        if let Some(policy) = value.policy.as_deref().and_then(parse_policy) {
-            runtime
-                .policy
-                .store(policy_number(policy), Ordering::Relaxed);
-        }
+        apply_control(&runtime, serde_json::from_str(&line)?).await;
     }
     Ok(())
+}
+
+async fn external_controls(runtime: Runtime, mut receiver: mpsc::Receiver<Control>) {
+    while let Some(value) = receiver.recv().await {
+        apply_control(&runtime, value).await;
+    }
+}
+
+async fn apply_control(runtime: &Runtime, value: Control) {
+    let existing = runtime.paths.read().await.clone();
+    let paths: Vec<_> = value
+        .interfaces
+        .into_iter()
+        .filter_map(|item| {
+            let address: Ipv4Addr = item.address?.parse().ok()?;
+            existing
+                .iter()
+                .find(|path| {
+                    path.name == item.name
+                        && path.address == address
+                        && path.metered == item.metered
+                })
+                .cloned()
+                .or_else(|| {
+                    Path::new(item.name, address, item.metered)
+                        .ok()
+                        .map(Arc::new)
+                })
+        })
+        .collect();
+    if !paths.is_empty() {
+        *runtime.paths.write().await = paths;
+    }
+    if let Some(policy) = value.policy.as_deref().and_then(parse_policy) {
+        runtime
+            .policy
+            .store(policy_number(policy), Ordering::Relaxed);
+    }
+    if let Some(domains) = value.secure_domains
+        && let Ok(domains) = normalize_domains(domains)
+    {
+        *runtime.secure_domains.write().await = domains;
+    }
 }
 
 async fn stop_signal() {
@@ -443,6 +654,13 @@ async fn stop_signal() {
 }
 
 pub async fn run(args: DirectArgs) -> Result<()> {
+    run_with_controls(args, None).await
+}
+
+pub async fn run_with_controls(
+    args: DirectArgs,
+    external: Option<mpsc::Receiver<Control>>,
+) -> Result<()> {
     ensure!(
         args.listen.ip().is_loopback(),
         "Direct Smart must listen only on loopback"
@@ -456,18 +674,34 @@ pub async fn run(args: DirectArgs) -> Result<()> {
         !paths.is_empty(),
         "Direct Smart needs at least one usable path"
     );
+    ensure!(
+        args.brain.is_some() == args.brain_secret_file.is_some(),
+        "brain address and secret file must be configured together"
+    );
+    let secure_domains = normalize_domains(args.secure_domain)?;
     let runtime = Runtime {
         paths: Arc::new(RwLock::new(paths)),
         policy: Arc::new(AtomicUsize::new(policy_number(args.policy))),
         cursor: Arc::new(AtomicUsize::new(0)),
         active: Arc::new(AtomicU64::new(0)),
         accepted: Arc::new(AtomicU64::new(0)),
+        direct_connections: Arc::new(AtomicU64::new(0)),
+        relay_connections: Arc::new(AtomicU64::new(0)),
+        relay_fallback: Arc::new(AtomicBool::new(args.relay_fallback)),
+        cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
+        brain_weights: Arc::new(RwLock::new(BTreeMap::new())),
+        secure_domains: Arc::new(RwLock::new(secure_domains)),
     };
     let listener = TcpListener::bind(args.listen).await?;
     println!("DIRECT CONNECTED: {}", listener.local_addr()?);
     tokio::spawn(probe(runtime.clone()));
     tokio::spawn(telemetry(runtime.clone()));
-    if args.control_stdin {
+    if let (Some(address), Some(secret_file)) = (args.brain, args.brain_secret_file) {
+        tokio::spawn(brain(runtime.clone(), address, secret_file));
+    }
+    if let Some(receiver) = external {
+        tokio::spawn(external_controls(runtime.clone(), receiver));
+    } else if args.control_stdin {
         let control_runtime = runtime.clone();
         tokio::spawn(async move {
             if let Err(error) = controls(control_runtime).await {
@@ -498,6 +732,22 @@ pub async fn run(args: DirectArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn runtime(paths: Vec<Arc<Path>>, policy: Policy) -> Runtime {
+        Runtime {
+            paths: Arc::new(RwLock::new(paths)),
+            policy: Arc::new(AtomicUsize::new(policy_number(policy))),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            accepted: Arc::new(AtomicU64::new(0)),
+            direct_connections: Arc::new(AtomicU64::new(0)),
+            relay_connections: Arc::new(AtomicU64::new(0)),
+            relay_fallback: Arc::new(AtomicBool::new(false)),
+            cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
+            brain_weights: Arc::new(RwLock::new(BTreeMap::new())),
+            secure_domains: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
     #[test]
     fn path_parser_rejects_unsafe_input() {
         assert!(parse_path("en0=192.168.1.2,false").is_ok());
@@ -512,13 +762,7 @@ mod tests {
         let b = parse_path("en7=192.168.1.3,false")?;
         a.rtt_us.store(20_000, Ordering::Relaxed);
         b.rtt_us.store(40_000, Ordering::Relaxed);
-        let runtime = Runtime {
-            paths: Arc::new(RwLock::new(vec![a.clone(), b.clone()])),
-            policy: Arc::new(AtomicUsize::new(policy_number(Policy::Smart))),
-            cursor: Arc::new(AtomicUsize::new(0)),
-            active: Arc::new(AtomicU64::new(0)),
-            accepted: Arc::new(AtomicU64::new(0)),
-        };
+        let runtime = runtime(vec![a.clone(), b.clone()], Policy::Smart);
         assert_eq!(runtime.candidates().await[0].name, "en0");
         assert_eq!(runtime.candidates().await[0].name, "en7");
         b.rtt_us.store(75_000, Ordering::Relaxed);
@@ -531,13 +775,7 @@ mod tests {
     async fn data_saver_avoids_metered_path() -> Result<()> {
         let a = parse_path("en0=192.168.1.2,true")?;
         let b = parse_path("en7=192.168.1.3,false")?;
-        let runtime = Runtime {
-            paths: Arc::new(RwLock::new(vec![a, b])),
-            policy: Arc::new(AtomicUsize::new(policy_number(Policy::DataSaver))),
-            cursor: Arc::new(AtomicUsize::new(0)),
-            active: Arc::new(AtomicU64::new(0)),
-            accepted: Arc::new(AtomicU64::new(0)),
-        };
+        let runtime = runtime(vec![a, b], Policy::DataSaver);
         assert_eq!(runtime.candidates().await.len(), 1);
         assert_eq!(runtime.candidates().await[0].name, "en7");
         Ok(())
@@ -549,16 +787,19 @@ mod tests {
         let b = parse_path("en7=192.168.1.3,false")?;
         a.rtt_us.store(120_000, Ordering::Relaxed);
         b.rtt_us.store(90_000, Ordering::Relaxed);
-        let runtime = Runtime {
-            paths: Arc::new(RwLock::new(vec![a, b])),
-            policy: Arc::new(AtomicUsize::new(policy_number(Policy::Smart))),
-            cursor: Arc::new(AtomicUsize::new(0)),
-            active: Arc::new(AtomicU64::new(0)),
-            accepted: Arc::new(AtomicU64::new(0)),
-        };
+        let runtime = runtime(vec![a, b], Policy::Smart);
         let selected = runtime.candidates().await;
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "en7");
         Ok(())
+    }
+
+    #[test]
+    fn secure_domain_rules_are_normalized_and_validated() {
+        assert_eq!(
+            normalize_domains(vec![".Example.COM.".into()]).unwrap(),
+            vec!["example.com"]
+        );
+        assert!(normalize_domains(vec!["bad domain".into()]).is_err());
     }
 }
