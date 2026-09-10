@@ -331,6 +331,19 @@ impl Path {
         }
         self.timeouts += 1;
         self.last_congestion = Some(now);
+        // Distinguish random wireless loss from real congestion. On Wi-Fi and
+        // cellular, isolated losses come from radio noise and MAC retries with
+        // no queue growth, so halving cwnd on every timeout collapses the
+        // window and the whole flow stalls. Kernel TCP CUBIC survives Wi-Fi
+        // by only reducing on a delay signal; mirror that: require RTT to be
+        // meaningfully above the minimum before treating this as congestion.
+        let elevated = self
+            .rtt_ms
+            .zip(Some(self.minimum_rtt_ms))
+            .is_some_and(|(rtt, min)| min.is_finite() && rtt - min > 15.0);
+        if !elevated {
+            return;
+        }
         self.slow_start_threshold = (self.congestion_window / 2).max(2 * BOND_MTU);
         self.congestion_window = self.slow_start_threshold;
         self.growth_credit = 0;
@@ -1197,10 +1210,40 @@ mod tests {
         s.fail_path(0);
         assert!(!s.paths[0].ready(101));
         assert_eq!(s.paths[0].congestion_window, 400_000);
+        // Loss with an elevated RTT is treated as real congestion and halves
+        // the window; a second event inside repair_ms is folded into the first.
+        s.paths[0].minimum_rtt_ms = 20.0;
+        s.paths[0].rtt_ms = Some(60.0);
         s.paths[0].congestion_loss(200);
         assert_eq!(s.paths[0].congestion_window, 200_000);
         s.paths[0].congestion_loss(201);
         assert_eq!(s.paths[0].congestion_window, 200_000);
+    }
+
+    #[test]
+    fn random_wifi_loss_does_not_collapse_the_window() {
+        // A Wi-Fi path can lose a few percent of packets to radio noise while
+        // keeping RTT flat. Kernel TCP CUBIC would ignore that; so must we,
+        // otherwise cwnd shrinks to the floor and OBS collapses to <1 Mbps.
+        let mut path = Path::new(0, "en0".into(), false);
+        path.minimum_rtt_ms = 12.0;
+        path.rtt_ms = Some(12.5);
+        path.congestion_window = 400_000;
+        path.slow_start_threshold = 400_000;
+        let mut now = 100_u64;
+        for _ in 0..50 {
+            path.congestion_loss(now);
+            now += path.repair_ms() + 1;
+        }
+        assert_eq!(
+            path.congestion_window, 400_000,
+            "isolated loss with flat RTT must not shrink the window"
+        );
+        // Once RTT climbs (real queue building), the next loss halves normally.
+        path.rtt_ms = Some(60.0);
+        now += path.repair_ms() + 1;
+        path.congestion_loss(now);
+        assert_eq!(path.congestion_window, 200_000);
     }
 
     #[test]
@@ -1210,6 +1253,10 @@ mod tests {
             path.acknowledge_capacity(BOND_MTU);
         }
         assert_eq!(path.congestion_window, 544 * BOND_MTU);
+        // Simulate a congestion signal, not radio noise: RTT is well above
+        // the observed minimum, so the window halves per AIMD.
+        path.minimum_rtt_ms = 10.0;
+        path.rtt_ms = Some(40.0);
         path.congestion_loss(100);
         let reduced = path.congestion_window;
         assert_eq!(reduced, 272 * BOND_MTU);
