@@ -33,11 +33,48 @@ use tokio::{
 };
 
 const DEFAULT_LATENCY_CUTOFF_US: u64 = 75_000;
-const PROBE_DESTINATION: &str = "1.1.1.1:443";
+/// Plain HTTP so the probe times a real request/response round trip without a
+/// TLS dependency. A TCP-splitting middlebox (satellite/cellular PEP, ISP
+/// accelerator) answers the handshake locally in a few ms; it cannot answer
+/// the request itself without forwarding it end to end.
+const PROBE_DESTINATION: &str = "1.1.1.1:80";
+const PROBE_HEALTH_DESTINATION: &str = "1.1.1.1:443";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_BUDGET: Duration = Duration::from_secs(3);
 const CONNECT_ATTEMPT: Duration = Duration::from_millis(1_200);
+const PREFERRED_MINIMUM: Duration = Duration::from_millis(300);
 const CONNECT_STAGGER: Duration = Duration::from_millis(150);
+/// Extra end-to-end delay a path may carry before new-flow placement starts
+/// penalising it; below this, capacity weights alone decide.
+const LATENCY_DEAD_ZONE_US: u64 = 50_000;
+const LATENCY_PENALTY_STEP_US: u64 = 100_000;
 static INCARNATION: AtomicU64 = AtomicU64::new(1);
+static PROBE_NONCE: AtomicU64 = AtomicU64::new(0);
+/// Per-run random salt: flow records can correlate repeat destinations within
+/// one session, but the log never contains a destination or a stable hash.
+static FLOW_SALT: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+/// Placement decision plus the evidence it was made on. Written to the local
+/// flow log so future policy changes can be replayed against real usage.
+#[derive(Default)]
+struct Plan {
+    paths: Vec<Arc<Path>>,
+    source: &'static str,
+    champion: Option<String>,
+    primary: Option<String>,
+    trial: Option<String>,
+    features: Vec<serde_json::Value>,
+}
+
+fn destination_tag(host: &str, port: u16) -> String {
+    use sha2::{Digest, Sha256};
+    let salt = FLOW_SALT.get_or_init(rand::random);
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(host.to_ascii_lowercase().as_bytes());
+    hasher.update(port.to_be_bytes());
+    hex::encode(&hasher.finalize()[..8])
+}
 
 /// Published only after the encrypted client has created its assigned utun.
 /// Binding relay sockets explicitly keeps protected flows off the physical
@@ -52,6 +89,12 @@ pub struct RelayRoute {
 enum Intent {
     #[default]
     Balanced,
+    // Direction-specific placement needs per-flow evidence that a new SOCKS
+    // connection does not carry; kept for when such a signal exists.
+    #[allow(dead_code)]
+    Download,
+    #[allow(dead_code)]
+    Upload,
     Realtime,
 }
 
@@ -59,6 +102,38 @@ fn known_realtime_port(port: u16) -> bool {
     // Explicit RTSP/RTMP/SIP/TURN endpoints. Port 443 is deliberately unknown:
     // it could carry a call, a download, or a web page. No TLS interception.
     matches!(port, 554 | 1935 | 3478 | 5349 | 5060 | 5061)
+}
+
+/// Placement intent for a new flow. Only the flow's own destination port is
+/// evidence about it. The machine-wide traffic shape of the last second is not:
+/// applying it made an unrelated page request inherit the placement rules of a
+/// concurrent bulk download, and flipped every second.
+fn intent_for(port: u16) -> Intent {
+    if known_realtime_port(port) {
+        Intent::Realtime
+    } else {
+        Intent::Balanced
+    }
+}
+
+fn preferred_budget(connect_us: u64) -> Duration {
+    if connect_us == 0 {
+        return CONNECT_ATTEMPT;
+    }
+    Duration::from_micros(connect_us.saturating_mul(3).saturating_add(100_000))
+        .clamp(PREFERRED_MINIMUM, CONNECT_ATTEMPT)
+}
+
+/// Multiplier applied to a path's new-flow score for carrying more end-to-end
+/// delay than the best available path. Unknown delay is not penalised.
+fn latency_factor(rtt_us: u64, best_rtt_us: u64) -> f64 {
+    if rtt_us == 0 || best_rtt_us == 0 {
+        return 1.0;
+    }
+    let excess = rtt_us
+        .saturating_sub(best_rtt_us)
+        .saturating_sub(LATENCY_DEAD_ZONE_US);
+    (1.0 + excess as f64 / LATENCY_PENALTY_STEP_US as f64).min(16.0)
 }
 
 #[derive(Args, Debug)]
@@ -107,7 +182,11 @@ struct Path {
     address: Ipv4Addr,
     metered: bool,
     healthy: AtomicBool,
+    /// Smoothed end-to-end request/response delay from the probe, not the
+    /// TCP handshake time.
     rtt_us: AtomicU64,
+    /// Smoothed TCP handshake time; only used to size the failover wait.
+    connect_us: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
     failures: AtomicU64,
@@ -141,6 +220,7 @@ impl Path {
             metered,
             healthy: AtomicBool::new(true),
             rtt_us: AtomicU64::new(0),
+            connect_us: AtomicU64::new(0),
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             failures: AtomicU64::new(0),
@@ -165,6 +245,14 @@ impl Path {
     fn upload_held(&self) -> bool {
         self.created.elapsed().as_millis()
             < u128::from(self.upload_hold_until_ms.load(Ordering::Relaxed))
+    }
+
+    /// How long a new flow waits on this path before other adapters are tried.
+    /// Scaled from the measured handshake so a 70 ms path fails over in about
+    /// 300 ms instead of a fixed 1.2 s, while a genuinely slow path is not
+    /// declared dead by a shorter wait than its own handshake.
+    fn preferred_budget(&self) -> Duration {
+        preferred_budget(self.connect_us.load(Ordering::Relaxed))
     }
 
     fn hold_uploads(&self) {
@@ -195,6 +283,10 @@ struct Runtime {
     cutoff_us: Arc<AtomicU64>,
     brain_advice: Arc<RwLock<Option<(Instant, BrainAdvice)>>>,
     local_advice: Arc<RwLock<Option<BrainAdvice>>>,
+    /// 0=mixed/unknown, 1=download-dominant, 2=upload-dominant. Updated from
+    /// delivered TCP bytes once per second; new flows use it immediately while
+    /// established flows remain pinned to their original ISP.
+    traffic_shape: Arc<AtomicUsize>,
     epoch: Instant,
     guidance: Option<watch::Sender<Guidance>>,
     secure_domains: Arc<RwLock<Vec<String>>>,
@@ -202,9 +294,15 @@ struct Runtime {
 
 impl Runtime {
     async fn candidates(&self, intent: Intent) -> Vec<Arc<Path>> {
+        self.plan(intent).await.paths
+    }
+
+    /// Ordered connect candidates plus the evidence the decision was made on.
+    /// The recorder writes the latter; nothing here changes placement.
+    async fn plan(&self, intent: Intent) -> Plan {
         let all = self.paths.read().await.clone();
         if all.is_empty() {
-            return all;
+            return Plan::default();
         }
         let mut eligible: Vec<_> = all
             .iter()
@@ -220,21 +318,59 @@ impl Runtime {
         }
         let remote = self.brain_advice.read().await;
         let local = self.local_advice.read().await;
-        let advice = remote
-            .as_ref()
-            .filter(|(at, advice)| {
-                advice.valid_for_ms > 0
-                    && at.elapsed().as_millis() < u128::from(advice.valid_for_ms.min(5_000))
-            })
-            .map(|(_, advice)| advice)
-            .or(local.as_ref());
+        // Cloud advice without any delivery evidence is only its cold-start
+        // tie-break, which the deployed server still takes from adapter order.
+        // The Mac has measured end-to-end delay; its own controller uses it.
+        let remote = remote.as_ref().filter(|(at, advice)| {
+            advice.valid_for_ms > 0
+                && advice.learned_paths > 0
+                && at.elapsed().as_millis() < u128::from(advice.valid_for_ms.min(5_000))
+        });
+        let source = match (remote.is_some(), local.is_some()) {
+            (true, _) => "cloud",
+            (false, true) => "local",
+            _ => "none",
+        };
+        let advice = remote.map(|(_, advice)| advice).or(local.as_ref());
         let empty = BTreeMap::new();
         let weights = advice
             .map(|a| match intent {
                 Intent::Realtime => &a.realtime_weights,
+                Intent::Download => &a.download_weights,
+                Intent::Upload => &a.upload_weights,
                 Intent::Balanced => &a.weights,
             })
             .unwrap_or(&empty);
+        let advised_champion = advice.and_then(|a| match intent {
+            Intent::Realtime => None,
+            Intent::Download => a.download_champion.as_deref(),
+            Intent::Upload => a.upload_champion.as_deref(),
+            Intent::Balanced => a.balanced_champion.as_deref(),
+        });
+        let mut features: Vec<_> = eligible
+            .iter()
+            .map(|p| {
+                let ms = |v: u64| (v > 0).then_some(v as f64 / 1000.0);
+                json!({
+                    "name": p.name, "rtt_ms": ms(p.rtt_us.load(Ordering::Relaxed)),
+                    "connect_ms": ms(p.connect_us.load(Ordering::Relaxed)),
+                    "jitter_ms": p.jitter_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                    "probe_failure_ppm": p.probe_failure_ppm.load(Ordering::Relaxed),
+                    "busy": p.busy.load(Ordering::Relaxed), "connecting": p.connecting.load(Ordering::Relaxed),
+                    "active": p.active.load(Ordering::Relaxed), "weight": weights.get(&p.name),
+                    "held": p.upload_held(), "metered": p.metered,
+                    "acknowledged": p.acknowledged.load(Ordering::Relaxed), "received": p.received.load(Ordering::Relaxed)
+                })
+            })
+            .collect();
+        let mut plan = Plan {
+            paths: Vec::new(),
+            source,
+            champion: advised_champion.map(str::to_owned),
+            primary: None,
+            trial: None,
+            features: Vec::new(),
+        };
         if intent == Intent::Realtime || policy == Policy::Continuity {
             let has_fast = eligible.iter().any(|p| {
                 let rtt = p.rtt_us.load(Ordering::Relaxed);
@@ -270,21 +406,30 @@ impl Runtime {
             let busy =
                 |p: &Path| p.busy.load(Ordering::Relaxed) + p.connecting.load(Ordering::Relaxed);
             let unproven = |p: &Path| {
-                p.acknowledged.load(Ordering::Relaxed) < 65_536
+                let guided_challenger = advised_champion.is_some_and(|champion| {
+                    champion != p.name && weights.get(&p.name).copied().unwrap_or(1) <= 1
+                });
+                (p.acknowledged.load(Ordering::Relaxed) < 65_536
+                    && p.received.load(Ordering::Relaxed) < 65_536)
                     || p.upload_hold_until_ms.load(Ordering::Relaxed) > 0
+                    || guided_challenger
             };
-            let primary = eligible
-                .iter()
-                .filter(|p| !p.upload_held())
-                .min_by_key(|p| {
-                    (
-                        unproven(p),
-                        match p.rtt_us.load(Ordering::Relaxed) {
-                            0 => u64::MAX,
-                            v => v,
-                        },
-                        p.name.clone(),
-                    )
+            let primary = advised_champion
+                .and_then(|name| eligible.iter().find(|p| p.name == name && !p.upload_held()))
+                .or_else(|| {
+                    eligible
+                        .iter()
+                        .filter(|p| !p.upload_held())
+                        .min_by_key(|p| {
+                            (
+                                unproven(p),
+                                match p.rtt_us.load(Ordering::Relaxed) {
+                                    0 => u64::MAX,
+                                    v => v,
+                                },
+                                p.name.clone(),
+                            )
+                        })
                 })
                 .or_else(|| eligible.first())
                 .map(|p| p.name.clone())
@@ -304,11 +449,41 @@ impl Runtime {
                     0
                 }
             };
-            let primary_busy = eligible.iter().any(|p| p.name == primary && busy(p) > 0);
-            let trial = if primary_busy {
+            let rtt = |p: &Path| p.rtt_us.load(Ordering::Relaxed);
+            let best_rtt = eligible
+                .iter()
+                .map(|p| rtt(p))
+                .filter(|v| *v > 0)
+                .min()
+                .unwrap_or(0);
+            let penalty = |p: &Path| latency_factor(rtt(p), best_rtt);
+            for feature in &mut features {
+                if let Some(p) = eligible
+                    .iter()
+                    .find(|p| Some(p.name.as_str()) == feature["name"].as_str())
+                {
+                    feature["penalty"] = json!(penalty(p));
+                    feature["unproven"] = json!(unproven(p));
+                }
+            }
+            let primary_load = eligible
+                .iter()
+                .find(|p| p.name == primary)
+                .map(|p| busy(p))
+                .unwrap_or(0);
+            // A trial pins whatever flow arrives next to the unproven path for
+            // that flow's whole life; it cannot be migrated. A path with far
+            // more end-to-end delay only gets that chance once the primary
+            // carries many concurrent flows, not on the first keep-alive.
+            let trial = if primary_load > 0 {
                 eligible
                     .iter()
-                    .find(|p| p.name != primary && unproven(p) && trial_allowed(p))
+                    .find(|p| {
+                        p.name != primary
+                            && unproven(p)
+                            && trial_allowed(p)
+                            && (penalty(p) <= 2.0 || primary_load >= 8)
+                    })
                     .map(|p| p.name.clone())
             } else {
                 None
@@ -319,6 +494,7 @@ impl Runtime {
                     // a busy strong link. Idle keep-alives are not workload.
                     (busy(p) + 1) as f64
                         / weights.get(&p.name).copied().unwrap_or(4).clamp(1, 64) as f64
+                        * penalty(p)
                 };
                 let rank = |p: &Path| {
                     if trial.as_ref() == Some(&p.name) {
@@ -337,8 +513,12 @@ impl Runtime {
                 path.last_trial_ms
                     .store(path.created.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
+            plan.primary = Some(primary);
+            plan.trial = trial;
         }
-        eligible
+        plan.paths = eligible;
+        plan.features = features;
+        plan
     }
 
     async fn must_relay(&self, host: &str) -> bool {
@@ -432,6 +612,10 @@ struct MeteredStream {
     retransmitted: u64,
     queued: u64,
     busy: bool,
+    opened: Instant,
+    first_write: Option<Instant>,
+    first_read: Option<Instant>,
+    holds: u32,
 }
 impl MeteredStream {
     fn new(inner: TcpStream, path: Option<Arc<Path>>) -> Self {
@@ -454,7 +638,22 @@ impl MeteredStream {
             retransmitted: 0,
             queued: 0,
             busy: true,
+            opened: Instant::now(),
+            first_write: None,
+            first_read: None,
+            holds: 0,
         }
+    }
+
+    /// Application-level time to first byte: first remote byte after the first
+    /// client byte was forwarded. None for flows that never got a reply.
+    fn ttfb_ms(&self) -> Option<f64> {
+        Some(
+            self.first_read?
+                .saturating_duration_since(self.first_write?)
+                .as_secs_f64()
+                * 1000.0,
+        )
     }
 
     fn sample(&mut self) {
@@ -492,6 +691,7 @@ impl MeteredStream {
                 self.last_progress.elapsed(),
             ) {
                 path.hold_uploads();
+                self.holds += 1;
             } else if !path.upload_held()
                 && path.acknowledged.load(Ordering::Relaxed)
                     >= path.recovery_acknowledged.load(Ordering::Relaxed)
@@ -501,6 +701,7 @@ impl MeteredStream {
         } else if self.queued > 0 && self.last_progress.elapsed() > Duration::from_millis(500) {
             // Missing/reset socket stats cannot manufacture successful delivery.
             path.hold_uploads();
+            self.holds += 1;
         }
         let busy = self.queued > 16_384 || self.last_activity.elapsed() < Duration::from_secs(1);
         if busy != self.busy {
@@ -572,6 +773,7 @@ impl AsyncRead for MeteredStream {
         self.downloaded += bytes;
         if bytes > 0 {
             self.last_activity = Instant::now();
+            self.first_read.get_or_insert_with(Instant::now);
         }
         self.poll_metrics(cx);
         result
@@ -597,6 +799,7 @@ impl AsyncWrite for MeteredStream {
             self.uploaded += bytes as u64;
             if bytes > 0 {
                 self.last_activity = Instant::now();
+                self.first_write.get_or_insert_with(Instant::now);
             }
         }
         self.poll_metrics(cx);
@@ -830,49 +1033,110 @@ async fn socks_target(stream: &mut TcpStream) -> Result<(String, u16)> {
 }
 
 async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()> {
+    let accepted = Instant::now();
     let (host, port) = time::timeout(Duration::from_secs(3), socks_target(&mut client))
         .await
         .context("SOCKS negotiation timed out")??;
-    let destinations = match resolve(&host, port).await {
+    let resolving = Instant::now();
+    let resolved = resolve(&host, port).await;
+    let dns_ms = resolving.elapsed().as_secs_f64() * 1000.0;
+    let mut record = json!({
+        "t": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+        "dst": destination_tag(&host, port), "port": port, "literal_ip": host.parse::<Ipv4Addr>().is_ok(),
+        "dns_ms": dns_ms, "policy": number_policy(runtime.policy.load(Ordering::Relaxed)),
+        "active": runtime.active.load(Ordering::Relaxed)
+    });
+    let destinations = match resolved {
         Ok(addresses) => addresses,
         Err(error) => {
             client.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            record["result"] = json!("dns_failed");
+            println!("FLOW_RECORD {record}");
             return Err(error);
         }
     };
-    let intent = if known_realtime_port(port) {
-        Intent::Realtime
-    } else {
-        Intent::Balanced
-    };
+    record["addresses"] = json!(destinations.len());
+    let intent = intent_for(port);
     let forced_relay = runtime.must_relay(&host).await
         || (runtime.relay_fallback.load(Ordering::Relaxed)
             && (intent == Intent::Realtime
                 || number_policy(runtime.policy.load(Ordering::Relaxed)) == Policy::Continuity));
+    record["intent"] = json!(format!("{intent:?}"));
+    record["forced_relay"] = json!(forced_relay);
     let mut lease = None;
     let mut selected: Option<(Option<Arc<Path>>, TcpStream)> = None;
+    let mut stage = "relay";
+    let connecting = Instant::now();
     if !forced_relay {
-        let paths = runtime.candidates(intent).await;
-        let candidates: Vec<_> = destinations
-            .iter()
-            .flat_map(|destination| paths.iter().map(move |path| (path.clone(), *destination)))
-            .collect();
-        let attempts = candidates
-            .into_iter()
-            .map(|(path, destination)| async move {
-                let mut reservation = PathLease::new(path.clone());
-                let result = connect_on(&path, destination).await;
-                if result.is_err() {
-                    path.failures.fetch_add(1, Ordering::Relaxed);
+        let plan = runtime.plan(intent).await;
+        record["advice"] = json!(plan.source);
+        record["champion"] = json!(plan.champion);
+        record["primary"] = json!(plan.primary);
+        record["trial"] = json!(plan.trial);
+        record["order"] = json!(
+            plan.paths
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        record["paths"] = json!(plan.features);
+        let mut paths = plan.paths;
+        if let Some(preferred) = paths.first().cloned() {
+            // Selection and failover are separate decisions. Trying an
+            // unproven adapter 150 ms later let it steal control connections
+            // from the selected path. Use the controller's preferred path
+            // first; open the remaining paths only after a real failure.
+            let preferred_attempts = destinations.iter().copied().map(|destination| {
+                let path = preferred.clone();
+                async move {
+                    let mut reservation = PathLease::new(path.clone());
+                    let result = connect_on(&path, destination).await;
+                    if result.is_err() {
+                        path.failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let stream = result?;
+                    path.healthy.store(true, Ordering::Relaxed);
+                    reservation.connected();
+                    Ok((path, stream, reservation))
                 }
-                let stream = result?;
-                path.healthy.store(true, Ordering::Relaxed);
-                reservation.connected();
-                Ok((path, stream, reservation))
             });
-        if let Ok((path, stream, reservation)) = race_connections(attempts, CONNECT_BUDGET).await {
-            selected = Some((Some(path), stream));
-            lease = Some(reservation);
+            record["preferred_budget_ms"] = json!(preferred.preferred_budget().as_millis() as u64);
+            if let Ok((path, stream, reservation)) =
+                race_connections(preferred_attempts, preferred.preferred_budget()).await
+            {
+                selected = Some((Some(path), stream));
+                lease = Some(reservation);
+                stage = "preferred";
+            } else {
+                preferred.healthy.store(false, Ordering::Relaxed);
+            }
+            paths.remove(0);
+        }
+        if selected.is_none() {
+            let candidates: Vec<_> = destinations
+                .iter()
+                .flat_map(|destination| paths.iter().map(move |path| (path.clone(), *destination)))
+                .collect();
+            let attempts = candidates
+                .into_iter()
+                .map(|(path, destination)| async move {
+                    let mut reservation = PathLease::new(path.clone());
+                    let result = connect_on(&path, destination).await;
+                    if result.is_err() {
+                        path.failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let stream = result?;
+                    path.healthy.store(true, Ordering::Relaxed);
+                    reservation.connected();
+                    Ok((path, stream, reservation))
+                });
+            if let Ok((path, stream, reservation)) =
+                race_connections(attempts, CONNECT_BUDGET).await
+            {
+                selected = Some((Some(path), stream));
+                lease = Some(reservation);
+                stage = "failover";
+            }
         }
     }
     if selected.is_none() && (forced_relay || runtime.relay_fallback.load(Ordering::Relaxed)) {
@@ -881,12 +1145,22 @@ async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()
             .map(|destination| connect_via_relay(destination, runtime.relay_route.clone()));
         if let Ok(stream) = race_connections(attempts, Duration::from_secs(2)).await {
             selected = Some((None, stream));
+            stage = if forced_relay {
+                "relay"
+            } else {
+                "relay_fallback"
+            };
         }
     }
+    record["connect_ms"] = json!(connecting.elapsed().as_secs_f64() * 1000.0);
+    record["stage"] = json!(stage);
     let Some((path, outbound)) = selected else {
         client.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        record["result"] = json!("no_route");
+        println!("FLOW_RECORD {record}");
         bail!("no route succeeded for {host}:{port}");
     };
+    record["path"] = json!(path.as_ref().map(|p| p.name.as_str()).unwrap_or("relay"));
     let local = match outbound.local_addr()? {
         SocketAddr::V4(address) => address,
         SocketAddr::V6(_) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
@@ -907,12 +1181,70 @@ async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()
         tokio::io::copy_bidirectional_with_sizes(&mut client, &mut outbound, 65_536, 65_536).await;
     runtime.active.fetch_sub(1, Ordering::Relaxed);
     drop(lease);
+    outbound.sample();
+    record["result"] = json!(match &result {
+        Ok(_) => "closed",
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => "reset",
+        Err(_) => "error",
+    });
+    record["up"] = json!(outbound.uploaded);
+    record["down"] = json!(outbound.downloaded);
+    record["acked"] = json!(outbound.acknowledged);
+    record["retransmitted"] = json!(outbound.retransmitted);
+    record["holds"] = json!(outbound.holds);
+    record["ttfb_ms"] = json!(outbound.ttfb_ms());
+    record["open_ms"] = json!(outbound.opened.elapsed().as_secs_f64() * 1000.0);
+    record["total_ms"] = json!(accepted.elapsed().as_secs_f64() * 1000.0);
+    record["min_rtt_ms"] =
+        json!((outbound.minimum_rtt_us > 0).then_some(outbound.minimum_rtt_us as f64 / 1000.0));
+    println!("FLOW_RECORD {record}");
     result?;
     Ok(())
 }
 
+/// Returns (handshake time, request-to-first-response-byte time). The second
+/// value is the path's real end-to-end delay; the first is only a lower bound.
+async fn probe_once(path: &Path, destination: SocketAddr) -> Result<(Duration, Duration)> {
+    let started = Instant::now();
+    let mut stream = time::timeout(PROBE_TIMEOUT, connect_on(path, destination))
+        .await
+        .context("probe connect timed out")??;
+    let connect = started.elapsed();
+    // Unique path defeats any transparent cache between us and the server.
+    let nonce = PROBE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let request = format!(
+        "HEAD /verz-probe/{nonce} HTTP/1.1\r\nHost: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        destination.ip()
+    );
+    let sent = Instant::now();
+    stream.write_all(request.as_bytes()).await?;
+    let mut first = [0_u8; 1];
+    let read = time::timeout(PROBE_TIMEOUT, stream.read(&mut first))
+        .await
+        .context("probe response timed out")??;
+    ensure!(read == 1, "probe peer closed without responding");
+    Ok((connect, sent.elapsed()))
+}
+
+fn smooth(cell: &AtomicU64, observed: Duration) -> u64 {
+    let observed = observed.as_micros().min(u128::from(u64::MAX)) as u64;
+    let prior = cell.load(Ordering::Relaxed);
+    cell.store(
+        if prior == 0 {
+            observed
+        } else {
+            (prior * 7 + observed) / 8
+        },
+        Ordering::Relaxed,
+    );
+    prior
+}
+
 async fn probe(runtime: Runtime) {
     let destination: SocketAddr = PROBE_DESTINATION.parse().expect("fixed probe destination");
+    let health: SocketAddr = PROBE_HEALTH_DESTINATION
+        .parse()
+        .expect("fixed health destination");
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
@@ -923,23 +1255,20 @@ async fn probe(runtime: Runtime) {
                 continue;
             }
             tokio::spawn(async move {
-                let started = Instant::now();
-                match connect_on(&path, destination).await {
-                    Ok(_) => {
-                        let observed =
-                            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                        let prior = path.rtt_us.load(Ordering::Relaxed);
+                match probe_once(&path, destination).await {
+                    Ok((connect, response)) => {
+                        smooth(&path.connect_us, connect);
+                        let observed = response.as_micros().min(u128::from(u64::MAX)) as u64;
+                        let prior = smooth(&path.rtt_us, response);
                         let jitter = path.jitter_us.load(Ordering::Relaxed);
                         path.jitter_us.store(
-                            (jitter * 3 + prior.abs_diff(observed)) / 4,
-                            Ordering::Relaxed,
-                        );
-                        path.rtt_us.store(
-                            if prior == 0 {
-                                observed
-                            } else {
-                                (prior * 7 + observed) / 8
-                            },
+                            (jitter * 3
+                                + if prior == 0 {
+                                    0
+                                } else {
+                                    prior.abs_diff(observed)
+                                })
+                                / 4,
                             Ordering::Relaxed,
                         );
                         path.healthy.store(true, Ordering::Relaxed);
@@ -949,12 +1278,19 @@ async fn probe(runtime: Runtime) {
                     }
                     Err(_) => {
                         path.failures.fetch_add(1, Ordering::Relaxed);
-                        path.healthy.store(false, Ordering::Relaxed);
                         path.probe_failure_ppm
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                                 Some(v * 7 / 8 + 125_000)
                             })
                             .ok();
+                        // A network that blocks plain HTTP is still usable for
+                        // TLS; only a failed handshake marks the path offline.
+                        // Its end-to-end delay then stays unknown, so it is
+                        // never preferred for realtime work on handshake alone.
+                        let reachable =
+                            time::timeout(PROBE_TIMEOUT, connect_on(&path, health)).await;
+                        path.healthy
+                            .store(matches!(reachable, Ok(Ok(_))), Ordering::Relaxed);
                     }
                 }
                 path.probing.store(false, Ordering::Relaxed);
@@ -975,6 +1311,8 @@ async fn telemetry(runtime: Runtime) {
         let paths = runtime.paths.read().await.clone();
         let cutoff = runtime.cutoff_us.load(Ordering::Relaxed);
         previous.retain(|id, _| paths.iter().any(|p| p.incarnation == *id));
+        let mut total_up = 0.0;
+        let mut total_down = 0.0;
         let reports: Vec<_> = paths.iter().enumerate().map(|(id, path)| {
             let healthy = path.healthy.load(Ordering::Relaxed);
             let rtt = path.rtt_us.load(Ordering::Relaxed);
@@ -986,9 +1324,12 @@ async fn telemetry(runtime: Runtime) {
                 let secs = now.duration_since(at).as_secs_f64().max(0.001);
                 (acknowledged.saturating_sub(tx) as f64 * 8.0 / secs, received.saturating_sub(rx) as f64 * 8.0 / secs)
             }).unwrap_or((0.0, 0.0));
+            total_up += up;
+            total_down += down;
             json!({
                 "id": id, "name": path.name, "state": if healthy { "healthy" } else { "offline" },
                 "enabled": true, "rtt_ms": if rtt == 0 { None } else { Some(rtt as f64 / 1000.0) },
+                "connect_ms": match path.connect_us.load(Ordering::Relaxed) { 0 => None, v => Some(v as f64 / 1000.0) },
                 "jitter_ms": path.jitter_us.load(Ordering::Relaxed) as f64 / 1000.0,
                 "sent_bytes": sent, "received_bytes": received, "acknowledged_bytes": acknowledged,
                 "delivery_bps": up + down, "latency_excluded": false,
@@ -998,6 +1339,16 @@ async fn telemetry(runtime: Runtime) {
                 "connect_failures": path.failures.load(Ordering::Relaxed)
             })
         }).collect();
+        let traffic_shape = if total_down >= 1_000_000.0 && total_down > total_up * 2.0 {
+            1
+        } else if total_up >= 1_000_000.0 && total_up > total_down * 2.0 {
+            2
+        } else {
+            0
+        };
+        runtime
+            .traffic_shape
+            .store(traffic_shape, Ordering::Relaxed);
         let healthy = paths
             .iter()
             .filter(|p| p.healthy.load(Ordering::Relaxed))
@@ -1010,6 +1361,12 @@ async fn telemetry(runtime: Runtime) {
                 "accepted_connections": runtime.accepted.load(Ordering::Relaxed),
                 "direct_connections": runtime.direct_connections.load(Ordering::Relaxed),
                 "relay_connections": runtime.relay_connections.load(Ordering::Relaxed),
+                "traffic_shape": match traffic_shape { 1 => "download", 2 => "upload", _ => "balanced" },
+                "balanced_champion": advice.balanced_champion,
+                "download_champion": advice.download_champion,
+                "upload_champion": advice.upload_champion,
+                "download_guarded": advice.download_guarded,
+                "upload_guarded": advice.upload_guarded,
                 "cutoff_ms": cutoff as f64 / 1000.0
             })
         );
@@ -1069,9 +1426,9 @@ async fn brain(runtime: Runtime, address: SocketAddr, secret_file: PathBuf) {
                 continue;
             }
             // Advice cannot change security mode, local health or cost rules.
-            // Older servers do not understand delivery feedback: use the
-            // local v3 controller until both ends have been upgraded.
-            let compatible = advice.strategy == "delivery-aware-v3" && advice.valid_for_ms > 0;
+            // Older servers do not provide champion/confidence guidance: use
+            // the local v4 controller until both ends have been upgraded.
+            let compatible = advice.strategy == crate::brain::STRATEGY && advice.valid_for_ms > 0;
             *runtime.brain_advice.write().await =
                 compatible.then(|| (Instant::now(), advice.clone()));
             if let Some(sender) = &runtime.guidance {
@@ -1221,6 +1578,7 @@ pub async fn run_with_guidance(
         cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
         brain_advice: Arc::new(RwLock::new(None)),
         local_advice: Arc::new(RwLock::new(None)),
+        traffic_shape: Arc::new(AtomicUsize::new(0)),
         epoch: Instant::now(),
         guidance,
         secure_domains: Arc::new(RwLock::new(secure_domains)),
@@ -1372,10 +1730,18 @@ mod tests {
             cutoff_us: Arc::new(AtomicU64::new(DEFAULT_LATENCY_CUTOFF_US)),
             brain_advice: Arc::new(RwLock::new(None)),
             local_advice: Arc::new(RwLock::new(None)),
+            traffic_shape: Arc::new(AtomicUsize::new(0)),
             epoch: Instant::now(),
             guidance: None,
             secure_domains: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Cloud advice as it looks once the server has delivery evidence.
+    async fn learned_advice(runtime: &Runtime) -> BrainAdvice {
+        let mut advice = crate::brain::advise(&runtime.report().await, 1);
+        advice.learned_paths = 1;
+        advice
     }
 
     #[test]
@@ -1443,7 +1809,7 @@ mod tests {
         a.acknowledged.store(100_000, Ordering::Relaxed);
         b.acknowledged.store(100_000, Ordering::Relaxed);
         let runtime = runtime(vec![a.clone(), b], Policy::Smart);
-        let mut advice = crate::brain::advise(&runtime.report().await, 1);
+        let mut advice = learned_advice(&runtime).await;
         advice.download_weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 4)]);
         advice.upload_weights = BTreeMap::from([("en0".into(), 4), ("en7".into(), 64)]);
         advice.weights = BTreeMap::from([("en0".into(), 4), ("en7".into(), 16)]);
@@ -1459,6 +1825,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_traffic_direction_uses_its_own_champion_and_weights() -> Result<()> {
+        let wifi = parse_path("en0=192.168.1.2,false")?;
+        let lan = parse_path("en7=192.168.1.3,false")?;
+        for path in [&wifi, &lan] {
+            path.rtt_us.store(20_000, Ordering::Relaxed);
+            path.acknowledged.store(100_000, Ordering::Relaxed);
+            path.received.store(100_000, Ordering::Relaxed);
+        }
+        let runtime = runtime(vec![wifi, lan], Policy::Smart);
+        let mut advice = learned_advice(&runtime).await;
+        advice.download_champion = Some("en0".into());
+        advice.upload_champion = Some("en7".into());
+        advice.download_weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 8)]);
+        advice.upload_weights = BTreeMap::from([("en0".into(), 8), ("en7".into(), 64)]);
+        *runtime.brain_advice.write().await = Some((Instant::now(), advice));
+
+        runtime.traffic_shape.store(1, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Download).await[0].name, "en0");
+        runtime.traffic_shape.store(2, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Upload).await[0].name, "en7");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn expired_advice_uses_local_learning_and_limits_unknown_path_trials() -> Result<()> {
         let a = parse_path("en0=192.168.1.2,false")?;
         let b = parse_path("en7=192.168.1.3,false")?;
@@ -1467,7 +1857,7 @@ mod tests {
         a.acknowledged.store(100_000, Ordering::Relaxed);
         b.acknowledged.store(100_000, Ordering::Relaxed);
         let runtime = runtime(vec![a, b], Policy::Smart);
-        let mut remote = crate::brain::advise(&runtime.report().await, 1);
+        let mut remote = learned_advice(&runtime).await;
         remote.weights = BTreeMap::from([("en0".into(), 1), ("en7".into(), 64)]);
         let mut local = remote.clone();
         local.weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 1)]);
@@ -1586,6 +1976,188 @@ mod tests {
     }
 
     #[test]
+    fn unknown_flows_are_not_classified_by_machine_wide_traffic_shape() {
+        assert_eq!(intent_for(443), Intent::Balanced);
+        assert_eq!(intent_for(80), Intent::Balanced);
+        assert_eq!(intent_for(5061), Intent::Realtime);
+    }
+
+    #[test]
+    fn flow_record_destination_tag_is_salted_and_never_the_destination() {
+        let a = destination_tag("Example.com", 443);
+        assert_eq!(a, destination_tag("example.com", 443));
+        assert_ne!(a, destination_tag("example.com", 80));
+        assert_eq!(a.len(), 16);
+        assert!(!a.contains("example"));
+    }
+
+    #[tokio::test]
+    async fn plan_reports_its_evidence_and_ttfb_is_request_to_first_reply() -> Result<()> {
+        let wifi = parse_path("en0=192.168.1.2,false")?;
+        let lan = parse_path("en7=192.168.1.3,false")?;
+        wifi.rtt_us.store(70_000, Ordering::Relaxed);
+        lan.rtt_us.store(15_000, Ordering::Relaxed);
+        let runtime = runtime(vec![wifi, lan], Policy::Smart);
+        let plan = runtime.plan(Intent::Balanced).await;
+        assert_eq!(plan.source, "none");
+        assert_eq!(plan.features.len(), 2);
+        assert!(
+            plan.features
+                .iter()
+                .any(|f| f["name"] == "en7" && f["penalty"] == 1.0)
+        );
+        *runtime.local_advice.write().await =
+            Some(crate::brain::advise(&runtime.report().await, 1));
+        let plan = runtime.plan(Intent::Balanced).await;
+        assert_eq!(plan.source, "local");
+        assert_eq!(plan.primary.as_deref(), Some("en7"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let socket = TcpStream::connect(listener.local_addr()?).await?;
+        let (mut peer, _) = listener.accept().await?;
+        let mut stream = MeteredStream::new(socket, None);
+        assert_eq!(stream.ttfb_ms(), None);
+        stream.write_all(b"ping").await?;
+        peer.read_exact(&mut [0; 4]).await?;
+        time::sleep(Duration::from_millis(50)).await;
+        peer.write_all(b"pong").await?;
+        stream.read_exact(&mut [0; 4]).await?;
+        assert!(stream.ttfb_ms().is_some_and(|v| v >= 50.0));
+        Ok(())
+    }
+
+    #[test]
+    fn failover_wait_scales_with_measured_handshake_within_bounds() {
+        assert_eq!(preferred_budget(0), CONNECT_ATTEMPT);
+        assert_eq!(preferred_budget(70_000), Duration::from_millis(310));
+        assert_eq!(preferred_budget(10_000), PREFERRED_MINIMUM);
+        assert_eq!(preferred_budget(900_000), CONNECT_ATTEMPT);
+    }
+
+    #[test]
+    fn latency_penalty_ignores_small_differences_and_unknowns() {
+        assert_eq!(latency_factor(0, 66_000), 1.0);
+        assert_eq!(latency_factor(66_000, 0), 1.0);
+        assert_eq!(latency_factor(40_000, 20_000), 1.0);
+        assert_eq!(latency_factor(66_000, 66_000), 1.0);
+        let lan = latency_factor(620_000, 66_000);
+        assert!((6.0..6.1).contains(&lan), "{lan}");
+        assert_eq!(latency_factor(10_000_000, 1_000), 16.0);
+    }
+
+    #[tokio::test]
+    async fn probe_times_the_response_not_the_handshake() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let destination = listener.local_addr()?;
+        // Middlebox stand-in: accepts instantly, answers 200 ms later.
+        tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 512];
+            let read = peer.read(&mut request).await.unwrap();
+            assert!(request[..read].starts_with(b"HEAD /verz-probe/"));
+            time::sleep(Duration::from_millis(200)).await;
+            peer.write_all(b"HTTP/1.1 301 Moved Permanently\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let path = parse_path("lo0=192.0.2.1,false")?;
+        let path = Path {
+            address: Ipv4Addr::LOCALHOST,
+            ..Arc::into_inner(path).expect("unshared path")
+        };
+        let (connect, response) = probe_once(&path, destination).await?;
+        assert!(connect < Duration::from_millis(100), "{connect:?}");
+        assert!(response >= Duration::from_millis(200), "{response:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloud_advice_without_evidence_defers_to_local_delay_measurement() -> Result<()> {
+        let hotspot = parse_path("en0=192.168.1.2,false")?;
+        let lan = parse_path("en7=192.168.1.3,false")?;
+        hotspot.rtt_us.store(70_000, Ordering::Relaxed);
+        lan.rtt_us.store(15_000, Ordering::Relaxed);
+        let runtime = runtime(vec![hotspot, lan], Policy::Smart);
+        let report = runtime.report().await;
+        // Deployed server behaviour observed 2026-09-09: first-listed adapter
+        // becomes champion with no delivery evidence (learned_paths == 0).
+        let mut remote = crate::brain::advise(&report, 1);
+        remote.balanced_champion = Some("en0".into());
+        remote.weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 1)]);
+        remote.learned_paths = 0;
+        *runtime.brain_advice.write().await = Some((Instant::now(), remote.clone()));
+        *runtime.local_advice.write().await = Some(crate::brain::advise(&report, 1));
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en7");
+        // Once the cloud has delivery evidence its advice is used again.
+        remote.learned_paths = 1;
+        *runtime.brain_advice.write().await = Some((Instant::now(), remote));
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_fast_path_is_not_relieved_by_a_much_slower_idle_path() -> Result<()> {
+        let wifi = parse_path("en0=192.168.1.2,false")?;
+        let lan = parse_path("en7=192.168.1.3,false")?;
+        wifi.rtt_us.store(66_000, Ordering::Relaxed);
+        lan.rtt_us.store(620_000, Ordering::Relaxed);
+        for path in [&wifi, &lan] {
+            path.acknowledged.store(1_000_000, Ordering::Relaxed);
+            path.received.store(1_000_000, Ordering::Relaxed);
+        }
+        let runtime = runtime(vec![wifi.clone(), lan.clone()], Policy::Smart);
+        let mut advice = learned_advice(&runtime).await;
+        advice.balanced_champion = Some("en0".into());
+        // Learned shape of the measured setup: ~225/33 Mbps down.
+        advice.weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 9)]);
+        *runtime.brain_advice.write().await = Some((Instant::now(), advice));
+        // Ten concurrent page-load flows on Wi-Fi previously sent the next
+        // request to the 620 ms path.
+        wifi.busy.store(10, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en0");
+        wifi.busy.store(40, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en0");
+        // Under heavy concurrency the slower path still adds capacity.
+        wifi.busy.store(60, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en7");
+        // Comparable delay keeps the capacity-proportional sharing.
+        lan.rtt_us.store(90_000, Ordering::Relaxed);
+        wifi.busy.store(10, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en7");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn much_slower_unproven_path_is_trialled_only_under_real_load() -> Result<()> {
+        let mut wifi = parse_path("en0=192.168.1.2,false")?;
+        let mut lan = parse_path("en7=192.168.1.3,false")?;
+        for path in [&mut wifi, &mut lan] {
+            Arc::get_mut(path).unwrap().created = Instant::now() - Duration::from_secs(10);
+        }
+        wifi.rtt_us.store(66_000, Ordering::Relaxed);
+        lan.rtt_us.store(620_000, Ordering::Relaxed);
+        wifi.acknowledged.store(1_000_000, Ordering::Relaxed);
+        wifi.received.store(1_000_000, Ordering::Relaxed);
+        let runtime = runtime(vec![wifi.clone(), lan.clone()], Policy::Smart);
+        let mut advice = learned_advice(&runtime).await;
+        advice.balanced_champion = Some("en0".into());
+        advice.weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 1)]);
+        *runtime.brain_advice.write().await = Some((Instant::now(), advice));
+        wifi.busy.store(1, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en0");
+        wifi.busy.store(8, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en7");
+        // One trial per five seconds; the next flow returns to the primary.
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en0");
+        // A similarly fast unproven path is trialled as soon as work exists.
+        lan.rtt_us.store(80_000, Ordering::Relaxed);
+        lan.last_trial_ms.store(0, Ordering::Relaxed);
+        wifi.busy.store(1, Ordering::Relaxed);
+        assert_eq!(runtime.candidates(Intent::Balanced).await[0].name, "en7");
+        Ok(())
+    }
+
+    #[test]
     fn upload_guard_uses_backlog_and_loaded_delay_not_geographic_rtt() {
         assert!(!upload_congested(
             1_000_000,
@@ -1639,7 +2211,7 @@ mod tests {
         a.hold_uploads();
         b.busy.store(100, Ordering::Relaxed);
         let runtime = runtime(vec![a.clone(), b], Policy::Smart);
-        let mut advice = crate::brain::advise(&runtime.report().await, 1);
+        let mut advice = learned_advice(&runtime).await;
         advice.weights = BTreeMap::from([("en0".into(), 64), ("en7".into(), 1)]);
         *runtime.brain_advice.write().await = Some((Instant::now(), advice));
         for _ in 0..20 {

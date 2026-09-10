@@ -1,9 +1,19 @@
-# Adaptive brain — 0.5.2
+# Adaptive brain — 0.6.1
 
 The server is an advisory controller. It is not in the payload path for direct
 flows, and the Mac never waits for it to detect or react to a path failure.
 Secure Continuity payloads still traverse the encrypted relay; a brain-only
 control connection cannot preserve an ordinary TCP session across public IPs.
+
+Customer-facing builds do not need to explain or expose the brain, relay
+endpoint, packet scheduler, private tunnel addressing, or path-decision
+telemetry. Those details belong in protected VERZ engineering diagnostics.
+Automatic Hybrid may use the selected ISP public IP for direct flows and the
+relay public IP for protected flows, so one public-IP label is not a complete
+description of the session. Version 0.6.1 remains a development build, still
+exposes development-oriented details, and does not measure a trustworthy relay
+active/idle state; see
+[Product identity and disclosure](ARCHITECTURE_V3.md#product-identity-and-disclosure).
 
 ## What learns
 
@@ -49,11 +59,52 @@ The hold lasts three seconds after the last bad sample. Unknown/recovering
 secondary paths receive at most one new trial every five seconds while the
 preferred path is busy, and no new trial while that path has busy work.
 Recovery requires 64 KiB of subsequent acknowledged data and expiration of the
-hold. The initial unknown primary is the lowest measured probe-RTT path, with
-a stable name tie-break when RTT is unavailable. Paths are retained as connect
-fallbacks, and the only usable path is never blackholed by this policy.
+hold. The initial unknown bulk primary follows the lowest measured end-to-end
+request delay; adapter order is only the tie-break when no path has been
+measured. Handshake RTT is not treated as evidence of bandwidth or of delay:
+the probe times a real HTTP request/response on 1.1.1.1:80, because a
+TCP-splitting middlebox (satellite/cellular accelerator) completes handshakes
+locally in a few milliseconds while the actual path carries hundreds. Paths are
+retained as connect fallbacks, and the only usable path is never blackholed by
+this policy.
 Existing direct connections are never moved between ISPs. A limited trial can
 still become a long upload: its eventual direction and size are unknowable.
+A path carrying far more end-to-end delay than the best path (beyond a 50 ms
+dead zone) receives new flows only in proportion to a delay penalty, and is
+trialled only once the primary carries eight or more concurrent busy flows.
+
+## Champion–Challenger allocation (0.6.1)
+
+The controller now learns separate download and upload champions. An unproven
+path is a Challenger and receives weight 1 against the Champion's weight 64.
+It must deliver at least 64 KiB in three measurement intervals before it can
+become Champion or earn an allocation proportional to its observed directional
+delivery rate. One short burst cannot promote a path.
+The Champion changes only when another learned path exceeds it by 15%, avoiding
+rapid oscillation between similar paths. Download evidence can prove a path;
+it no longer requires application upload acknowledgements.
+
+The Mac classifies the current aggregate workload once per second as download
+dominant, upload dominant, or balanced for telemetry only. New unknown flows
+use the balanced Champion and two-way weights: a machine-wide shape is not
+evidence about an unrelated new connection, and applying it changed every
+second. Directional weights remain in the protocol for a future per-flow
+signal. Existing TCP connections stay pinned. Realtime traffic
+continues to use latency, jitter, reachability, and the 75 ms policy instead of
+bulk capacity ranking.
+
+The controller retains a decaying recent delivered-rate envelope for the
+Champion. When two or more paths are actively delivering but their aggregate
+rate falls below 95% of that envelope, new flows contract to weight 64 for the
+Champion and weight 1 for Challengers in that direction. This is a safety
+response, not proof of unused capacity or a guarantee that an already-running
+transfer can be repaired. The floor becomes meaningful only after the current
+session has collected representative load; learning is not yet persisted
+across app restarts or network changes.
+
+The v0.6.1 engineering telemetry reports the current traffic shape, directional
+Champions, and guard state. These fields are for VERZ testing and must not be
+shown in the production customer interface.
 
 ## Traffic handling
 
@@ -88,11 +139,15 @@ Hybrid relay TCP sockets explicitly bind to the assigned utun and tunnel source
 address, so protected flows cannot fall through to the old physical default
 while routes are being prepared or removed.
 
-New direct TCP handshakes give the preferred path a 150 ms head start, race at
-most two attempts, cancel losing sockets before sending application bytes, and
-share a three-second direct setup budget. Each attempt is bounded to 1.2 seconds;
-optional relay fallback shares a separate two-second budget. DNS has a two-second
-application deadline; an underlying OS resolver worker may finish later.
+New direct TCP handshakes first try the controller-selected adapter. Multiple
+resolved addresses may race on that same adapter, but a later unproven adapter
+cannot steal the connection merely by completing its handshake sooner. Remaining
+adapters open only after the selected adapter fails its bounded attempt, sized
+at three times its smoothed handshake time plus 100 ms and clamped to
+300–1200 ms (1.2 s until the first probe); they share a three-second direct
+fallback budget. Optional relay
+fallback has a separate two-second budget. DNS has a two-second application
+deadline; an underlying OS resolver worker may finish later.
 This bounds connection establishment, not retransmission on an existing session.
 Existing TCP sessions are not deliberately reset or migrated. A controlled
 pre-update test already preserved one IPv4 HTTPS connection across Connect;
@@ -117,9 +172,14 @@ TCP reorder hold; that throughput acceptance case remains open.
 - Advice expires after at most five seconds; disconnect clears it immediately.
   The same controller keeps learning locally during a brain outage.
 - Local health, Data Saver, security mode and domain rules override advice.
-  v0.5.1 requires `delivery-aware-v3` advice and falls back locally with older
-  brains. Its compact report accepts legacy field names on the server; older
-  clients reject the v3 strategy and use their own controller until upgraded.
+  The client requires `champion-challenger-v7` advice and falls back to its
+  local v6 controller with older brains; cloud advice carrying no delivery
+  evidence is also ignored in favour of the local delay-based cold start. Its
+  compact report accepts legacy field names on the server; older clients reject
+  the newer strategy and use their own controller until upgraded. Learned
+  envelopes decay over 30 s while a path carries traffic and over 10 minutes
+  while idle, so a pause does not hand the champion to whichever path moved
+  bytes last.
 - Probes do not overlap per adapter. Destination-specific connect failures no
   longer mark the whole ISP offline or contaminate uplink RTT.
 - Hybrid's helper recovers a missing secondary scoped default from that

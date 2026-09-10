@@ -43,6 +43,43 @@ replace the tunnel session, private IP, or public relay identity. Direct TCP
 flows retain the physical limit described below and therefore cannot be given
 the same session-migration guarantee.
 
+## Product identity and disclosure
+
+VERZ optimizes for the customer outcome, not for exposing its internal routing
+method. The production customer interface must not display the brain endpoint,
+relay endpoint, relay public IP, private tunnel addresses, packet scheduler,
+path-selection decisions, or detailed direct-versus-relay counters. Its primary
+language should remain outcome-oriented: connected, speed optimized, continuity
+ready, usable connections, overall traffic rate, and actionable connection
+health. A continuity-ready claim must be backed by a healthy warm secure path;
+it is not a promise of mathematically zero interruption for every protocol.
+
+Automatic Hybrid has two possible external identities. Direct traffic retains
+the public IP and natural route of the selected ISP. Traffic placed on Secure
+Continuity exits with the relay's public IP so that it has a stable identity
+across WAN changes. The Mac uses a private address inside the secure tunnel; it
+does not own the relay's public address. A single unlabeled "Public IPv4" value
+cannot describe every Hybrid flow and should not appear in the normal customer
+interface.
+
+VERZ engineering still requires detailed evidence to develop, test, and support
+the system. Direct and relay egress identities, brain and relay connectivity,
+per-path health, active relayed flows, direct/relay byte rates, scheduler
+counters, and failover timing belong in an internal development build or a
+protected engineering diagnostics mode available to the VERZ owner and
+authorized engineering team. They are not customer-facing product features.
+
+Version 0.6.1 does not yet implement this production disclosure boundary. Its
+visible Diagnostics page and connection details remain development UI, and it
+does not reliably classify the warm relay as idle versus actively carrying
+payload. That state must be based on measured active relay flows and relay byte
+deltas before it is used by any interface or test assertion.
+
+Removing internal details from the customer UI is product abstraction, not a
+security boundary. Authentication, encryption, authorization, and server-side
+controls must protect the system even when endpoints and protocol behavior are
+inspected.
+
 ## Control and trust boundaries
 
 - Payload data stays local/direct in Direct Smart.

@@ -207,7 +207,10 @@ impl Path {
             received_bytes: 0,
             delivery_bps: 0.0,
             in_flight: 0,
-            congestion_window: 16 * BOND_MTU,
+            // 300 Mbps at 3 ms LAN RTT needs ~112 KB in flight to fill; the
+            // previous 16 MTU (~19 KB) start capped throughput to ~50 Mbps
+            // for the first many RTTs before growth caught up.
+            congestion_window: 32 * BOND_MTU,
             slow_start_threshold: 4 * 1024 * 1024,
             timeouts: 0,
             latency_excluded: false,
@@ -250,15 +253,20 @@ impl Path {
         }
         self.minimum_rtt_ms = self.minimum_rtt_ms.min(sample);
         let rtt = self.rtt_ms.unwrap_or(sample);
-        // Using a high-baseline-RTT path for bulk is useful; building an ISP
-        // queue on it is not. Back off on added queue delay without calling
-        // geographic latency packet loss or waiting for a retransmit timeout.
-        if rtt - self.minimum_rtt_ms > 10.0
+        // 10 ms was pathological on LAN (min 3 ms): a single BDP worth of
+        // packets in flight already pushes rtt past 13 ms, so cwnd was halved
+        // on every growth attempt and stuck at ~5 MTUs. A 30 ms threshold
+        // still catches queue building on any link, including satellite.
+        const DELAY_SLACK_MS: f64 = 30.0;
+        if rtt - self.minimum_rtt_ms > DELAY_SLACK_MS
             && self
                 .last_delay_adjust
                 .is_none_or(|last| now.saturating_sub(last) as f64 >= rtt)
         {
-            let ratio = ((self.minimum_rtt_ms + 5.0) / rtt).clamp(0.5, 0.9);
+            // Softer backoff (0.75..0.95): cutting cwnd in half whenever a
+            // couple of packets queue prevented steady-state throughput near
+            // capacity even after growth reached the BDP.
+            let ratio = ((self.minimum_rtt_ms + DELAY_SLACK_MS) / rtt).clamp(0.75, 0.95);
             self.congestion_window =
                 ((self.congestion_window as f64 * ratio) as usize).max(4 * BOND_MTU);
             self.slow_start_threshold = self.congestion_window;
@@ -287,9 +295,11 @@ impl Path {
     }
 
     fn acknowledge_capacity(&mut self, bytes: usize) {
+        // Match the delay-based backoff threshold so growth pauses only when
+        // backoff would also trigger, not on any transient queue.
         if self
             .rtt_ms
-            .is_some_and(|rtt| rtt - self.minimum_rtt_ms > 10.0)
+            .is_some_and(|rtt| rtt - self.minimum_rtt_ms > 30.0)
         {
             return;
         }
@@ -789,7 +799,25 @@ impl Scheduler {
 fn interactive(ip: &[u8]) -> bool {
     // Large UDP/QUIC transfers are bulk too. Treating every UDP packet as
     // interactive duplicated downloads and consumed the capacity being bonded.
+    // Bare TCP ACKs are also skipped: TCP already tolerates ACK loss via the
+    // next cumulative ACK, and duplicating them halved each path's usable
+    // bandwidth during bulk transfers.
+    if bare_tcp_ack(ip) {
+        return false;
+    }
     ip.len() < 600 || ip.get(9) == Some(&1) || ip.get(1).is_some_and(|v| v >> 2 == 46)
+}
+
+fn bare_tcp_ack(ip: &[u8]) -> bool {
+    if ip.first().is_none_or(|v| v >> 4 != 4) || ip.get(9) != Some(&6) {
+        return false;
+    }
+    let iph = usize::from(ip[0] & 15) * 4;
+    if iph < 20 || ip.len() < iph + 20 {
+        return false;
+    }
+    let tcph = usize::from(ip[iph + 12] >> 4) * 4;
+    tcph >= 20 && ip.len() == iph + tcph
 }
 
 fn streaming(ip: &[u8]) -> bool {
@@ -1065,11 +1093,11 @@ mod tests {
         for _ in 0..512 {
             path.acknowledge_capacity(BOND_MTU);
         }
-        assert_eq!(path.congestion_window, 528 * BOND_MTU);
+        assert_eq!(path.congestion_window, 544 * BOND_MTU);
         path.congestion_loss(100);
         let reduced = path.congestion_window;
-        assert_eq!(reduced, 264 * BOND_MTU);
-        for _ in 0..264 {
+        assert_eq!(reduced, 272 * BOND_MTU);
+        for _ in 0..272 {
             path.acknowledge_capacity(BOND_MTU);
         }
         assert_eq!(path.congestion_window, reduced + BOND_MTU);
@@ -1079,6 +1107,39 @@ mod tests {
             path.acknowledge_capacity(BOND_MTU);
         }
         assert!(path.congestion_window > 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn low_latency_link_grows_past_bdp_and_bare_tcp_acks_are_not_duplicated() {
+        // Deployed relay telemetry 2026-09-09: LAN min RTT 3 ms was seeing
+        // ~15 ms loaded, and the old 10 ms slack pinned cwnd to ~5 MTUs so a
+        // single flow through the tunnel capped at ~9 Mbps. Under load the
+        // window must reach several BDPs, not sit at the initial size.
+        let mut path = Path::new(0, "en0".into(), false);
+        path.rtt_ms = Some(3.0);
+        path.minimum_rtt_ms = 3.0;
+        for _ in 0..200 {
+            path.observe(2, 0); // stays within delay slack, growth continues
+            path.acknowledge_capacity(BOND_MTU);
+        }
+        assert!(
+            path.congestion_window >= 200 * BOND_MTU,
+            "cwnd only reached {} MTUs",
+            path.congestion_window / BOND_MTU
+        );
+
+        // Empty TCP segment (bare ACK) must not be treated as interactive.
+        let mut ack = vec![0_u8; 40];
+        ack[0] = 0x45; // IPv4, IHL 5
+        ack[9] = 6; // TCP
+        ack[32] = 0x50; // TCP data offset 5 (20-byte TCP header)
+        assert!(bare_tcp_ack(&ack));
+        assert!(!interactive(&ack));
+        // A short RTP packet still counts as interactive.
+        let mut rtp = vec![0_u8; 200];
+        rtp[0] = 0x45;
+        rtp[9] = 17; // UDP
+        assert!(interactive(&rtp));
     }
     #[test]
     fn removed_low_latency_link_repairs_over_slower_link_immediately() {

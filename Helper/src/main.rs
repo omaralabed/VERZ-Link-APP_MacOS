@@ -244,6 +244,8 @@ fn main() -> Result<()> {
                 );
             } else if let Some(state) = line.strip_prefix("BRAIN_STATE ") {
                 event(&out_events, json!({"event":"brain", "line":state}));
+            } else if let Some(record) = line.strip_prefix("FLOW_RECORD ") {
+                event(&out_events, json!({"event":"flow", "line":record}));
             } else {
                 event(&out_events, json!({"event":"log", "line":line}));
             }

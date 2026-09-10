@@ -25,6 +25,10 @@ const PROLOGUE: &[u8] = b"VERZ Link brain v1 / path metadata only";
 const MAX_FRAME: usize = 65_535;
 const CUTOFF_MS: f64 = 75.0;
 const RECOVERY_MS: f64 = 65.0;
+/// Bumped whenever the controller's learning rules change. A client only
+/// follows a server that speaks the same version; otherwise it uses its own
+/// controller, so a stale deployment cannot steer newer clients.
+pub const STRATEGY: &str = "champion-challenger-v7";
 
 #[derive(Args, Debug)]
 pub struct BrainServerArgs {
@@ -52,7 +56,7 @@ pub struct PathReport {
     pub sent_bytes: u64,
     #[serde(default, rename = "rx", alias = "received_bytes")]
     pub received_bytes: u64,
-    #[serde(default, skip_serializing, rename = "flows", alias = "active_flows")]
+    #[serde(default, rename = "f", alias = "flows", alias = "active_flows")]
     pub active_flows: u64,
     #[serde(default, rename = "j", alias = "jitter_ms")]
     pub jitter_ms: f64,
@@ -109,6 +113,21 @@ pub struct BrainAdvice {
     pub upload_weights: BTreeMap<String, u32>,
     #[serde(default)]
     pub realtime_weights: BTreeMap<String, u32>,
+    /// Direction-specific proven paths. The Mac treats these as advisory;
+    /// immediate health, congestion and cost policy remain authoritative.
+    #[serde(default)]
+    pub balanced_champion: Option<String>,
+    #[serde(default)]
+    pub download_champion: Option<String>,
+    #[serde(default)]
+    pub upload_champion: Option<String>,
+    /// True when adding challengers failed to preserve 95% of the champion's
+    /// recent delivered-rate envelope. New work contracts to the champion;
+    /// existing TCP connections are never reset or migrated.
+    #[serde(default)]
+    pub download_guarded: bool,
+    #[serde(default)]
+    pub upload_guarded: bool,
     #[serde(default)]
     pub learned_paths: usize,
     #[serde(default)]
@@ -125,6 +144,17 @@ struct Observation {
     received: u64,
     upload_bps: f64,
     download_bps: f64,
+    current_upload_bps: f64,
+    current_download_bps: f64,
+    upload_samples: u32,
+    download_samples: u32,
+    upload_learned: u64,
+    download_learned: u64,
+    /// Highest observed goodput on this path, decayed slowly regardless of
+    /// current workload. Prevents the champion from oscillating away from a
+    /// proven fast link merely because current traffic is small.
+    upload_peak_bps: f64,
+    download_peak_bps: f64,
     incarnation: u64,
 }
 
@@ -135,6 +165,149 @@ struct Observation {
 #[derive(Default)]
 pub struct Controller {
     observations: BTreeMap<String, Observation>,
+    download_champion: Option<String>,
+    upload_champion: Option<String>,
+    balanced_champion: Option<String>,
+}
+
+const LEARNING_BYTES: u64 = 64 * 1024;
+/// Delivered bytes that prove a path on their own. A fast link finishes a
+/// trial transfer in one or two intervals; requiring three separate seconds
+/// left a 300 Mbps path unproven forever behind an 85 Mbps champion.
+const PROVEN_BYTES: u64 = 8 * 1024 * 1024;
+const IDLE_DECAY_MS: f64 = 600_000.0;
+const CHAMPION_SWITCH_MARGIN: f64 = 1.15;
+const PERFORMANCE_FLOOR: f64 = 0.95;
+const MIN_CAPACITY_SAMPLES: u32 = 3;
+const CHALLENGER_WEIGHT: u32 = 1;
+
+/// Evidence count used for proof: interval samples, or the full requirement
+/// once enough bytes have been delivered in total.
+fn evidence(samples: u32, learned_bytes: u64) -> u32 {
+    if learned_bytes >= PROVEN_BYTES {
+        samples.max(MIN_CAPACITY_SAMPLES)
+    } else {
+        samples
+    }
+}
+
+fn learned_rate(observation: &Observation, upload: bool) -> f64 {
+    let samples = if upload {
+        observation.upload_samples
+    } else {
+        observation.download_samples
+    };
+    if samples == 0 {
+        0.0
+    } else if upload {
+        observation.upload_bps
+    } else {
+        observation.download_bps
+    }
+}
+
+/// Rate used when choosing a champion: the higher of the current envelope and
+/// the slowly-decayed peak. Allocation weights keep tracking the envelope so
+/// pacing follows what the path is actually delivering right now.
+fn champion_rate(observation: &Observation, upload: bool) -> f64 {
+    let peak = if upload {
+        observation.upload_peak_bps
+    } else {
+        observation.download_peak_bps
+    };
+    learned_rate(observation, upload).max(peak)
+}
+
+fn download_evidence(o: &Observation) -> u32 {
+    evidence(o.download_samples, o.download_learned)
+}
+
+fn upload_evidence(o: &Observation) -> u32 {
+    evidence(o.upload_samples, o.upload_learned)
+}
+
+/// Two-way placement rate. Both directions known: the weaker one. Only one
+/// known: that one, because a download-only workload otherwise never produces
+/// upload evidence and the balanced champion would stay at its cold-start
+/// tie-break forever. Local upload holds still protect against a poor uplink.
+fn balanced_rate(o: &Observation) -> f64 {
+    match (learned_rate(o, true), learned_rate(o, false)) {
+        (up, down) if up > 0.0 && down > 0.0 => up.min(down),
+        (up, down) => up.max(down),
+    }
+}
+
+fn balanced_evidence(o: &Observation) -> u32 {
+    upload_evidence(o).max(download_evidence(o))
+}
+
+fn choose_champion(
+    previous: &Option<String>,
+    paths: &[&PathReport],
+    observations: &BTreeMap<String, Observation>,
+    score: impl Fn(&Observation) -> f64,
+    samples: impl Fn(&Observation) -> u32,
+) -> Option<String> {
+    // Capacity is unknowable before delivery evidence exists. During cold
+    // start, bulk traffic follows the path with the lowest measured end-to-end
+    // request delay (the Mac's probe times a real response, not a handshake a
+    // local middlebox can complete). Adapter order is only the last resort; the
+    // UI lists Wi-Fi first, which is not evidence of anything.
+    let fallback = || {
+        paths
+            .iter()
+            .filter(|p| p.rtt_ms.is_some_and(|v| v.is_finite() && v > 0.0))
+            .min_by(|a, b| realtime_cost(a).total_cmp(&realtime_cost(b)))
+            .or(paths.first())
+            .map(|p| p.name.clone())
+    };
+    let best = paths
+        .iter()
+        .filter_map(|p| {
+            let observation = &observations[&p.name];
+            let value = score(observation);
+            (samples(observation) >= MIN_CAPACITY_SAMPLES && value >= 64_000.0)
+                .then_some((p.name.as_str(), value))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    let Some((best_name, best_score)) = best else {
+        return fallback();
+    };
+    if let Some(current) = previous
+        && paths.iter().any(|p| p.name == *current)
+    {
+        let observation = &observations[current];
+        let current_score = score(observation);
+        if samples(observation) >= MIN_CAPACITY_SAMPLES
+            && current_score >= 64_000.0
+            && best_score < current_score * CHAMPION_SWITCH_MARGIN
+        {
+            return Some(current.clone());
+        }
+    }
+    Some(best_name.to_owned())
+}
+
+fn allocation_weight(
+    eligible: bool,
+    champion: bool,
+    rate: f64,
+    champion_rate: f64,
+    samples: u32,
+    reliability: f64,
+) -> u32 {
+    if !eligible {
+        return 0;
+    }
+    if champion {
+        return 64;
+    }
+    if samples < MIN_CAPACITY_SAMPLES || rate < 64_000.0 || champion_rate < 64_000.0 {
+        return CHALLENGER_WEIGHT;
+    }
+    (64.0 * (rate / champion_rate).clamp(1.0 / 64.0, 1.0) * reliability)
+        .round()
+        .clamp(1.0, 64.0) as u32
 }
 
 impl Controller {
@@ -150,25 +323,71 @@ impl Controller {
                 && p.received_bytes >= prior.received
                 && (100..=10_000).contains(&elapsed);
             if same {
-                // Decay old evidence over 30 seconds. Sparse/idle traffic is
-                // not evidence of poor capacity, so it cannot create a cap.
-                let decay = (-(elapsed as f64) / 30_000.0).exp();
                 let rate = |bytes: u64| bytes as f64 * 8_000.0 / elapsed as f64;
-                prior.upload_bps = if p.tcp.is_some() && prior.tcp_observed {
-                    let observed = rate(acknowledged - prior.acknowledged);
-                    if p.tcp.as_ref().is_some_and(|t| t.held) {
-                        observed // old peak must not immediately refill a congested path
+                let uploaded = acknowledged - prior.acknowledged;
+                let downloaded = p.received_bytes - prior.received;
+                // Under load the envelope tracks what the path delivers now
+                // (30 s). Idle is not evidence of less capacity: the 2026-09-09
+                // log shows a fast LAN losing the champion to a hotspot merely
+                // because a speed test paused for 40 s. Idle decays slowly.
+                let decay = |learning: u64| {
+                    let horizon = if learning >= LEARNING_BYTES {
+                        30_000.0
                     } else {
-                        (prior.upload_bps * decay).max(observed)
+                        IDLE_DECAY_MS
+                    };
+                    (-(elapsed as f64) / horizon).exp()
+                };
+                let upload_decay = decay(uploaded);
+                let download_decay = decay(downloaded);
+                // Peak decays only on the idle horizon (~10 minutes), so the
+                // measured ceiling of a proven fast link survives long stretches
+                // of small traffic that would otherwise drag its envelope down.
+                let peak_decay = (-(elapsed as f64) / IDLE_DECAY_MS).exp();
+                let current_upload = if p.tcp.is_some() && prior.tcp_observed {
+                    rate(uploaded)
+                } else {
+                    0.0
+                };
+                let current_download = rate(downloaded);
+                prior.current_upload_bps = current_upload;
+                prior.current_download_bps = current_download;
+                if uploaded >= LEARNING_BYTES {
+                    prior.upload_samples = prior.upload_samples.saturating_add(1);
+                    prior.upload_learned = prior.upload_learned.saturating_add(uploaded);
+                }
+                if downloaded >= LEARNING_BYTES {
+                    prior.download_samples = prior.download_samples.saturating_add(1);
+                    prior.download_learned = prior.download_learned.saturating_add(downloaded);
+                }
+                prior.upload_bps = if p.tcp.is_some() && prior.tcp_observed {
+                    if p.tcp.as_ref().is_some_and(|t| t.held) {
+                        current_upload // old peak must not immediately refill a congested path
+                    } else {
+                        (prior.upload_bps * upload_decay).max(current_upload)
                     }
                 } else {
                     0.0
                 };
-                prior.download_bps =
-                    (prior.download_bps * decay).max(rate(p.received_bytes - prior.received));
+                prior.download_bps = (prior.download_bps * download_decay).max(current_download);
+                prior.upload_peak_bps = if p.tcp.as_ref().is_some_and(|t| t.held) {
+                    current_upload
+                } else {
+                    (prior.upload_peak_bps * peak_decay).max(prior.upload_bps)
+                };
+                prior.download_peak_bps =
+                    (prior.download_peak_bps * peak_decay).max(prior.download_bps);
             } else {
                 prior.upload_bps = 0.0;
                 prior.download_bps = 0.0;
+                prior.current_upload_bps = 0.0;
+                prior.current_download_bps = 0.0;
+                prior.upload_samples = 0;
+                prior.download_samples = 0;
+                prior.upload_learned = 0;
+                prior.download_learned = 0;
+                prior.upload_peak_bps = 0.0;
+                prior.download_peak_bps = 0.0;
             }
             prior.sample_ms = report.sample_ms;
             prior.acknowledged = acknowledged;
@@ -181,20 +400,67 @@ impl Controller {
         let eligible = |p: &PathReport| {
             p.healthy && !(report.policy == Policy::DataSaver && p.metered && has_unmetered)
         };
-        let reference = |upload: bool| {
-            let mut rates: Vec<f64> = report
-                .paths
-                .iter()
-                .filter(|p| eligible(p))
-                .filter_map(|p| self.observations.get(&p.name))
-                .map(|o| if upload { o.upload_bps } else { o.download_bps })
-                .filter(|v| *v >= 64_000.0)
-                .collect();
-            rates.sort_by(f64::total_cmp);
-            rates.get(rates.len() / 2).copied().unwrap_or(1_000_000.0)
+        let eligible_paths: Vec<_> = report.paths.iter().filter(|p| eligible(p)).collect();
+        let download_champion = choose_champion(
+            &self.download_champion,
+            &eligible_paths,
+            &self.observations,
+            |o| champion_rate(o, false),
+            download_evidence,
+        );
+        let upload_champion = choose_champion(
+            &self.upload_champion,
+            &eligible_paths,
+            &self.observations,
+            |o| champion_rate(o, true),
+            upload_evidence,
+        );
+        let balanced_champion = choose_champion(
+            &self.balanced_champion,
+            &eligible_paths,
+            &self.observations,
+            |o| match (champion_rate(o, true), champion_rate(o, false)) {
+                (up, down) if up > 0.0 && down > 0.0 => up.min(down),
+                (up, down) => up.max(down),
+            },
+            balanced_evidence,
+        );
+        self.download_champion = download_champion.clone();
+        self.upload_champion = upload_champion.clone();
+        self.balanced_champion = balanced_champion.clone();
+
+        let champion_rate = |name: &Option<String>, upload: bool| {
+            name.as_ref()
+                .and_then(|name| self.observations.get(name))
+                .map(|o| learned_rate(o, upload))
+                .unwrap_or(0.0)
         };
-        let up_reference = reference(true);
-        let down_reference = reference(false);
+        let download_champion_rate = champion_rate(&download_champion, false);
+        let upload_champion_rate = champion_rate(&upload_champion, true);
+        let active_download_paths = eligible_paths
+            .iter()
+            .filter(|p| self.observations[&p.name].current_download_bps >= 64_000.0)
+            .count();
+        let active_upload_paths = eligible_paths
+            .iter()
+            .filter(|p| self.observations[&p.name].current_upload_bps >= 64_000.0)
+            .count();
+        let current_download: f64 = eligible_paths
+            .iter()
+            .map(|p| self.observations[&p.name].current_download_bps)
+            .sum();
+        let current_upload: f64 = eligible_paths
+            .iter()
+            .map(|p| self.observations[&p.name].current_upload_bps)
+            .sum();
+        let download_guarded = active_download_paths > 1
+            && download_champion_rate >= 1_000_000.0
+            && current_download >= 1_000_000.0
+            && current_download < download_champion_rate * PERFORMANCE_FLOOR;
+        let upload_guarded = active_upload_paths > 1
+            && upload_champion_rate >= 1_000_000.0
+            && current_upload >= 1_000_000.0
+            && current_upload < upload_champion_rate * PERFORMANCE_FLOOR;
         let has_fast = report
             .paths
             .iter()
@@ -207,7 +473,7 @@ impl Controller {
             .map(|p| p.name.as_str());
         let mut advice = BrainAdvice {
             generation,
-            strategy: "delivery-aware-v3".into(),
+            strategy: STRATEGY.into(),
             cutoff_ms: CUTOFF_MS,
             recovery_ms: RECOVERY_MS,
             relay_fallback: true,
@@ -215,33 +481,67 @@ impl Controller {
             download_weights: BTreeMap::new(),
             upload_weights: BTreeMap::new(),
             realtime_weights: BTreeMap::new(),
+            balanced_champion: balanced_champion.clone(),
+            download_champion: download_champion.clone(),
+            upload_champion: upload_champion.clone(),
+            download_guarded,
+            upload_guarded,
             learned_paths: 0,
             valid_for_ms: 5_000,
         };
         for p in &report.paths {
             let o = &self.observations[&p.name];
-            if o.upload_bps >= 64_000.0 || o.download_bps >= 64_000.0 {
+            if o.upload_samples > 0 || o.download_samples > 0 {
                 advice.learned_paths += 1;
             }
             let reliability = 1.0 - finite(p.probe_failure_ratio, 0.0).clamp(0.0, 1.0) * 0.8;
-            let weight = |rate: f64, reference: f64| {
-                if !eligible(p) {
-                    return 0;
-                }
-                let relative = if rate > 0.0 { rate / reference } else { 1.0 };
-                (16.0 * relative.clamp(0.0625, 4.0) * reliability)
-                    .round()
-                    .clamp(1.0, 64.0) as u32
-            };
             let up = if p.tcp.as_ref().is_some_and(|t| t.held) {
                 0
+            } else if upload_guarded && upload_champion.as_deref() != Some(p.name.as_str()) {
+                1
             } else {
-                weight(o.upload_bps, up_reference)
+                allocation_weight(
+                    eligible(p),
+                    upload_champion.as_deref() == Some(p.name.as_str()),
+                    learned_rate(o, true),
+                    upload_champion_rate,
+                    upload_evidence(o),
+                    reliability,
+                )
             };
-            let down = weight(o.download_bps, down_reference);
+            let down = if download_guarded && download_champion.as_deref() != Some(p.name.as_str())
+            {
+                1
+            } else {
+                allocation_weight(
+                    eligible(p),
+                    download_champion.as_deref() == Some(p.name.as_str()),
+                    learned_rate(o, false),
+                    download_champion_rate,
+                    download_evidence(o),
+                    reliability,
+                )
+            };
             advice.upload_weights.insert(p.name.clone(), up);
             advice.download_weights.insert(p.name.clone(), down);
-            advice.weights.insert(p.name.clone(), up.min(down));
+            let balanced_champion_rate = balanced_champion
+                .as_ref()
+                .and_then(|name| self.observations.get(name))
+                .map(balanced_rate)
+                .unwrap_or(0.0);
+            let balanced = if p.tcp.as_ref().is_some_and(|t| t.held) {
+                0
+            } else {
+                allocation_weight(
+                    eligible(p),
+                    balanced_champion.as_deref() == Some(p.name.as_str()),
+                    balanced_rate(o),
+                    balanced_champion_rate,
+                    balanced_evidence(o),
+                    reliability,
+                )
+            };
+            advice.weights.insert(p.name.clone(), balanced);
             let realtime = eligible(p)
                 && if has_fast {
                     p.rtt_ms.is_some_and(|v| v > 0.0 && v < CUTOFF_MS)
@@ -445,7 +745,9 @@ mod tests {
     #[test]
     fn high_latency_is_bulk_capacity_but_not_realtime_preferred() {
         let advice = advise(&report(Policy::Performance), 9);
-        assert_eq!(advice.weights["en0"], advice.weights["en7"]);
+        assert_eq!(advice.balanced_champion.as_deref(), Some("en0"));
+        assert_eq!(advice.weights["en0"], 64);
+        assert_eq!(advice.weights["en7"], CHALLENGER_WEIGHT);
         assert!(advice.weights["en8"] > 0);
         assert_eq!(advice.realtime_weights["en8"], 0);
         assert_eq!(advice.generation, 9);
@@ -457,6 +759,24 @@ mod tests {
         let mut report = report(Policy::DataSaver);
         report.paths[2].rtt_ms = Some(10.0);
         assert_eq!(advise(&report, 1).weights["en8"], 0);
+    }
+
+    #[test]
+    fn cold_start_champion_follows_measured_delay_not_adapter_order() {
+        let mut report = report(Policy::Smart);
+        // Wi-Fi is listed first by the UI but has a 620 ms end-to-end delay.
+        report.paths[0].rtt_ms = Some(620.0);
+        report.paths[1].rtt_ms = Some(66.0);
+        let advice = advise(&report, 1);
+        assert_eq!(advice.balanced_champion.as_deref(), Some("en7"));
+        assert_eq!(advice.download_champion.as_deref(), Some("en7"));
+        assert_eq!(advice.weights["en7"], 64);
+        assert_eq!(advice.weights["en0"], CHALLENGER_WEIGHT);
+        // Without any delay measurement the order remains the only tie-break.
+        for p in &mut report.paths {
+            p.rtt_ms = None;
+        }
+        assert_eq!(advise(&report, 2).balanced_champion.as_deref(), Some("en0"));
     }
 
     #[test]
@@ -480,46 +800,229 @@ mod tests {
         }
         let mut controller = Controller::default();
         controller.advise(&report, 1);
-        report.sample_ms = 1_000;
-        report.paths[0].received_bytes = 30_000_000;
-        report.paths[0].sent_bytes = 1_000_000;
-        report.paths[1].received_bytes = 1_000_000;
-        report.paths[1].sent_bytes = 30_000_000;
-        report.paths[0].tcp.as_mut().unwrap().acknowledged = 1_000_000;
-        report.paths[1].tcp.as_mut().unwrap().acknowledged = 30_000_000;
-        let advice = controller.advise(&report, 2);
+        let mut advice = controller.advise(&report, 1);
+        for sample in 1..=MIN_CAPACITY_SAMPLES {
+            report.sample_ms = u64::from(sample) * 1_000;
+            report.paths[0].received_bytes += 30_000_000;
+            report.paths[1].received_bytes += 1_000_000;
+            report.paths[0].tcp.as_mut().unwrap().acknowledged += 1_000_000;
+            report.paths[1].tcp.as_mut().unwrap().acknowledged += 30_000_000;
+            advice = controller.advise(&report, u64::from(sample) + 1);
+            // 30 MB delivered in one interval is proof on its own; the small
+            // 1 MB/s uploader still needs three intervals.
+            assert_eq!(advice.upload_champion.as_deref(), Some("en7"));
+            if sample < MIN_CAPACITY_SAMPLES {
+                assert_eq!(advice.upload_weights["en0"], CHALLENGER_WEIGHT);
+            }
+        }
         assert!(advice.download_weights["en0"] > advice.download_weights["en7"]);
         assert!(advice.upload_weights["en7"] > advice.upload_weights["en0"]);
+        assert_eq!(advice.download_champion.as_deref(), Some("en0"));
+        assert_eq!(advice.upload_champion.as_deref(), Some("en7"));
         assert!(advice.weights["en8"] > 0);
         assert_eq!(advice.learned_paths, 2);
         report.paths[0].incarnation += 1;
         report.sample_ms += 1_000;
-        assert_eq!(controller.advise(&report, 3).learned_paths, 1);
+        assert_eq!(controller.advise(&report, 5).learned_paths, 1);
+    }
+
+    #[test]
+    fn one_full_trial_transfer_proves_a_fast_challenger_for_download_only_work() {
+        // Measured 2026-09-09: hotspot listed first (~85 Mbps), LAN ~306 Mbps.
+        // Eight parallel downloads put seven on the hotspot because a 50 MB
+        // trial finishing in 1.4 s could never accumulate three samples.
+        let mut report = report(Policy::Smart);
+        report.paths.truncate(2);
+        for p in &mut report.paths {
+            p.rtt_ms = None;
+            p.tcp = Some(TcpReport::default());
+        }
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        for second in 1..=3 {
+            report.sample_ms = second * 1_000;
+            report.paths[0].received_bytes += 10_600_000;
+            controller.advise(&report, second);
+        }
+        let advice = controller.advise(&report, 4);
+        assert_eq!(advice.download_champion.as_deref(), Some("en0"));
+        assert_eq!(advice.balanced_champion.as_deref(), Some("en0"));
+        report.sample_ms += 1_000;
+        report.paths[0].received_bytes += 10_600_000;
+        report.paths[1].received_bytes += 40_000_000;
+        let advice = controller.advise(&report, 5);
+        assert_eq!(advice.download_champion.as_deref(), Some("en7"));
+        assert_eq!(advice.download_weights["en7"], 64);
+        assert!((15..=20).contains(&advice.download_weights["en0"]));
+        // Download-only evidence also moves two-way placement.
+        assert_eq!(advice.balanced_champion.as_deref(), Some("en7"));
+        assert_eq!(advice.weights["en7"], 64);
+        assert!(advice.weights["en0"] < 64);
+    }
+
+    #[test]
+    fn champion_challenger_matches_asymmetric_capacity_and_guards_the_floor() {
+        let mut report = report(Policy::Smart);
+        report.paths.truncate(2);
+        for path in &mut report.paths {
+            path.active_flows = 4;
+            path.tcp = Some(TcpReport {
+                busy: 4,
+                ..TcpReport::default()
+            });
+        }
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        let mut advice = None;
+        for second in 1..=3 {
+            report.sample_ms = second * 1_000;
+            // Reproduce the measured shape: Wi-Fi ~= 213/67 Mbps and the
+            // challenger LAN ~= 29/39 Mbps. Both paths add upload capacity,
+            // but LAN earns only a small download allocation.
+            report.paths[0].received_bytes += 26_618_750;
+            report.paths[0].tcp.as_mut().unwrap().acknowledged += 8_353_750;
+            report.paths[1].received_bytes += 3_608_750;
+            report.paths[1].tcp.as_mut().unwrap().acknowledged += 4_922_500;
+            advice = Some(controller.advise(&report, second));
+        }
+        let advice = advice.unwrap();
+        assert_eq!(advice.download_champion.as_deref(), Some("en0"));
+        assert_eq!(advice.upload_champion.as_deref(), Some("en0"));
+        assert_eq!(advice.download_weights["en0"], 64);
+        assert!((8..=10).contains(&advice.download_weights["en7"]));
+        assert!((37..=39).contains(&advice.upload_weights["en7"]));
+        assert!(!advice.download_guarded);
+
+        // If using both paths now delivers less than 95% of the champion's
+        // recent envelope, new download work contracts to the champion. This
+        // does not reset already-established TCP connections.
+        report.sample_ms += 1_000;
+        report.paths[0].received_bytes += 10_000_000;
+        report.paths[1].received_bytes += 5_000_000;
+        let guarded = controller.advise(&report, 4);
+        assert!(guarded.download_guarded);
+        assert_eq!(guarded.download_weights["en0"], 64);
+        assert_eq!(guarded.download_weights["en7"], 1);
+    }
+
+    #[test]
+    fn a_pause_does_not_hand_the_champion_to_the_path_that_moved_bytes_last() {
+        // From the 2026-09-09 flow log: LAN (en7) proven at ~300 Mbps, then a
+        // 40 s pause, then one 14 MB upload on the hotspot (en0) made en0 the
+        // balanced champion and the next three uploads followed it there.
+        let mut report = report(Policy::Smart);
+        report.paths.truncate(2);
+        for p in &mut report.paths {
+            p.rtt_ms = None;
+            p.tcp = Some(TcpReport::default());
+        }
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        for second in 1..=3 {
+            report.sample_ms = second * 1_000;
+            report.paths[1].received_bytes += 37_000_000;
+            report.paths[1].tcp.as_mut().unwrap().acknowledged += 25_000_000;
+            report.paths[0].received_bytes += 10_000_000;
+            report.paths[0].tcp.as_mut().unwrap().acknowledged += 4_000_000;
+            controller.advise(&report, second);
+        }
+        report.sample_ms = 4_000;
+        assert_eq!(
+            controller.advise(&report, 4).balanced_champion.as_deref(),
+            Some("en7")
+        );
+        for second in 5..=45 {
+            report.sample_ms = second * 1_000;
+            controller.advise(&report, second);
+        }
+        report.sample_ms = 46_000;
+        report.paths[0].tcp.as_mut().unwrap().acknowledged += 14_000_000;
+        let advice = controller.advise(&report, 46);
+        assert_eq!(advice.balanced_champion.as_deref(), Some("en7"));
+        assert_eq!(advice.upload_champion.as_deref(), Some("en7"));
+        assert!(advice.weights["en7"] > advice.weights["en0"]);
+    }
+
+    #[test]
+    fn champion_survives_small_bursts_and_light_traffic() {
+        // Log evidence 2026-09-09: LAN (en7) proven at ~300 Mbps download,
+        // then Cloudflare's upload phase moved to hotspot (en0) briefly. Old
+        // brain flipped champion to en0 within 14 s because en0's 9 Mbps last
+        // sample beat en7's 5 Mbps last sample. Peak tracking must prevent it.
+        let mut report = report(Policy::Smart);
+        report.paths.truncate(2);
+        for p in &mut report.paths {
+            p.tcp = Some(TcpReport::default());
+        }
+        let mut controller = Controller::default();
+        controller.advise(&report, 0);
+        // 5 s of full-speed download on en7 proves its capacity.
+        for second in 1..=5 {
+            report.sample_ms = second * 1_000;
+            report.paths[1].received_bytes += 37_000_000;
+            report.paths[1].tcp.as_mut().unwrap().acknowledged += 5_000_000;
+            controller.advise(&report, second);
+        }
+        report.sample_ms = 6_000;
+        assert_eq!(
+            controller.advise(&report, 6).download_champion.as_deref(),
+            Some("en7")
+        );
+        // Two minutes of small mixed traffic: en0 gets a light 9 Mbps upload
+        // phase, en7 idles or trickles. Champion must not flip.
+        for second in 7..=125 {
+            report.sample_ms = second * 1_000;
+            report.paths[0].tcp.as_mut().unwrap().acknowledged += 1_100_000;
+            report.paths[0].received_bytes += 100_000;
+            report.paths[1].received_bytes += 100_000;
+            let advice = controller.advise(&report, second);
+            assert_eq!(
+                advice.download_champion.as_deref(),
+                Some("en7"),
+                "flipped at t={second}s"
+            );
+            assert_eq!(advice.balanced_champion.as_deref(), Some("en7"));
+        }
     }
 
     #[test]
     fn evidence_adapts_after_capacity_changes_and_counters_reset() {
+        // Peak tracking makes the champion sticky against workload variation.
+        // A real capacity change still moves it, but requires either a long
+        // idle-decay window or a fresh incarnation. Both are covered here.
         let mut report = report(Policy::Smart);
         let mut controller = Controller::default();
         controller.advise(&report, 0);
-        for second in 1..=180 {
+        for second in 1..=5 {
             report.sample_ms = second * 1_000;
-            report.paths[0].received_bytes += if second <= 5 { 30_000_000 } else { 100_000 };
+            report.paths[0].received_bytes += 30_000_000;
             report.paths[1].received_bytes += 10_000_000;
             controller.advise(&report, second);
         }
-        let advice = controller.advise(
-            &ClientReport {
-                sample_ms: 181_000,
-                ..report.clone()
-            },
-            181,
+        report.sample_ms = 6_000;
+        assert_eq!(
+            controller.advise(&report, 6).download_champion.as_deref(),
+            Some("en0")
         );
-        assert!(advice.download_weights["en7"] > advice.download_weights["en0"]);
+        // A fresh incarnation on en0 (e.g., adapter re-address, DHCP renewal)
+        // clears its history entirely; en7 becomes champion on new evidence.
+        report.paths[0].incarnation += 1;
         report.paths[0].received_bytes = 0;
-        report.sample_ms = 182_000;
-        controller.advise(&report, 182);
+        report.paths[0].tcp = None;
+        report.sample_ms = 7_000;
+        controller.advise(&report, 7);
         assert_eq!(controller.observations["en0"].download_bps, 0.0);
+        assert_eq!(controller.observations["en0"].download_peak_bps, 0.0);
+        for second in 8..=15 {
+            report.sample_ms = second * 1_000;
+            report.paths[1].received_bytes += 10_000_000;
+            controller.advise(&report, second);
+        }
+        report.sample_ms = 16_000;
+        assert_eq!(
+            controller.advise(&report, 16).download_champion.as_deref(),
+            Some("en7")
+        );
     }
 
     #[test]
@@ -574,7 +1077,7 @@ mod tests {
         let mut client = BrainClient::connect(address, &secret).await?;
         let advice = client.exchange(&report(Policy::Smart)).await?;
         assert_eq!(advice.generation, 1);
-        assert_eq!(advice.strategy, "delivery-aware-v3");
+        assert_eq!(advice.strategy, STRATEGY);
         drop(client);
         assert!(server.await?.is_err());
         Ok(())
@@ -601,17 +1104,20 @@ mod tests {
         }
         let mut controller = Controller::default();
         controller.advise(&report, 0);
-        report.sample_ms = 1_000;
-        report.paths[0].sent_bytes = 30_000_000;
-        report.paths[0].received_bytes = 50_000_000;
-        report.paths[0].tcp.as_mut().unwrap().acknowledged = 100_000;
-        report.paths[1].tcp.as_mut().unwrap().acknowledged = 30_000_000;
-        let advice = controller.advise(&report, 1);
+        let mut advice = controller.advise(&report, 0);
+        for sample in 1..=MIN_CAPACITY_SAMPLES {
+            report.sample_ms = u64::from(sample) * 1_000;
+            report.paths[0].sent_bytes += 30_000_000;
+            report.paths[0].received_bytes += 50_000_000;
+            report.paths[0].tcp.as_mut().unwrap().acknowledged += 100_000;
+            report.paths[1].tcp.as_mut().unwrap().acknowledged += 30_000_000;
+            advice = controller.advise(&report, u64::from(sample));
+        }
         assert_eq!(controller.observations["en0"].upload_bps, 800_000.0);
-        assert!(advice.weights["en0"] < advice.weights["en7"]);
+        assert!(advice.upload_weights["en0"] < advice.upload_weights["en7"]);
         report.paths[0].tcp.as_mut().unwrap().held = true;
         report.sample_ms += 1_000;
-        let advice = controller.advise(&report, 2);
+        let advice = controller.advise(&report, 4);
         assert_eq!(advice.weights["en0"], 0);
         assert!(advice.download_weights["en0"] > 0);
     }

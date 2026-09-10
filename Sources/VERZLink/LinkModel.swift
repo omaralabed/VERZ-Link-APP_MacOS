@@ -68,6 +68,12 @@ struct BondTelemetry: Decodable {
     let healthyPaths: Int
     let assignedIp: String
     let serverIp: String
+    var trafficShape: String?
+    var balancedChampion: String?
+    var downloadChampion: String?
+    var uploadChampion: String?
+    var downloadGuarded: Bool?
+    var uploadGuarded: Bool?
 }
 
 struct BrainState: Decodable {
@@ -165,6 +171,26 @@ final class LinkModel: ObservableObject {
     func log(_ text: String) {
         activity.append(ActivityEntry(message: text))
         if activity.count > 300 { activity.removeFirst(activity.count - 300) }
+    }
+
+    /// One JSON line per direct/relay flow from the engine: placement inputs and
+    /// delivered outcome, destinations hashed. Local only; this is the dataset
+    /// any future policy or model must be replayed against before it ships.
+    private func recordFlow(_ line: String) {
+        let directory = storage.appendingPathComponent("flows", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let day = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])
+        let url = directory.appendingPathComponent("\(day).jsonl")
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
     }
 
     func connect() {
@@ -309,6 +335,8 @@ final class LinkModel: ObservableObject {
         case "engine_error", "cleanup_error":
             if event.event == "cleanup_error" { restorationFailed = true }
             if let line = event.line { log(line); errorMessage = line }
+        case "flow":
+            if let line = event.line { recordFlow(line) }
         case "launch_error":
             let text = event.line ?? "Unable to start the Rust engine."
             errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text

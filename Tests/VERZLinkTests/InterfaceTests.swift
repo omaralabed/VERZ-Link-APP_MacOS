@@ -21,10 +21,25 @@ final class InterfaceTests: XCTestCase {
     }
 
     func testBrainReportsMeasuredLearningWithoutRequiringItInLegacyMessages() throws {
-        let current = #"{"connected":true,"generation":42,"strategy":"delivery-aware-v3","learnedPaths":2}"#
+        let current = #"{"connected":true,"generation":42,"strategy":"champion-challenger-v7","learnedPaths":2}"#
         XCTAssertEqual(try JSONDecoder().decode(BrainState.self, from: Data(current.utf8)).learnedPaths, 2)
         let legacy = #"{"connected":false,"generation":0,"strategy":"local-fallback"}"#
         XCTAssertNil(try JSONDecoder().decode(BrainState.self, from: Data(legacy.utf8)).learnedPaths)
+    }
+
+    func testChampionChallengerTelemetryIsOptionalAndDecodedForEngineering() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let current = #"{"paths":[],"healthy_paths":2,"assigned_ip":"","server_ip":"","traffic_shape":"download","balanced_champion":"en0","download_champion":"en0","upload_champion":"en7","download_guarded":true,"upload_guarded":false}"#
+        let report = try decoder.decode(BondTelemetry.self, from: Data(current.utf8))
+        XCTAssertEqual(report.trafficShape, "download")
+        XCTAssertEqual(report.downloadChampion, "en0")
+        XCTAssertEqual(report.uploadChampion, "en7")
+        XCTAssertEqual(report.downloadGuarded, true)
+        XCTAssertEqual(report.uploadGuarded, false)
+
+        let legacy = #"{"paths":[],"healthy_paths":1,"assigned_ip":"","server_ip":""}"#
+        XCTAssertNil(try decoder.decode(BondTelemetry.self, from: Data(legacy.utf8)).trafficShape)
     }
 
     func testControlSocketBackpressureReturnsWithoutIndefiniteBlocking() {
