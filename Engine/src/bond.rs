@@ -227,7 +227,10 @@ impl Path {
     pub fn failure_ms(&self) -> u64 {
         // Probes are continuous: detect missing replies, not a high RTT.
         // Protection/repair is separate from declaring the entire path dead.
-        (3.0 * PROBE_MS as f64 + 4.0 * self.jitter_ms).clamp(60.0, 1000.0) as u64
+        // A residential LAN can pause 100-200 ms during ARP refresh or Wi-Fi
+        // roam without being "failed"; require several missed probes plus
+        // jitter headroom before ejecting a path.
+        (8.0 * PROBE_MS as f64 + 4.0 * self.jitter_ms).clamp(250.0, 2000.0) as u64
     }
     fn repair_ms(&self) -> u64 {
         (self.rtt_ms.unwrap_or(30.0) + 4.0 * self.jitter_ms + 20.0).max(70.0) as u64
@@ -369,6 +372,11 @@ pub struct Scheduler {
     last_probe: Option<u64>,
     realtime_advice: BTreeMap<String, u32>,
     advice_until: u64,
+    // Bulk UDP flows (SRT, RTMP-over-UDP, WebRTC video, games) suffer badly
+    // when consecutive packets are sprayed across paths of unequal RTT.
+    // Pin each 5-tuple to one path and only migrate on path failure.
+    flow_paths: BTreeMap<u128, (usize, u64)>,
+    last_flow_prune: u64,
 }
 impl Scheduler {
     pub fn new(names: Vec<(String, bool)>, policy: Policy) -> Result<Self> {
@@ -394,6 +402,8 @@ impl Scheduler {
             last_probe: None,
             realtime_advice: BTreeMap::new(),
             advice_until: 0,
+            flow_paths: BTreeMap::new(),
+            last_flow_prune: 0,
         })
     }
     pub fn set_realtime_advice(&mut self, weights: BTreeMap<String, u32>, until: u64) {
@@ -450,6 +460,7 @@ impl Scheduler {
         self.received.contains(id)
     }
     pub fn fail_path(&mut self, path: usize) {
+        let failing = path;
         let Some(path) = self.paths.get_mut(path) else {
             return;
         };
@@ -460,6 +471,8 @@ impl Scheduler {
         path.good_samples = 0;
         path.last_response = None;
         path.next_send = 0.0;
+        // Drop pinned UDP flows on the failing path so the next packet re-picks.
+        self.flow_paths.retain(|_, (index, _)| *index != failing);
         // Liveness controls eligibility immediately, but a quiet path's probe
         // gap is not evidence that its data capacity has halved. Actual pending
         // data repairs still apply congestion backoff in tick().
@@ -664,6 +677,11 @@ impl Scheduler {
                 self.fail_path(index);
             }
         }
+        if now.saturating_sub(self.last_flow_prune) >= 1000 {
+            self.last_flow_prune = now;
+            self.flow_paths
+                .retain(|_, (_, last_seen)| now.saturating_sub(*last_seen) < 30_000);
+        }
         if self
             .last_probe
             .is_none_or(|last| now.saturating_sub(last) >= PROBE_MS)
@@ -751,9 +769,26 @@ impl Scheduler {
             };
             let is_interactive = interactive(body);
             let targets = self.targets(body.len(), is_interactive || streaming(body), now);
-            let Some(&primary) = targets.first() else {
+            let Some(&first) = targets.first() else {
                 break;
             };
+            // For bulk UDP flows, keep the whole 5-tuple on one path. Spraying
+            // consecutive SRT/RTMP/WebRTC packets across paths of unequal RTT
+            // reorders them and collapses effective throughput to the slowest
+            // path. If the pinned path is dead, fall back to the fresh pick.
+            // Only bulk packets create a pin; smaller companion packets (SRT
+            // ACKs/NAKs, RTP marker, etc.) look up an existing pin so their
+            // 5-tuple stays on the same path and does not get duplicated.
+            let insert_key = bulk_udp_flow_key(body);
+            let lookup_key = insert_key.or_else(|| udp_flow_key(body));
+            let pinned_primary = lookup_key
+                .and_then(|key| self.flow_paths.get(&key).map(|&(pinned, _)| pinned))
+                .filter(|&pinned| {
+                    self.paths
+                        .get(pinned)
+                        .is_some_and(|p| p.enabled && p.state != "failed")
+                });
+            let primary = pinned_primary.unwrap_or(first);
             let body = if self.urgent.is_empty() {
                 if self.streaming.is_empty() {
                     self.queued.pop_front()
@@ -770,6 +805,9 @@ impl Scheduler {
                 break;
             };
             self.next_id = next;
+            if let Some(key) = insert_key {
+                self.flow_paths.insert(key, (primary, now));
+            }
             let mut packet = Pending {
                 body,
                 born: now,
@@ -777,12 +815,21 @@ impl Scheduler {
                 last_repair: now,
             };
             output.push(self.send_copy(&mut packet, id, primary, now));
-            if is_interactive && let Some(&alternate) = targets.get(1) {
-                let recovery = self.paths[primary].failure_ms() as f64
+            // A UDP packet that belongs to a pinned bulk flow (SRT/RTMP/etc.)
+            // travels with the flow: duplicating its control packets across
+            // paths burns bandwidth without helping the media stream.
+            let follows_pin = pinned_primary.is_some();
+            if is_interactive && !follows_pin && let Some(&alternate) = targets.get(1) {
+                // Detection-time budget for interactive protection, held
+                // independent of the (much wider) failure eviction window so
+                // that longer failure_ms values do not silently opt every
+                // small packet into duplication.
+                let recovery = 3.0 * PROBE_MS as f64
                     + self.paths[alternate].rtt_ms.unwrap_or(100.0)
                     + (self.paths[alternate].in_flight + packet.body.len()) as f64
                         / self.paths[alternate].estimated_bytes_per_ms();
                 if self.policy == Policy::Continuity
+                    || (self.policy != Policy::DataSaver && is_realtime_media(&packet.body))
                     || recovery >= 100.0
                     || self.paths[primary].state == "degraded"
                 {
@@ -818,6 +865,75 @@ fn bare_tcp_ack(ip: &[u8]) -> bool {
     }
     let tcph = usize::from(ip[iph + 12] >> 4) * 4;
     tcph >= 20 && ip.len() == iph + tcph
+}
+
+// Small UDP packets carry realtime media (RTP, WebRTC audio/video, game state,
+// Zoom/Teams/Discord). Duplicate them proactively so a link drop mid-call does
+// not lose audio. Bulk QUIC and non-media UDP (DNS, NTP, DHCP, IKE) are excluded.
+fn is_realtime_media(ip: &[u8]) -> bool {
+    if ip.first().is_none_or(|v| v >> 4 != 4) || ip.get(9) != Some(&17) {
+        return false;
+    }
+    let iph = usize::from(ip[0] & 15) * 4;
+    if iph < 20 || ip.len() < iph + 8 || ip.len() >= 500 {
+        return false;
+    }
+    let dst_port = u16::from_be_bytes([ip[iph + 2], ip[iph + 3]]);
+    !matches!(dst_port, 53 | 67 | 68 | 123 | 137 | 138 | 500 | 4500 | 5353)
+}
+
+// Sizable UDP flows (SRT/RTMP-over-UDP, WebRTC video, gaming) reorder badly
+// when consecutive packets take paths of unequal RTT. Return a 5-tuple key so
+// the scheduler can pin each such flow to a single path. Small realtime UDP
+// (VoIP, RTP audio, tiny game state) is intentionally excluded so that the
+// proactive duplication path in tick() still protects it.
+fn bulk_udp_flow_key(ip: &[u8]) -> Option<u128> {
+    if ip.first().is_none_or(|v| v >> 4 != 4) || ip.get(9) != Some(&17) {
+        return None;
+    }
+    let iph = usize::from(ip[0] & 15) * 4;
+    if iph < 20 || ip.len() < iph + 8 || ip.len() < 500 {
+        return None;
+    }
+    let dst_port = u16::from_be_bytes([ip[iph + 2], ip[iph + 3]]);
+    if matches!(dst_port, 53 | 67 | 68 | 123 | 500 | 4500 | 5353) {
+        return None;
+    }
+    let src_ip = u32::from_be_bytes(ip[12..16].try_into().ok()?);
+    let dst_ip = u32::from_be_bytes(ip[16..20].try_into().ok()?);
+    let src_port = u16::from_be_bytes([ip[iph], ip[iph + 1]]);
+    Some(
+        (u128::from(src_ip) << 96)
+            | (u128::from(dst_ip) << 64)
+            | (u128::from(src_port) << 48)
+            | (u128::from(dst_port) << 32),
+    )
+}
+
+// Any UDP 5-tuple, used only to *look up* an existing pin so that ACK/NAK/
+// control packets in an ongoing media flow ride with the bulk stream instead
+// of being duplicated as if they were an independent VoIP call.
+fn udp_flow_key(ip: &[u8]) -> Option<u128> {
+    if ip.first().is_none_or(|v| v >> 4 != 4) || ip.get(9) != Some(&17) {
+        return None;
+    }
+    let iph = usize::from(ip[0] & 15) * 4;
+    if iph < 20 || ip.len() < iph + 8 {
+        return None;
+    }
+    let dst_port = u16::from_be_bytes([ip[iph + 2], ip[iph + 3]]);
+    if matches!(dst_port, 53 | 67 | 68 | 123 | 500 | 4500 | 5353) {
+        return None;
+    }
+    let src_ip = u32::from_be_bytes(ip[12..16].try_into().ok()?);
+    let dst_ip = u32::from_be_bytes(ip[16..20].try_into().ok()?);
+    let src_port = u16::from_be_bytes([ip[iph], ip[iph + 1]]);
+    Some(
+        (u128::from(src_ip) << 96)
+            | (u128::from(dst_ip) << 64)
+            | (u128::from(src_port) << 48)
+            | (u128::from(dst_port) << 32),
+    )
 }
 
 fn streaming(ip: &[u8]) -> bool {
@@ -1141,6 +1257,177 @@ mod tests {
         rtp[9] = 17; // UDP
         assert!(interactive(&rtp));
     }
+
+    #[test]
+    fn realtime_media_classifier_matches_rtp_and_excludes_bulk_and_infra() {
+        let mut rtp = vec![0_u8; 200];
+        rtp[0] = 0x45;
+        rtp[9] = 17;
+        rtp[22..24].copy_from_slice(&8801_u16.to_be_bytes()); // Zoom media port
+        assert!(is_realtime_media(&rtp));
+
+        let mut dns = vec![0_u8; 90];
+        dns[0] = 0x45;
+        dns[9] = 17;
+        dns[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        assert!(!is_realtime_media(&dns));
+
+        let mut big_quic = vec![0_u8; 1200];
+        big_quic[0] = 0x45;
+        big_quic[9] = 17;
+        big_quic[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        assert!(!is_realtime_media(&big_quic));
+
+        let mut tcp = vec![0_u8; 200];
+        tcp[0] = 0x45;
+        tcp[9] = 6;
+        assert!(!is_realtime_media(&tcp));
+    }
+
+    #[test]
+    fn smart_duplicates_small_udp_media_before_any_degradation() {
+        let mut s = scheduler(Policy::Smart);
+        let mut voice = vec![0_u8; 200];
+        voice[0] = 0x45;
+        voice[9] = 17;
+        voice[22..24].copy_from_slice(&8801_u16.to_be_bytes());
+        s.enqueue(voice);
+        let sent: Vec<_> = s
+            .tick(31)
+            .into_iter()
+            .filter(|f| f.kind == Kind::Data)
+            .collect();
+        assert_eq!(
+            sent.len(),
+            2,
+            "voice must ride both links so a link drop is invisible"
+        );
+        assert_ne!(sent[0].path, sent[1].path);
+    }
+
+    #[test]
+    fn smart_does_not_duplicate_bulk_or_dns_under_realtime_rule() {
+        let mut s = scheduler(Policy::Smart);
+        let mut dns = vec![0_u8; 90];
+        dns[0] = 0x45;
+        dns[9] = 17;
+        dns[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        s.enqueue(dns);
+        assert_eq!(
+            s.tick(31).iter().filter(|f| f.kind == Kind::Data).count(),
+            1
+        );
+
+        let mut s = scheduler(Policy::Smart);
+        let mut big = vec![0_u8; 1200];
+        big[0] = 0x45;
+        big[9] = 17;
+        big[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        s.enqueue(big);
+        assert_eq!(
+            s.tick(31).iter().filter(|f| f.kind == Kind::Data).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn data_saver_never_duplicates_even_realtime_media() {
+        let mut s = scheduler(Policy::DataSaver);
+        let mut voice = vec![0_u8; 200];
+        voice[0] = 0x45;
+        voice[9] = 17;
+        voice[22..24].copy_from_slice(&8801_u16.to_be_bytes());
+        s.enqueue(voice);
+        assert_eq!(
+            s.tick(31).iter().filter(|f| f.kind == Kind::Data).count(),
+            1
+        );
+    }
+    fn srt_packet(sport: u16, dport: u16, seed: u8) -> Vec<u8> {
+        let mut p = vec![seed; 1200];
+        p[0] = 0x45;
+        p[9] = 17; // UDP
+        p[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        p[16..20].copy_from_slice(&[69, 164, 208, 201]);
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+    #[test]
+    fn bulk_udp_flow_key_ignores_small_udp_and_infra_ports() {
+        assert!(bulk_udp_flow_key(&srt_packet(50000, 9000, 0)).is_some());
+        let mut small = srt_packet(50000, 9000, 0);
+        small.truncate(300);
+        assert!(bulk_udp_flow_key(&small).is_none());
+        let mut dns = srt_packet(50000, 53, 0);
+        assert!(bulk_udp_flow_key(&dns).is_none());
+        dns[22..24].copy_from_slice(&123_u16.to_be_bytes());
+        assert!(bulk_udp_flow_key(&dns).is_none());
+        let mut tcp = srt_packet(50000, 9000, 0);
+        tcp[9] = 6;
+        assert!(bulk_udp_flow_key(&tcp).is_none());
+    }
+    #[test]
+    fn bulk_udp_flow_pins_every_packet_to_the_first_chosen_path() {
+        let mut s = unequal_latency();
+        for seed in 0..8_u8 {
+            s.enqueue(srt_packet(50000, 9000, seed));
+        }
+        let paths: Vec<u8> = s
+            .tick(120)
+            .into_iter()
+            .filter(|f| f.kind == Kind::Data)
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths.len(), 8);
+        assert!(
+            paths.iter().all(|&p| p == paths[0]),
+            "SRT flow was sprayed across paths: {paths:?}"
+        );
+    }
+    #[test]
+    fn distinct_udp_flows_pin_independently() {
+        let mut s = unequal_latency();
+        s.enqueue(srt_packet(50000, 9000, 1));
+        let first = s
+            .tick(120)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap()
+            .path;
+        // Even if a second flow lands on the same (best) path, it must not be
+        // pinned to the first flow's slot: force the best path to look busier
+        // and check the second flow can still take a different path.
+        s.paths[first as usize].in_flight = s.paths[first as usize].congestion_window - 500;
+        s.enqueue(srt_packet(50001, 9100, 2));
+        let second = s
+            .tick(122)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap()
+            .path;
+        assert_ne!(second, first);
+    }
+    #[test]
+    fn pinned_udp_flow_migrates_when_pinned_path_fails() {
+        let mut s = unequal_latency();
+        s.enqueue(srt_packet(50000, 9000, 1));
+        let first = s
+            .tick(120)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap()
+            .path;
+        s.fail_path(first as usize);
+        s.enqueue(srt_packet(50000, 9000, 2));
+        let second = s
+            .tick(122)
+            .into_iter()
+            .find(|f| f.kind == Kind::Data)
+            .unwrap()
+            .path;
+        assert_ne!(second, first);
+    }
     #[test]
     fn removed_low_latency_link_repairs_over_slower_link_immediately() {
         let mut s = unequal_latency();
@@ -1234,9 +1521,10 @@ mod tests {
     }
     #[test]
     fn alternate_repairs_preserve_identity_and_deduplicate() {
+        // Bulk TCP so duplication is not triggered; the repair path is what is under test.
         let mut tx = scheduler(Policy::Smart);
         let mut rx = scheduler(Policy::Smart);
-        tx.enqueue(packet());
+        tx.enqueue(bulk());
         let first = tx
             .tick(31)
             .into_iter()
@@ -1252,7 +1540,7 @@ mod tests {
         assert_ne!(first.path, repair.path);
         assert!(rx.receive(&repair, 60).0.is_some());
         assert!(rx.receive(&first, 61).0.is_none());
-        assert_eq!(rx.counters.delivered_bytes, 100);
+        assert_eq!(rx.counters.delivered_bytes, 1200);
         assert_eq!(rx.counters.duplicates, 1);
     }
     #[test]
@@ -1282,7 +1570,7 @@ mod tests {
         );
         assert_eq!(scheduler.pending_packets(), 0);
         assert!(scheduler.paths.iter().all(|path| path.in_flight == 0));
-        scheduler.tick(200);
+        scheduler.tick(400);
         assert!(scheduler.paths.iter().all(|path| path.state == "failed"));
     }
     #[test]
