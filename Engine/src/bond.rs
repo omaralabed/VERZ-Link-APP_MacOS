@@ -235,6 +235,16 @@ impl Path {
     fn repair_ms(&self) -> u64 {
         (self.rtt_ms.unwrap_or(30.0) + 4.0 * self.jitter_ms + 20.0).max(70.0) as u64
     }
+    // How far above minimum RTT a sample must sit before we call it queueing.
+    // Cellular RAN scheduling routinely adds 20-40 ms above the minimum with
+    // low measured jitter (samples cluster), so a jitter-only slack is not
+    // enough. Scale with the link's baseline latency as well: LAN keeps a
+    // tight 15 ms floor; hotspot links (min RTT ~15-30 ms) get room to
+    // breathe without any of that being read as congestion.
+    fn queue_slack_ms(&self, floor: f64) -> f64 {
+        let baseline = self.minimum_rtt_ms.min(15.0).max(0.0) * 2.0;
+        floor.max(3.0 * self.jitter_ms).max(baseline)
+    }
     pub fn ready(&self, now: u64) -> bool {
         self.enabled
             && self.good_samples >= 3
@@ -260,8 +270,12 @@ impl Path {
         // packets in flight already pushes rtt past 13 ms, so cwnd was halved
         // on every growth attempt and stuck at ~5 MTUs. A 30 ms threshold
         // still catches queue building on any link, including satellite.
+        // Scale by observed jitter so cellular scheduling swings (routinely
+        // 20-40 ms above min RTT on iPhone hotspots) are not misread as
+        // queue growth and made to shrink cwnd.
         const DELAY_SLACK_MS: f64 = 30.0;
-        if rtt - self.minimum_rtt_ms > DELAY_SLACK_MS
+        let delay_slack = self.queue_slack_ms(DELAY_SLACK_MS);
+        if rtt - self.minimum_rtt_ms > delay_slack
             && self
                 .last_delay_adjust
                 .is_none_or(|last| now.saturating_sub(last) as f64 >= rtt)
@@ -269,7 +283,7 @@ impl Path {
             // Softer backoff (0.75..0.95): cutting cwnd in half whenever a
             // couple of packets queue prevented steady-state throughput near
             // capacity even after growth reached the BDP.
-            let ratio = ((self.minimum_rtt_ms + DELAY_SLACK_MS) / rtt).clamp(0.75, 0.95);
+            let ratio = ((self.minimum_rtt_ms + delay_slack) / rtt).clamp(0.75, 0.95);
             self.congestion_window =
                 ((self.congestion_window as f64 * ratio) as usize).max(4 * BOND_MTU);
             self.slow_start_threshold = self.congestion_window;
@@ -285,7 +299,9 @@ impl Path {
         }
         self.state = if self.good_samples < 3 {
             "recovering"
-        } else if self.rtt_ms.unwrap_or(sample) - self.minimum_rtt_ms > 15.0 {
+        } else if self.rtt_ms.unwrap_or(sample) - self.minimum_rtt_ms
+            > self.queue_slack_ms(15.0)
+        {
             "degraded"
         } else {
             "healthy"
@@ -298,11 +314,12 @@ impl Path {
     }
 
     fn acknowledge_capacity(&mut self, bytes: usize) {
-        // Match the delay-based backoff threshold so growth pauses only when
-        // backoff would also trigger, not on any transient queue.
+        // Pause growth only when backoff would also trigger, not on any
+        // transient queue.
+        let slack = self.queue_slack_ms(30.0);
         if self
             .rtt_ms
-            .is_some_and(|rtt| rtt - self.minimum_rtt_ms > 30.0)
+            .is_some_and(|rtt| rtt - self.minimum_rtt_ms > slack)
         {
             return;
         }
@@ -337,10 +354,13 @@ impl Path {
         // window and the whole flow stalls. Kernel TCP CUBIC survives Wi-Fi
         // by only reducing on a delay signal; mirror that: require RTT to be
         // meaningfully above the minimum before treating this as congestion.
+        // Scale the tolerance with jitter and baseline RTT so cellular's
+        // routine 20-40 ms scheduling swings do not look like a queue.
+        let slack = self.queue_slack_ms(15.0);
         let elevated = self
             .rtt_ms
             .zip(Some(self.minimum_rtt_ms))
-            .is_some_and(|(rtt, min)| min.is_finite() && rtt - min > 15.0);
+            .is_some_and(|(rtt, min)| min.is_finite() && rtt - min > slack);
         if !elevated {
             return;
         }
