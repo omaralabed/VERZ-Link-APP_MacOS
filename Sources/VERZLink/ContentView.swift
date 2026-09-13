@@ -107,17 +107,47 @@ struct ContentView: View {
         }
     }
 
+    @State private var showAdvanced = false
+
     private var connection: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 14) {
-                eyebrow("CONNECTION MODE")
-                Picker("Connection mode", selection: $model.mode) {
-                    ForEach(TransportMode.allCases) { mode in Text(mode.title).tag(mode) }
+                eyebrow("CONNECTION")
+                Picker("Connection", selection: Binding(get: { model.preset }, set: { model.preset = $0 })) {
+                    ForEach(ConnectionPreset.allCases.filter { $0 != .custom || model.preset == .custom }) { preset in
+                        Text(preset.title).tag(preset)
+                    }
                 }.pickerStyle(.segmented).disabled(model.busy)
-                Text(model.mode == .direct ? "No relay and no VERZ payload encryption. TCP connections are assigned directly across the selected adapters."
-                     : model.mode == .hybrid ? "Direct-first flow steering with a warm encrypted relay. Secure-domain rules and failed direct connections escalate automatically."
-                     : "Encrypted relay with a stable public IP and session-preserving path failover.")
-                    .font(.system(size: 11)).foregroundStyle(muted)
+                Text(model.preset.description).font(.system(size: 11)).foregroundStyle(muted)
+                if model.busy { Text("Disconnect to change the connection type.").font(.system(size: 10)).foregroundStyle(muted) }
+                DisclosureGroup(isExpanded: $showAdvanced) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Route · does traffic go through the VERZ server?").font(.system(size: 11, weight: .medium))
+                        Picker("Connection mode", selection: $model.mode) {
+                            ForEach(TransportMode.allCases) { mode in Text(mode.title).tag(mode) }
+                        }.pickerStyle(.segmented).disabled(model.busy)
+                        Text(model.mode == .direct ? "No relay and no VERZ payload encryption. TCP connections are assigned directly across the selected adapters and stay on that adapter for life."
+                             : model.mode == .hybrid ? "Direct-first flow steering with a warm encrypted relay. Secure-domain rules, calls, live streams and failed direct connections use the relay."
+                             : "Everything through the encrypted relay: one stable public IP and session-preserving failover across all links.")
+                            .font(.system(size: 10)).foregroundStyle(muted)
+                        Text("Links · what should several links be used for?").font(.system(size: 11, weight: .medium)).padding(.top, 4)
+                        Picker("Connection preference", selection: $model.policy) {
+                            Text("Bonding").tag("smart")
+                            Text("Continuity").tag("continuity")
+                            Text("Data saver").tag("data-saver")
+                            // Legacy value: identical to Bonding for TCP; only spreads UDP flows.
+                            if model.policy == "performance" { Text("Performance").tag("performance") }
+                        }.pickerStyle(.segmented)
+                        Text(model.policy == "continuity"
+                             ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight."
+                             : model.policy == "data-saver"
+                             ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
+                             : "Bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
+                            .font(.system(size: 10)).foregroundStyle(muted)
+                    }.padding(.top, 8)
+                } label: {
+                    Text("Advanced").font(.system(size: 11)).foregroundStyle(muted)
+                }.onAppear { if model.preset == .custom { showAdvanced = true } }
             }.padding(18).card()
             VStack(alignment: .leading, spacing: 24) {
                 HStack(alignment: .top) {
@@ -272,23 +302,6 @@ struct ContentView: View {
                 Text("Per-link rates are live wire traffic on each adapter, including protection copies and repairs, so links can add up to more than the payload rate shown below.")
                     .font(.system(size: 10)).foregroundStyle(muted)
             }
-            HStack {
-                Text("Connection preference").font(.system(size: 12))
-                Spacer()
-                Picker("Connection preference", selection: $model.policy) {
-                    Text("Bonding").tag("smart")
-                    Text("Continuity").tag("continuity")
-                    Text("Data saver").tag("data-saver")
-                    // Legacy value: identical to Bonding for TCP; only spreads UDP flows.
-                    if model.policy == "performance" { Text("Performance").tag("performance") }
-                }.labelsHidden().frame(width: 160)
-            }
-            Text(model.policy == "continuity"
-                 ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight. Session and public IP never change."
-                 : model.policy == "data-saver"
-                 ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
-                 : "Bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
-                .font(.system(size: 10)).foregroundStyle(muted)
         }.padding(20).card()
     }
 

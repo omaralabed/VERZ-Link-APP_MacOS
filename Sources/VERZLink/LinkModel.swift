@@ -44,6 +44,44 @@ enum TransportMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// One user-facing choice that sets both the transport mode and the link
+/// preference. `custom` only appears when Advanced holds another combination.
+enum ConnectionPreset: String, CaseIterable, Identifiable {
+    case neverDrop, fastest, direct, custom
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .neverDrop: "Never drop"
+        case .fastest: "Fastest"
+        case .direct: "Direct, no server"
+        case .custom: "Custom"
+        }
+    }
+    var settings: (mode: TransportMode, policy: String)? {
+        switch self {
+        case .neverDrop: (.secure, "continuity")
+        case .fastest: (.secure, "smart")
+        case .direct: (.direct, "smart")
+        case .custom: nil
+        }
+    }
+    static func matching(mode: TransportMode, policy: String) -> ConnectionPreset {
+        allCases.first { $0.settings.map { $0.mode == mode && $0.policy == policy } ?? false } ?? .custom
+    }
+    var description: String {
+        switch self {
+        case .neverDrop:
+            "Recommended. All traffic goes through the encrypted VERZ server over every link, and calls, UDP and light TCP are carried on two links at once. Losing a cable, or loss on one ISP, causes no drop: the session and public IP stay the same."
+        case .fastest:
+            "All traffic goes through the encrypted VERZ server with the links bonded for maximum throughput. Calls and live media are still protected; other traffic is re-sent on the surviving link after a failure, which can pause briefly."
+        case .direct:
+            "No server. Each connection is pinned to one adapter and ISP for its whole life, so loss, congestion or an outage on that ISP hits it directly and nothing can carry or repair it over the other link. Only new connections can pick a better adapter."
+        case .custom:
+            "A combination chosen in Advanced."
+        }
+    }
+}
+
 struct PathTelemetry: Decodable, Identifiable {
     let id: Int
     let name: String
@@ -116,8 +154,16 @@ final class LinkModel: ObservableObject {
     @Published var sentMbps = 0.0
     @Published var uptime = 0
     @Published var selectedPage = "Connection"
-    @Published var policy = "smart" { didSet { configurationChanged() } }
-    @Published var mode = TransportMode.direct { didSet { configurationChanged() } }
+    @Published var policy = "continuity" { didSet { configurationChanged() } }
+    @Published var mode = TransportMode.secure { didSet { configurationChanged() } }
+    var preset: ConnectionPreset {
+        get { ConnectionPreset.matching(mode: mode, policy: policy) }
+        set {
+            guard let settings = newValue.settings else { return }
+            if mode != settings.mode { mode = settings.mode }
+            if policy != settings.policy { policy = settings.policy }
+        }
+    }
     @Published var secureDomainsText = "" { didSet { configurationChanged() } }
     @Published var disabledInterfaces = Set<String>()
     @Published var meteredInterfaces = Set<String>()
@@ -180,8 +226,8 @@ final class LinkModel: ObservableObject {
         if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
-        policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "smart"
-        mode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "direct") ?? .direct
+        policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "continuity"
+        mode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "secure") ?? .secure
         secureDomainsText = UserDefaults.standard.string(forKey: "secureDomains") ?? ""
         if let value = UserDefaults.standard.string(forKey: "interface") { selectedInterface = value }
         hasCredential = validSecret((try? Data(contentsOf: keyURL)) ?? Data())
