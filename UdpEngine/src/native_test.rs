@@ -91,7 +91,11 @@ fn native_srt_complete_datagrams_across_both_wan_cuts() {
             .collect(),
     )
     .unwrap();
-    unsafe { verz_mode(&mut e, 2) };
+    let mode = std::env::var("VERZ_UDP_NATIVE_MODE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    unsafe { verz_mode(&mut e, mode) };
     let mut paths = std::collections::HashMap::new();
     let mut route = |cut: u8| {
         let mut buf = [0; 17000];
@@ -177,12 +181,15 @@ fn native_srt_complete_datagrams_across_both_wan_cuts() {
             .unwrap(),
     );
     let start = Instant::now();
+    let no_cuts = std::env::var_os("VERZ_UDP_NATIVE_NO_CUTS").is_some();
     let mut source = None;
     let mut decoded = Vec::new();
     let mut buf = [0; 17000];
     while start.elapsed() < Duration::from_secs(12) && decoded.len() < 70 {
         let ms = start.elapsed().as_millis();
-        let cut = if (2000..3200).contains(&ms) {
+        let cut = if no_cuts {
+            0
+        } else if (2000..3200).contains(&ms) {
             2
         } else if (4500..5700).contains(&ms) {
             1
@@ -223,10 +230,12 @@ fn native_srt_complete_datagrams_across_both_wan_cuts() {
         .max()
         .unwrap();
     println!(
-        "70 decoded frames, maximum inter-frame gap {} ms, uploaded {} bytes",
+        "mode {mode}: 70 decoded frames, maximum inter-frame gap {} ms, uploaded {} bytes",
         max_gap.as_millis(),
         e.upload
     );
+    println!("bonded status: {}", e.bonded.status());
+    println!("gateway counters: {}", gateway.counters());
     assert!(
         max_gap < Duration::from_millis(350),
         "video delivery stalled across WAN cut: {max_gap:?}"

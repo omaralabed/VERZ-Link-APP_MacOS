@@ -27,6 +27,13 @@ pub struct Sent {
     pub duplicate: Option<u8>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct Repair {
+    pub sequence: u32,
+    pub path: u8,
+    pub wire_bytes: usize,
+}
+
 impl Sender {
     /// Policy changes must not reset flow sequences or retransmission state.
     pub fn set_config(&mut self, config: Config) {
@@ -84,9 +91,46 @@ impl Sender {
     /// Metadata/classification is supplied by the ingress layer; payload is a full IP packet for TUN.
     pub fn forward(
         &mut self,
+        packet: Packet,
+        snapshot: &[Link],
+        writer: &mut impl WanWriter,
+    ) -> io::Result<Sent> {
+        let decision = self
+            .scheduler
+            .schedule(packet.class, snapshot)
+            .map_err(io::Error::other)?;
+        self.forward_with_decision(packet, snapshot, writer, decision.primary, decision.fec)
+    }
+
+    /// Send through a path selected by a caller that owns a stronger scheduler.
+    /// Socket failure still falls back to another healthy path, while sequence,
+    /// cache, authentication and NACK repair remain owned by this Sender.
+    pub fn forward_on(
+        &mut self,
+        packet: Packet,
+        snapshot: &[Link],
+        writer: &mut impl WanWriter,
+        preferred: u8,
+    ) -> io::Result<Sent> {
+        if !snapshot
+            .iter()
+            .any(|link| link.id == preferred && !link.disabled && matches!(link.status, 1 | 2))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "preferred WAN is not healthy",
+            ));
+        }
+        self.forward_with_decision(packet, snapshot, writer, preferred, 0)
+    }
+
+    fn forward_with_decision(
+        &mut self,
         mut packet: Packet,
         snapshot: &[Link],
         writer: &mut impl WanWriter,
+        preferred: u8,
+        fec: u8,
     ) -> io::Result<Sent> {
         if packet.payload.len() > crate::MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -94,23 +138,19 @@ impl Sender {
                 "payload too large",
             ));
         }
-        let decision = self
-            .scheduler
-            .schedule(packet.class, snapshot)
-            .map_err(io::Error::other)?;
         let sequence = self.sequences.entry(packet.local_port).or_default();
         packet.sequence = *sequence;
         *sequence = sequence.wrapping_add(1);
         packet.session = self.session;
         packet.flags = PRIMARY | (packet.flags & TUN);
-        let primary = self.send_any(&packet, decision.primary, snapshot, writer)?;
+        let primary = self.send_any(&packet, preferred, snapshot, writer)?;
         packet.link = primary;
         self.cache.store(packet.clone());
         let mut duplicate = None;
-        if decision.fec != 0 && decision.fec != primary {
+        if fec != 0 && fec != primary {
             packet.flags = FEC | (packet.flags & TUN);
-            if self.send_one(&packet, decision.fec, writer).is_ok() {
-                duplicate = Some(decision.fec);
+            if self.send_one(&packet, fec, writer).is_ok() {
+                duplicate = Some(fec);
             }
         }
         Ok(Sent {
@@ -126,6 +166,20 @@ impl Sender {
         snapshot: &[Link],
         writer: &mut impl WanWriter,
     ) -> io::Result<usize> {
+        self.control_on(wire, snapshot, writer, None)
+            .map(|repairs| repairs.len())
+    }
+
+    /// Handle authenticated feedback and, for NACKs, optionally prefer the WAN
+    /// that delivered the feedback. This lets a multipath owner repair around a
+    /// silently failed original path without changing the legacy control path.
+    pub fn control_on(
+        &mut self,
+        wire: &[u8],
+        snapshot: &[Link],
+        writer: &mut impl WanWriter,
+        preferred_repair: Option<u8>,
+    ) -> io::Result<Vec<Repair>> {
         let control = Packet::decode(wire, &self.key).map_err(io::Error::other)?;
         if control.session != self.session {
             return Err(io::Error::new(
@@ -136,25 +190,30 @@ impl Sender {
         if control.flags == ACK {
             self.cache
                 .trim_through(control.local_port, control.sequence);
-            return Ok(0);
+            return Ok(Vec::new());
         }
         if control.flags != NACK {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not ACK/NACK"));
         }
         let sequences = decode_nack(&control.payload).map_err(io::Error::other)?;
-        let mut sent = 0;
+        let mut repairs = Vec::new();
         for sequence in sequences {
             if let Some(mut packet) = self.cache.get(control.local_port, sequence).cloned() {
                 packet.flags |= RESEND;
-                if self
-                    .send_any(&packet, packet.link, snapshot, writer)
-                    .is_ok()
-                {
-                    sent += 1;
+                // The authenticated control packet arriving through this socket
+                // is newer reachability evidence than the heartbeat snapshot.
+                // send_any still checks carrier and falls back safely.
+                let preferred = preferred_repair.unwrap_or(packet.link);
+                if let Ok(path) = self.send_any(&packet, preferred, snapshot, writer) {
+                    repairs.push(Repair {
+                        sequence,
+                        path,
+                        wire_bytes: packet.encode(&self.key).map_err(io::Error::other)?.len(),
+                    });
                 }
             }
         }
-        Ok(sent)
+        Ok(repairs)
     }
 }
 
@@ -257,6 +316,49 @@ mod tests {
         let p = w.sent.last().unwrap();
         assert_eq!((p.sequence, p.link), (0, 2));
         assert_ne!(p.flags & RESEND, 0);
+    }
+    #[test]
+    fn caller_selected_path_preserves_sequence_and_falls_back_on_socket_error() {
+        let mut s = Sender::new(123, vec![7; 32], Config::default()).unwrap();
+        let mut w = Wans {
+            up: vec![1, 2],
+            fail: vec![],
+            sent: vec![],
+        };
+        let sent = s.forward_on(packet(), &links(), &mut w, 1).unwrap();
+        assert_eq!((sent.sequence, sent.primary, sent.duplicate), (0, 1, None));
+        w.fail.push(1);
+        let sent = s.forward_on(packet(), &links(), &mut w, 1).unwrap();
+        assert_eq!((sent.sequence, sent.primary, sent.duplicate), (1, 2, None));
+        assert_eq!(w.sent.iter().map(|p| p.link).collect::<Vec<_>>(), [1, 2]);
+    }
+    #[test]
+    fn caller_selected_repair_uses_feedback_path_while_legacy_keeps_original() {
+        let mut s = Sender::new(123, vec![7; 32], Config::default()).unwrap();
+        let mut w = Wans {
+            up: vec![1, 2],
+            fail: vec![],
+            sent: vec![],
+        };
+        assert_eq!(
+            s.forward_on(packet(), &links(), &mut w, 1).unwrap().primary,
+            1
+        );
+        let nack = Packet {
+            session: 123,
+            flags: NACK,
+            local_port: 9000,
+            payload: crate::encode_nack(&[0]).unwrap(),
+            ..Default::default()
+        }
+        .encode(&[7; 32])
+        .unwrap();
+        let mut stale = links();
+        stale[1].status = 0;
+        let repairs = s.control_on(&nack, &stale, &mut w, Some(2)).unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!((repairs[0].sequence, repairs[0].path), (0, 2));
+        assert_eq!(w.sent.last().unwrap().link, 2);
     }
     #[test]
     fn authentication_and_session_isolate_control() {

@@ -1,10 +1,12 @@
 //! Single-owner engine, called only from the provider's serial queue. No TUN or route changes.
+mod bonded;
 mod gateway;
 #[cfg(test)]
 mod native_test;
 mod reassembly;
 pub mod secure;
 mod wan;
+use bonded::BondedSpeed;
 use secure::SecureSockets as Sockets;
 use serde::Deserialize;
 use std::{
@@ -13,7 +15,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use verz_link_core::{
-    ACK, DOWNLINK, HEARTBEAT, NACK, Packet,
+    ACK, DOWNLINK, HEARTBEAT, NACK, Packet, decode_nack, encode_nack,
     recovery::Deduper,
     scheduler::{Config, Link},
     transport::{Sender, WanWriter},
@@ -53,6 +55,7 @@ pub struct Engine {
     pub download: u64,
     pub errors: u64,
     mode: i32,
+    bonded: BondedSpeed,
 }
 fn stamp() -> i64 {
     SystemTime::now()
@@ -82,6 +85,7 @@ impl Engine {
             download: 0,
             errors: 0,
             mode: 0,
+            bonded: BondedSpeed::default(),
         })
     }
     fn adapters(&mut self, adapters: Vec<Adapter>) -> Result<(), String> {
@@ -98,6 +102,7 @@ impl Engine {
         for id in removed {
             self.sockets.remove(id);
             self.paths.remove(&id);
+            self.bonded.remove_path(id);
         }
         let mut failures = Vec::new();
         for a in adapters {
@@ -109,6 +114,8 @@ impl Engine {
                 .add(a.id, &a.name, a.address, self.enrollment.gateway)
             {
                 Ok(()) => {
+                    self.bonded
+                        .add_path(a.id, self.start.elapsed().as_micros() as u64);
                     self.paths.insert(
                         a.id,
                         Path {
@@ -152,14 +159,20 @@ impl Engine {
                     100.0 * p.outcomes.iter().filter(|v| !**v).count() as f64
                         / p.outcomes.len() as f64
                 },
-                capacity: 0.0,
+                capacity: if self.mode == 1 {
+                    self.bonded.capacity_bps(id).unwrap_or(0.0)
+                } else {
+                    0.0
+                },
                 uptime: 1.0,
             })
             .collect()
     }
     fn send(&mut self, port: u16, ip: [u8; 4], remote: u16, payload: &[u8]) -> Result<(), String> {
         let p = Packet {
-            class: 4,
+            // Class 3 is reserved here for capacity-weighted Bonded Speed.
+            // Existing continuity/latency behavior remains class 4.
+            class: if self.mode == 1 { 3 } else { 4 },
             local_port: port,
             destination: ip,
             destination_port: remote,
@@ -168,13 +181,28 @@ impl Engine {
             ..Default::default()
         };
         let links = self.links();
-        let sent = self
-            .sender
-            .forward(p.clone(), &links, &mut self.sockets)
-            .map_err(|e| {
-                self.errors += 1;
-                e.to_string()
-            })?;
+        let now_us = self.start.elapsed().as_micros() as u64;
+        let wire_bytes = payload
+            .len()
+            .saturating_add(verz_link_core::HEADER + verz_link_core::TAG);
+        let result = if self.mode == 1 {
+            let preferred = self
+                .bonded
+                .select(&links, wire_bytes, now_us)
+                .ok_or_else(|| "no healthy WAN for Bonded Speed".to_owned())?;
+            self.sender
+                .forward_on(p.clone(), &links, &mut self.sockets, preferred)
+        } else {
+            self.sender.forward(p.clone(), &links, &mut self.sockets)
+        };
+        let sent = result.map_err(|e| {
+            self.errors += 1;
+            e.to_string()
+        })?;
+        if self.mode == 1 {
+            self.bonded
+                .sent(port, sent.sequence, sent.primary, wire_bytes, now_us);
+        }
         if self.mode == 2 {
             // Redundancy mode sends a copy immediately, rather than waiting for failure detection.
             for link in links
@@ -264,7 +292,45 @@ impl Engine {
                     }
                 }
                 ACK | NACK => {
-                    let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
+                    let mut repairs = Vec::new();
+                    if self.mode == 1 {
+                        let now_us = self.start.elapsed().as_micros() as u64;
+                        if p.flags == ACK {
+                            self.bonded.acknowledge(p.local_port, p.sequence, now_us);
+                        } else if let Ok(sequences) = decode_nack(&p.payload) {
+                            let fresh = self.bonded.nack(p.local_port, &sequences, now_us);
+                            if let Ok(payload) = encode_nack(&fresh) {
+                                let mut control = p.clone();
+                                control.payload = payload;
+                                if let Ok(authenticated) =
+                                    control.encode(self.enrollment.key.as_bytes())
+                                    && let Ok(sent) = self.sender.control_on(
+                                        &authenticated,
+                                        &self.links(),
+                                        &mut self.sockets,
+                                        Some(id),
+                                    )
+                                {
+                                    repairs = sent;
+                                }
+                            }
+                        }
+                    }
+                    if self.mode != 1 || p.flags == ACK {
+                        let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
+                    }
+                    if self.mode == 1 {
+                        let now_us = self.start.elapsed().as_micros() as u64;
+                        for repair in repairs {
+                            self.bonded.repair_sent(
+                                p.local_port,
+                                repair.sequence,
+                                repair.path,
+                                repair.wire_bytes,
+                                now_us,
+                            );
+                        }
+                    }
                 }
                 DOWNLINK => {
                     if !self
@@ -398,7 +464,7 @@ pub unsafe extern "C" fn verz_status(e: *mut Engine, out: *mut u8, cap: usize) -
         return 0;
     }
     let e = unsafe { &*e };
-    let value = serde_json::json!({"upload":e.upload,"download":e.download,"errors":e.errors,"wire":e.sockets.bytes,"paths":e.links(),"mode":e.mode,"adapters":e.paths.iter().map(|(id,p)|(id.to_string(),p.adapter.name.clone())).collect::<BTreeMap<_,_>>()});
+    let value = serde_json::json!({"upload":e.upload,"download":e.download,"errors":e.errors,"wire":e.sockets.bytes,"paths":e.links(),"mode":e.mode,"bonded_speed":e.bonded.status(),"adapters":e.paths.iter().map(|(id,p)|(id.to_string(),p.adapter.name.clone())).collect::<BTreeMap<_,_>>()});
     let data = serde_json::to_vec(&value).unwrap_or_default();
     if data.len() > cap {
         return 0;
@@ -417,10 +483,15 @@ pub unsafe extern "C" fn verz_mode(e: *mut Engine, mode: i32) {
         return;
     }
     let e = unsafe { &mut *e };
+    if e.mode != mode {
+        e.bonded.reset_runtime(e.start.elapsed().as_micros() as u64);
+    }
     e.mode = mode;
     e.sender.set_config(Config {
-        bond_all: mode == 1,
-        fec: mode != 3,
+        // Mode 1 chooses through BondedSpeed::select and deliberately avoids
+        // duplicate payload. Modes 0/2/3 retain their previous core scheduler.
+        bond_all: false,
+        fec: mode != 1 && mode != 3,
         ..Default::default()
     });
 }

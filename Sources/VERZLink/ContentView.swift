@@ -133,15 +133,16 @@ struct ContentView: View {
                         Text("Links · what should several links be used for?").font(.system(size: 11, weight: .medium)).padding(.top, 4)
                         Picker("Connection preference", selection: $model.policy) {
                             Text("Bonding").tag("smart")
+                            Text("Bonded speed").tag("performance")
                             Text("Continuity").tag("continuity")
                             Text("Data saver").tag("data-saver")
-                            // Legacy value: identical to Bonding for TCP; only spreads UDP flows.
-                            if model.policy == "performance" { Text("Performance").tag("performance") }
                         }.pickerStyle(.segmented)
                         Text(model.policy == "continuity"
                              ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight."
                              : model.policy == "data-saver"
                              ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
+                             : model.policy == "performance"
+                             ? "Bonded speed: measures delivered UDP upload capacity and allocates outgoing packets proportionally across every healthy WAN. The gateway restores packet order and requests missing packets; continuous duplicate payload is disabled."
                              : "Bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
                             .font(.system(size: 10)).foregroundStyle(muted)
                     }.padding(.top, 8)
@@ -282,8 +283,14 @@ struct ContentView: View {
                             Text(String(format: "↑ %.2f  ↓ %.2f Mbps", udp.uploadMbps, udp.downloadMbps))
                                 .font(.system(size: 12, weight: .semibold)).monospacedDigit()
                                 .foregroundStyle(udp.healthy ? Color.primary : muted)
-                                .help("Live traffic of the streams-and-calls lane on this link (SRT, RTP, WebRTC, QUIC over UDP), including protection copies.")
-                            Text("UDP lane · includes copies")
+                                .help(model.policy == "performance"
+                                      ? "Live Bonded Speed traffic carried on this WAN."
+                                      : "Live traffic of the streams-and-calls lane on this link (SRT, RTP, WebRTC, QUIC over UDP), including protection copies.")
+                            if model.policy == "performance", let capacity = udp.capacityMbps {
+                                Text(String(format: "Bonded estimate %.1f Mbps", capacity))
+                            } else {
+                                Text("UDP lane · includes copies")
+                            }
                         }.font(.system(size: 10)).foregroundStyle(muted).frame(width: 150, alignment: .trailing)
                     }
                     Toggle("Use", isOn: Binding(get: { !model.disabledInterfaces.contains(interface.name) },

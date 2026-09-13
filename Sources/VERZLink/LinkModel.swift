@@ -60,7 +60,7 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
     var settings: (mode: TransportMode, policy: String)? {
         switch self {
         case .neverDrop: (.secure, "continuity")
-        case .fastest: (.secure, "smart")
+        case .fastest: (.secure, "performance")
         case .direct: (.direct, "smart")
         case .custom: nil
         }
@@ -73,7 +73,7 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
         case .neverDrop:
             "Recommended. All traffic goes through the encrypted VERZ server over every link, and calls, UDP and light TCP are carried on two links at once. Losing a cable, or loss on one ISP, causes no drop: the session and public IP stay the same."
         case .fastest:
-            "All traffic goes through the encrypted VERZ server with the links bonded for maximum throughput. Calls and live media are still protected; other traffic is re-sent on the surviving link after a failure, which can pause briefly."
+            "All traffic goes through the encrypted VERZ server. TCP uses every responsive link, while UDP Bonded Speed measures delivered upload capacity and divides an outgoing stream proportionally across the available WANs. Missing packets are repaired, but unlike Never drop, payload is not continuously duplicated."
         case .direct:
             "No server. Each connection is pinned to one adapter and ISP for its whole life, so loss, congestion or an outage on that ISP hits it directly and nothing can carry or repair it over the other link. Only new connections can pick a better adapter."
         case .custom:
@@ -119,6 +119,7 @@ struct BondTelemetry: Decodable {
 struct UDPPathTelemetry {
     let healthy: Bool
     let rtt: Double
+    let capacityMbps: Double?
     let sent: UInt64
     let received: UInt64
     let uploadMbps: Double
@@ -276,7 +277,11 @@ final class LinkModel: ObservableObject {
                 let up = elapsed > 0 && old != nil && sent >= old!.sent ? Double(sent - old!.sent) * 8 / elapsed / 1_000_000 : 0
                 let down = elapsed > 0 && old != nil && received >= old!.received ? Double(received - old!.received) * 8 / elapsed / 1_000_000 : 0
                 paths[name] = UDPPathTelemetry(healthy: (path["status"] as? Int) == 1,
-                    rtt: (path["rtt"] as? NSNumber)?.doubleValue ?? 0, sent: sent, received: received,
+                    rtt: (path["rtt"] as? NSNumber)?.doubleValue ?? 0,
+                    capacityMbps: (path["capacity"] as? NSNumber).flatMap {
+                        $0.doubleValue > 0 ? $0.doubleValue / 1_000_000 : nil
+                    },
+                    sent: sent, received: received,
                     uploadMbps: up, downloadMbps: down)
             }
             self.udpPaths = paths; self.udpTelemetryTime = now

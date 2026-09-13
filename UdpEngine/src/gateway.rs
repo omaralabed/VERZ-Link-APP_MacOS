@@ -389,16 +389,27 @@ impl Gateway {
             self.counters.rejected += 1;
             return;
         }
-        let (budget, grace) = match p.normalized_class() {
-            4 => (50_000, 25_000),
-            2 => (2_000_000, 200_000),
-            _ => (5_000_000, 200_000),
+        let class = p.normalized_class();
+        let (budget, grace, capacity) = match class {
+            // Bonded Speed stripes one flow across unequal paths. At 20 Mbps a
+            // 100 ms path skew can hold roughly 200 full-sized datagrams, so its
+            // per-flow buffer must be larger than Continuity's duplicate lane.
+            // Request a repair after 30 ms; waiting 100 ms here caused the media
+            // receiver to exhaust its own latency budget during a silent cut.
+            3 => (30_000, 50_000, 1_024),
+            4 => (50_000, 25_000, 64),
+            2 => (2_000_000, 200_000, 64),
+            _ => (5_000_000, 200_000, 64),
         };
         let stream = self
             .streams
             .entry((session, port))
             .or_insert_with(|| Ordered {
-                stream: Stream::new(budget, grace, 64),
+                stream: if class == 3 {
+                    Stream::new_repairing(budget, grace, capacity)
+                } else {
+                    Stream::new(budget, grace, capacity)
+                },
                 last: now,
             });
         stream.last = now;
@@ -724,6 +735,31 @@ mod lifecycle_tests {
         g.expire(2 * UDP_IDLE_US);
         assert!(g.flows.is_empty());
         assert!(g.streams.is_empty());
+    }
+
+    #[test]
+    fn bonded_speed_restores_cross_wan_packet_order_before_udp_egress() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        let mut second = packet(10000, destination, 1);
+        second.class = 3;
+        second.link = 2;
+        second.payload = vec![1];
+        ingest(&mut g, &second, 1_000);
+        assert_eq!(g.counters.uplink_bytes, 0, "sequence 1 must wait for 0");
+
+        let mut first = packet(10000, destination, 0);
+        first.class = 3;
+        first.link = 1;
+        first.payload = vec![0];
+        ingest(&mut g, &first, 2_000);
+        assert_eq!(g.counters.uplink_bytes, 2);
+
+        let mut payload = [0u8; 8];
+        assert_eq!(sink.recv_from(&mut payload).unwrap().0, 1);
+        assert_eq!(payload[0], 0);
+        assert_eq!(sink.recv_from(&mut payload).unwrap().0, 1);
+        assert_eq!(payload[0], 1);
     }
 
     #[test]

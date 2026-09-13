@@ -20,6 +20,7 @@ pub struct Stream {
     grace: u64,
     latest_sent: i64,
     capacity: usize,
+    repair_before_release: bool,
 }
 impl Stream {
     pub fn buffered_bytes(&self) -> usize {
@@ -31,6 +32,14 @@ impl Stream {
     }
     /// Durations are microseconds. Caller owns class-dependent/adaptive budgets.
     pub fn new(budget: u64, grace: u64, capacity: usize) -> Self {
+        Self::configured(budget, grace, capacity, false)
+    }
+
+    pub fn new_repairing(budget: u64, grace: u64, capacity: usize) -> Self {
+        Self::configured(budget, grace, capacity, true)
+    }
+
+    fn configured(budget: u64, grace: u64, capacity: usize, repair_before_release: bool) -> Self {
         Self {
             next: 0,
             pending: BTreeMap::new(),
@@ -42,6 +51,7 @@ impl Stream {
             grace,
             latest_sent: 0,
             capacity: capacity.max(1),
+            repair_before_release,
         }
     }
     fn clear_gap(&mut self) {
@@ -73,6 +83,18 @@ impl Stream {
         false
     }
     fn finish(&mut self, ready: Vec<Packet>, now: u64) -> Output {
+        if self.repair_before_release
+            && self.gap.is_none()
+            && self
+                .pending
+                .keys()
+                .next()
+                .is_some_and(|seq| *seq > self.next)
+        {
+            // Draining one repaired hole may expose another already-buffered
+            // hole. Start its timer now instead of waiting for another packet.
+            self.gap = Some(now);
+        }
         let ack = if !ready.is_empty() && self.next > 0 {
             Some(self.next - 1)
         } else {
@@ -88,7 +110,7 @@ impl Stream {
                 None => {
                     self.nack_at = Some(now);
                     self.retries = 1;
-                    nack.push(self.next);
+                    self.collect_missing(&mut nack);
                 }
                 Some(at)
                     if self.retries < 3
@@ -97,12 +119,36 @@ impl Stream {
                 {
                     self.nack_at = Some(now);
                     self.retries += 1;
-                    nack.push(self.next);
+                    self.collect_missing(&mut nack);
                 }
                 _ => {}
             }
         }
         Output { ready, ack, nack }
+    }
+
+    fn collect_missing(&self, missing: &mut Vec<u32>) {
+        if !self.repair_before_release {
+            missing.push(self.next);
+            return;
+        }
+        let mut expected = self.next;
+        for sequence in self.pending.keys().copied() {
+            if sequence < expected {
+                continue;
+            }
+            while expected < sequence && missing.len() < 32 {
+                missing.push(expected);
+                expected = expected.wrapping_add(1);
+            }
+            if missing.len() == 32 {
+                return;
+            }
+            expected = sequence.wrapping_add(1);
+        }
+        if missing.is_empty() {
+            missing.push(self.next);
+        }
     }
     pub fn insert(&mut self, packet: Packet, now: u64) -> Result<Output, &'static str> {
         if !packet.is_data() {
@@ -164,6 +210,24 @@ impl Stream {
             ready.push(packet);
             self.advance();
             self.sequential(&mut ready);
+            return self.finish(ready, now);
+        }
+        if self.repair_before_release
+            && let Some(gap) = self.gap
+            && now.saturating_sub(gap) >= self.budget
+        {
+            if self
+                .nack_at
+                .is_some_and(|at| now.saturating_sub(at) >= self.grace)
+            {
+                // The repair window expired. Drop exactly the missing sequence,
+                // then release only the now-contiguous suffix.
+                self.advance();
+                self.sequential(&mut ready);
+                return self.finish(ready, now);
+            }
+            // finish() emits or repeats the NACK. Do not run the legacy aged
+            // release below while a Bonded Speed repair is still possible.
             return self.finish(ready, now);
         }
         if self.gap.is_some()
@@ -249,6 +313,36 @@ mod tests {
         assert_eq!(s.tick(50_000).nack, vec![0]);
         // Mirrors the copied aged-packet rule: expired queued packets may advance the gap.
         assert_eq!(s.tick(50_001).ready[0].sequence, 1);
+    }
+
+    #[test]
+    fn repairing_stream_requests_missing_packet_before_releasing_later_payload() {
+        let mut s = Stream::new_repairing(30_000, 50_000, 1_024);
+        assert!(s.insert(p(1), 0).unwrap().ready.is_empty());
+        let request = s.tick(30_000);
+        assert_eq!(request.nack, vec![0]);
+        assert!(request.ready.is_empty());
+        let restored = s.insert(p(0), 40_000).unwrap();
+        assert_eq!(
+            restored
+                .ready
+                .iter()
+                .map(|packet| packet.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(restored.ack, Some(1));
+    }
+
+    #[test]
+    fn repairing_stream_requests_a_burst_of_cross_wan_holes_together() {
+        let mut s = Stream::new_repairing(30_000, 50_000, 1_024);
+        for sequence in [1, 3, 5] {
+            assert!(s.insert(p(sequence), 0).unwrap().ready.is_empty());
+        }
+        let request = s.tick(30_000);
+        assert_eq!(request.nack, [0, 2, 4]);
+        assert!(request.ready.is_empty());
     }
     #[test]
     fn delayed_packet_does_not_restart_stream() {
