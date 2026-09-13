@@ -1,0 +1,30 @@
+[Unit]
+Description=VERZ isolated encrypted UDP datagram gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/verz-link-lab/verz-udp-gateway 0.0.0.0:4443 %d/lab-secret
+LoadCredential=lab-secret:/etc/verz-link-lab/secret
+DynamicUser=yes
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+MemoryMax=256M
+TasksMax=8
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

@@ -7,7 +7,11 @@ use crate::ReplayWindow;
 
 pub const MTU: usize = 1280;
 pub const HEADER: usize = 29;
-pub const MAX_WIRE: usize = HEADER + 1 + MTU + 16;
+// A multipath frame wraps a full inner IP packet. Keep that framing budget
+// separate from the legacy tunnel's IP MTU; every transport enforces its own
+// authenticated protocol's payload limit in both directions.
+pub const MAX_PAYLOAD: usize = MTU + 96;
+pub const MAX_WIRE: usize = HEADER + 1 + MAX_PAYLOAD + 16;
 pub const HELLO: u8 = 1;
 pub const WELCOME: u8 = 2;
 pub const TRANSPORT: u8 = 3;
@@ -106,6 +110,7 @@ pub fn handshake(secret: &[u8; 32], session: &[u8; 16], initiator: bool) -> Resu
 
 pub struct Transport {
     pub session: [u8; 16],
+    max_payload: usize,
     noise: StatelessTransportState,
     tx_counter: u64,
     replay: ReplayWindow,
@@ -113,8 +118,21 @@ pub struct Transport {
 
 impl Transport {
     pub fn new(session: [u8; 16], noise: HandshakeState) -> Result<Self> {
+        Self::with_payload_limit(session, noise, MTU)
+    }
+
+    pub fn with_payload_limit(
+        session: [u8; 16],
+        noise: HandshakeState,
+        max_payload: usize,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=MAX_PAYLOAD).contains(&max_payload),
+            "invalid payload limit"
+        );
         Ok(Self {
             session,
+            max_payload,
             noise: noise.into_stateless_transport_mode()?,
             tx_counter: 0,
             replay: ReplayWindow::new(8192),
@@ -123,7 +141,10 @@ impl Transport {
 
     pub fn seal(&mut self, kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
         ensure!((IP..=CLOSE).contains(&kind), "invalid encrypted type");
-        ensure!(payload.len() <= MTU, "IP packet exceeds tunnel MTU");
+        ensure!(
+            payload.len() <= self.max_payload,
+            "payload exceeds transport limit"
+        );
         ensure!(
             kind == IP || payload.is_empty(),
             "control payload must be empty"
@@ -133,7 +154,7 @@ impl Transport {
         let mut plaintext = Vec::with_capacity(1 + payload.len());
         plaintext.push(kind);
         plaintext.extend_from_slice(payload);
-        let mut ciphertext = [0; MTU + 17];
+        let mut ciphertext = [0; MAX_PAYLOAD + 17];
         let len = self
             .noise
             .write_message(counter, &plaintext, &mut ciphertext)?;
@@ -148,6 +169,10 @@ impl Transport {
     pub fn open(&mut self, packet: &[u8]) -> Result<(u8, Vec<u8>)> {
         let header = Header::parse(packet)?;
         ensure!(
+            packet.len() <= HEADER + 1 + self.max_payload + 16,
+            "payload exceeds transport limit"
+        );
+        ensure!(
             header.kind == TRANSPORT && header.session == self.session,
             "wrong transport session"
         );
@@ -155,7 +180,7 @@ impl Transport {
             !self.replay.contains(header.counter),
             "replayed transport packet"
         );
-        let mut plaintext = [0; MTU + 17];
+        let mut plaintext = [0; MAX_PAYLOAD + 17];
         let len = self
             .noise
             .read_message(header.counter, &packet[HEADER..], &mut plaintext)?;

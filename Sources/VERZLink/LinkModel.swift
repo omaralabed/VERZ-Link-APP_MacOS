@@ -64,6 +64,8 @@ struct PathTelemetry: Decodable, Identifiable {
     var tcpObserved: Bool?
 }
 struct BondTelemetry: Decodable {
+    // Retain the optional engine field for telemetry compatibility, not display.
+    var payload: PayloadTelemetry?
     let paths: [PathTelemetry]
     let healthyPaths: Int
     let assignedIp: String
@@ -76,6 +78,15 @@ struct BondTelemetry: Decodable {
     var uploadGuarded: Bool?
 }
 
+struct UDPPathTelemetry {
+    let healthy: Bool
+    let rtt: Double
+    let sent: UInt64
+    let received: UInt64
+    let uploadMbps: Double
+    let downloadMbps: Double
+}
+
 struct BrainState: Decodable {
     let connected: Bool
     let generation: UInt64
@@ -86,7 +97,7 @@ struct BrainState: Decodable {
 @MainActor
 final class LinkModel: ObservableObject {
     @Published var state = ConnectionState.disconnected
-    @Published var relay = "69.164.213.57:39002"
+    @Published var relay = "69.164.213.57:443"
     @Published var selectedInterface = "en0"
     @Published var interfaces: [LinkInterface] = []
     @Published var tunnelInterface = ""
@@ -111,6 +122,8 @@ final class LinkModel: ObservableObject {
     @Published var disabledInterfaces = Set<String>()
     @Published var meteredInterfaces = Set<String>()
     @Published var bondTelemetry: BondTelemetry?
+    @Published var udpPaths: [String: UDPPathTelemetry] = [:]
+    private var udpTelemetryTime: Date?
     @Published var privateServerIP = "10.78.0.1"
     @Published var brainConnected = false
     @Published var brainGeneration: UInt64 = 0
@@ -124,6 +137,7 @@ final class LinkModel: ObservableObject {
     private var timer: Timer?
     private var interfaceMonitor: InterfaceMonitor?
     private var session: TunnelSession?
+    private let udpConnection = UDPConnection()
     private var runner: NetworkTest?
     private var testTask: Task<Void, Never>?
     private var sessionID = UUID()
@@ -133,6 +147,10 @@ final class LinkModel: ObservableObject {
     var whenDisconnected: (() -> Void)?
 
     let storage: URL
+    // Opt-in, local-only transport diagnostics. One bounded snapshot, no
+    // packet contents or credentials; disk I/O stays off the UI/event queue.
+    private let transportDiagnosticQueue = DispatchQueue(label: "com.verz.link.tcp-diagnostics", qos: .utility)
+    private var lastTransportDiagnostic = Date.distantPast
     var busy: Bool { state != .disconnected }
     var canTest: Bool { state == .connected && mode != .direct && !testRunning }
     var enabledInterfaces: [LinkInterface] { interfaces.filter { $0.canConnect && !disabledInterfaces.contains($0.name) } }
@@ -141,12 +159,22 @@ final class LinkModel: ObservableObject {
     var keyURL: URL { storage.appendingPathComponent("lab-secret") }
 
     init() {
+        // Preserve this old app's preferences when moving its signing identity
+        // to the paid team required by the Network Extension.
+        if UserDefaults.standard.object(forKey: "classicUDPMigrated") == nil {
+            let old = UserDefaults.standard.persistentDomain(forName: "com.verz.link.mac") ?? [:]
+            for name in ["relay", "interface", "disabledInterfaces", "meteredInterfaces", "bondPolicy", "transportMode", "secureDomains"] {
+                if UserDefaults.standard.object(forKey: name) == nil, let value = old[name] { UserDefaults.standard.set(value, forKey: name) }
+            }
+            UserDefaults.standard.set(true, forKey: "classicUDPMigrated")
+        }
         storage = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/VERZ Link", isDirectory: true)
         try? FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         if let value = UserDefaults.standard.string(forKey: "relay") { relay = value }
-        if relay == "69.164.213.57:39001" { relay = "69.164.213.57:39002" }
+        if relay == "69.164.213.57:39001" { relay = "69.164.213.57:443" }
+        if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
         policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "smart"
@@ -166,6 +194,28 @@ final class LinkModel: ObservableObject {
             Task { @MainActor in self?.sampleTraffic() }
         }
         initialized = true
+        udpConnection.onMessage = { [weak self] text in self?.log(text) }
+        udpConnection.onFailure = { [weak self] text in self?.errorMessage = text; self?.log(text); self?.disconnect() }
+        udpConnection.onTelemetry = { [weak self] data in
+            guard let self, let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+            let now = Date()
+            let elapsed = self.udpTelemetryTime.map { now.timeIntervalSince($0) } ?? 0
+            let names = object["adapters"] as? [String: String] ?? [:]
+            let wire = object["wire"] as? [String: [String: NSNumber]] ?? [:]
+            var paths: [String: UDPPathTelemetry] = [:]
+            for path in object["paths"] as? [[String: Any]] ?? [] {
+                guard let id = path["id"] as? Int, let name = names[String(id)] else { continue }
+                let sent = wire[String(id)]?["sent"]?.uint64Value ?? 0
+                let received = wire[String(id)]?["received"]?.uint64Value ?? 0
+                let old = self.udpPaths[name]
+                let up = elapsed > 0 && old != nil && sent >= old!.sent ? Double(sent - old!.sent) * 8 / elapsed / 1_000_000 : 0
+                let down = elapsed > 0 && old != nil && received >= old!.received ? Double(received - old!.received) * 8 / elapsed / 1_000_000 : 0
+                paths[name] = UDPPathTelemetry(healthy: (path["status"] as? Int) == 1,
+                    rtt: (path["rtt"] as? NSNumber)?.doubleValue ?? 0, sent: sent, received: received,
+                    uploadMbps: up, downloadMbps: down)
+            }
+            self.udpPaths = paths; self.udpTelemetryTime = now
+        }
     }
 
     func log(_ text: String) {
@@ -224,12 +274,30 @@ final class LinkModel: ObservableObject {
         restorationFailed = false
         publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
+        udpPaths = [:]; udpTelemetryTime = nil
         brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
         directHealthyPaths = 0; secureHealthyPaths = 0
         sessionID = UUID()
         let identifier = sessionID
         let names = enabledInterfaces.map(\.name)
         log("Starting \(mode.title) using \(names.joined(separator: ", ")) · \(policy)")
+        if mode != .direct {
+            udpConnection.connect(host: String(relay.split(separator: ":")[0]),
+                                  key: String(decoding: secret, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
+                                  disabled: Array(disabledInterfaces), policy: policy) { [weak self] result in
+                guard let self, self.sessionID == identifier, self.state != .disconnecting else { return }
+                switch result {
+                case .success:
+                    self.log("Independent encrypted UDP datagram path authenticated; starting the unchanged TCP engine")
+                    self.startTunnel(secret: secret, names: names, identifier: identifier)
+                case .failure(let error):
+                    self.state = .disconnected; self.errorMessage = error.localizedDescription; self.log(error.localizedDescription)
+                }
+            }
+        } else { startTunnel(secret: secret, names: names, identifier: identifier) }
+    }
+
+    private func startTunnel(secret: Data, names: [String], identifier: UUID) {
         do {
             session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: policy, configuration: configurationData()) { [weak self] event in
                 Task { @MainActor in
@@ -237,7 +305,7 @@ final class LinkModel: ObservableObject {
                     self.handle(event)
                 }
             }
-        } catch { state = .disconnected; errorMessage = error.localizedDescription; log(error.localizedDescription) }
+        } catch { udpConnection.disconnect(); state = .disconnected; errorMessage = error.localizedDescription; log(error.localizedDescription) }
     }
 
     func disconnect() {
@@ -245,7 +313,8 @@ final class LinkModel: ObservableObject {
         runner?.cancel(); testTask?.cancel(); testRunning = false
         state = .disconnecting
         log("Disconnect requested")
-        session?.disconnect()
+        udpConnection.disconnect()
+        if let session { session.disconnect() } else { state = .disconnected }
     }
 
     private func handle(_ event: EngineEvent) {
@@ -283,6 +352,14 @@ final class LinkModel: ObservableObject {
             }
         case "telemetry":
             if let line = event.line, let data = line.data(using: .utf8) {
+                if UserDefaults.standard.bool(forKey: "TCPTransportDiagnostics"),
+                   Date().timeIntervalSince(lastTransportDiagnostic) >= 1, data.count <= 262_144 {
+                    lastTransportDiagnostic = Date()
+                    let destination = storage.appendingPathComponent("tcp-transport-latest.json")
+                    transportDiagnosticQueue.async {
+                        try? data.write(to: destination, options: .atomic)
+                    }
+                }
                 let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
                 if let report = try? decoder.decode(BondTelemetry.self, from: data) {
                     secureHealthyPaths = report.healthyPaths
@@ -342,6 +419,7 @@ final class LinkModel: ObservableObject {
             errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
             log(errorMessage!)
         case "session_ended":
+            udpConnection.disconnect()
             state = .disconnected; tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
             brainConnected = false; brainGeneration = 0; directHealthyPaths = 0; secureHealthyPaths = 0
             runner?.cancel(); testTask?.cancel(); testRunning = false
@@ -393,7 +471,8 @@ final class LinkModel: ObservableObject {
                 data = Data(profile.key.utf8)
                 guard validSecret(data) else { throw LinkError.message("Invalid connection key in profile.") }
                 relay = profile.relay
-                if relay == "69.164.213.57:39001" { relay = "69.164.213.57:39002" }
+                if relay == "69.164.213.57:39001" { relay = "69.164.213.57:443" }
+                if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
                 UserDefaults.standard.set(relay, forKey: "relay")
             }
             guard validSecret(data) else { throw LinkError.message("The key must contain 64 hexadecimal characters.") }
@@ -449,9 +528,16 @@ final class LinkModel: ObservableObject {
     }
 
     private func updateInterfaces(_ found: [LinkInterface]) {
-        if interfaces != found { interfaces = found }
-        selectedInterface = InterfaceInventory.selectedName(current: selectedInterface, busy: busy, interfaces: found)
-        configurationChanged()
+        let interfacesChanged = interfaces != found
+        if interfacesChanged { interfaces = found }
+        let selected = InterfaceInventory.selectedName(current: selectedInterface, busy: busy, interfaces: found)
+        let selectionChanged = selectedInterface != selected
+        if selectionChanged { selectedInterface = selected }
+        // The monitor polls only as a safety net. Do not turn identical
+        // snapshots into control messages: the UDP provider interprets an app
+        // update as a request to refresh adapters, and the TCP engine should
+        // receive configuration only for an actual carrier/address change.
+        if interfacesChanged || selectionChanged { configurationChanged() }
     }
 
     func setInterface(_ name: String, enabled: Bool) {
@@ -482,6 +568,7 @@ final class LinkModel: ObservableObject {
         UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
         UserDefaults.standard.set(secureDomainsText, forKey: "secureDomains")
         session?.updateConfiguration(configurationData())
+        if mode != .direct { udpConnection.update(disabled: Array(disabledInterfaces), policy: policy) }
     }
 
     private func secureDomains() -> [String]? {
@@ -517,6 +604,7 @@ final class LinkModel: ObservableObject {
 
     private func sampleTraffic() {
         guard state == .connected || state == .reconnecting else { return }
+        if mode != .direct { udpConnection.telemetry() }
         uptime = Int(Date().timeIntervalSince(connectedAt ?? Date()))
         var list: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&list) == 0 else { return }

@@ -2,9 +2,14 @@
 dist/
 Helper/target/
 Engine/target/
+UdpEngine/target/
+Engine/vendor/**/target/
+Engine/vendor/**/Cargo.lock
 *.log
 .DS_Store
 .swiftpm/
 **/xcuserdata/
 **/lab-secret
 *.verz
+build/
+__pycache__/

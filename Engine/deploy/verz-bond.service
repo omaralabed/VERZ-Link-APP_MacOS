@@ -6,13 +6,13 @@ Requires=verz-bond-network.service
 
 [Service]
 Type=simple
-ExecStart=/opt/verz-link-lab/verz-bond server --secret-file %d/lab-secret
+ExecStart=/opt/verz-link-lab/verz-bond server --listen 0.0.0.0:443 --secret-file %d/lab-secret
 LoadCredential=lab-secret:/etc/verz-link-lab/secret
 Restart=on-failure
 RestartSec=2
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

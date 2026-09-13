@@ -240,11 +240,22 @@ struct ContentView: View {
                             }
                         }.font(.system(size: 10))
                     }
+                    if let udp = model.udpPaths[interface.name], model.busy {
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(udp.healthy ? "UDP ready" : "UDP waiting").foregroundStyle(udp.healthy ? mint : muted)
+                            Text(String(format: "%.1f ms RTT", udp.rtt))
+                            Text(String(format: "↓ %.1f  ↑ %.1f Mbps", udp.downloadMbps, udp.uploadMbps))
+                            Text("UDP carrier · includes copies")
+                        }.font(.system(size: 10)).foregroundStyle(muted)
+                    }
                     Toggle("Use", isOn: Binding(get: { !model.disabledInterfaces.contains(interface.name) },
                         set: { model.setInterface(interface.name, enabled: $0) })).toggleStyle(.switch).controlSize(.small)
-                        .fixedSize().help("Include this adapter in the multipath connection")
+                        .fixedSize()
+                        .accessibilityIdentifier("interface-use-\(interface.name)")
+                        .help("Include this adapter in the multipath connection")
                     Toggle("Metered", isOn: Binding(get: { model.meteredInterfaces.contains(interface.name) },
                         set: { model.setMetered(interface.name, metered: $0) })).controlSize(.small).fixedSize()
+                        .accessibilityIdentifier("interface-metered-\(interface.name)")
                 }.padding(.vertical, 5)
             }
             Text(model.mode == .secure

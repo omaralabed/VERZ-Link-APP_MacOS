@@ -10,7 +10,7 @@ protocol VERZSessionServiceProtocol {
 }
 
 enum ConnectionHelper {
-    static let name = "com.verz.link.session-service"
+    static let name = "com.omaralabed.verzlink.classic.session-service"
     static var service: SMAppService { .daemon(plistName: "\(name).plist") }
     static func signingTeam() throws -> String {
         var code: SecCode?; var staticCode: SecStaticCode?; var info: CFDictionary?
@@ -176,7 +176,7 @@ final class TunnelSession: @unchecked Sendable {
     private func launch(relay: String, interfaces: [String], policy: String) throws {
         let team = try ConnectionHelper.signingTeam()
         let connection = NSXPCConnection(machServiceName: ConnectionHelper.name, options: .privileged)
-        connection.setCodeSigningRequirement("anchor apple generic and identifier \"com.verz.link.session-service\" and certificate leaf[subject.OU] = \"\(team)\"")
+        connection.setCodeSigningRequirement("anchor apple generic and identifier \"\(ConnectionHelper.name)\" and certificate leaf[subject.OU] = \"\(team)\"")
         connection.remoteObjectInterface = NSXPCInterface(with: VERZSessionServiceProtocol.self)
         connection.invalidationHandler = { [weak self] in self?.sessionEnded(1, "The macOS connection helper is unavailable. Check its approval in System Settings.") }
         serviceConnection = connection

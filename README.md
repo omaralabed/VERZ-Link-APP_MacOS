@@ -14,6 +14,21 @@ Open `VERZ Link.xcodeproj`, choose **VERZ Link → My Mac**, then Run. Requires
 macOS 14+, Xcode command-line tools and Rust with Apple arm64/x86_64 targets.
 The build phase compiles and bundles the Rust engine automatically.
 
+The shared scheme also builds **Install for Xcode Run**, which waits for the
+app to finish signing, verifies its identity and UDP entitlements, and installs
+that exact product at `/Applications/VERZ Link.app`. Run and Profile launch
+this installed copy (with Xcode debugging), not the DerivedData copy. macOS
+requires the containing app in an Applications directory to activate its
+[system extension](https://developer.apple.com/documentation/driverkit/debugging-and-testing-system-extensions).
+Do not disable system security or remove the app's location check.
+
+An already running VERZ app is asked to quit normally before replacement.
+Previous installed builds are saved as ZIPs in `.build/xcode-run-backups/`.
+Installation/signing/quit failures fail the build instead of launching an old
+copy. The developer must have write access to `/Applications`; this step does
+not run sudo or store a password. Scheme Build also installs; Archive, Analyze
+and Test do not select the installation target. No gateway deployment occurs.
+
 Direct Smart is the default and needs no relay profile. It sends proxy-aware
 IPv4 TCP connections directly to their destinations, assigning each complete
 connection to one selected adapter. It does not add VERZ payload encryption;

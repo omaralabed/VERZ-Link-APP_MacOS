@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>VERZ Link UDP</string>
+<key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+<key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+<key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundlePackageType</key><string>SYSX</string>
+<key>CFBundleShortVersionString</key><string>0.7.0</string>
+<key>CFBundleVersion</key><string>26</string>
+<key>NSSystemExtensionUsageDescription</key><string>VERZ Link preserves UDP streaming flows across network changes.</string>
+<key>NetworkExtension</key><dict>
+<key>NEMachServiceName</key><string>$(TeamIdentifierPrefix)com.omaralabed.verzlink.classic.udp</string>
+<key>NEProviderClasses</key><dict><key>com.apple.networkextension.app-proxy</key><string>$(PRODUCT_MODULE_NAME).TransparentProvider</string></dict>
+</dict>
+</dict></plist>

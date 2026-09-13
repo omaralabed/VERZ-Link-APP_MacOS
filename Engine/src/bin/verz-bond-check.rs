@@ -13,7 +13,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::mpsc, time};
 use verz_link_lab::{
     bind_interface_socket,
-    bond::{Frame, Kind, Policy, Scheduler, handshake},
+    bond::{Frame, Kind, Policy, Scheduler, handshake, transport as bond_transport},
     load_secret,
     tunnel::{HEADER, HELLO, Header, IP, MAX_WIRE, Transport, WELCOME, validate_ipv4},
 };
@@ -25,7 +25,7 @@ struct Args {
     allow_shared_interface: bool,
     #[arg(long)]
     secret_file: PathBuf,
-    #[arg(long, default_value = "69.164.213.57:39002")]
+    #[arg(long, default_value = "69.164.213.57:443")]
     relay: SocketAddr,
     #[arg(long, num_args = 2.., required = true)]
     interface: Vec<String>,
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let mut transport = Transport::new(session, noise)?;
+    let mut transport = bond_transport(session, noise)?;
     let mut scheduler = Scheduler::new(
         args.interface
             .iter()

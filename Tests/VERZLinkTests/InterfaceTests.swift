@@ -66,11 +66,49 @@ final class InterfaceTests: XCTestCase {
         XCTAssertFalse(ethernet(link: false).canConnect)
         XCTAssertEqual(ethernet(link: false).status, "No cable link")
     }
+    func testRunningFlagOverridesStalePositiveMediaStateLikeUDPEngine() {
+        let upOnly = UInt32(IFF_UP)
+        let running = UInt32(IFF_UP | IFF_RUNNING)
+        XCTAssertEqual(InterfaceInventory.carrierState(flags: upOnly, mediaActive: true), false)
+        XCTAssertEqual(InterfaceInventory.carrierState(flags: running, mediaActive: true), true)
+        XCTAssertNil(InterfaceInventory.carrierState(flags: running, mediaActive: nil))
+    }
     func testSelfAssignedIPv4IsNotAUsableRelayPath() {
         XCTAssertFalse(ethernet(addresses: ["169.254.2.3"]).canConnect)
         XCTAssertFalse(LinkInterface.usableIPv4("127.0.0.1"))
         XCTAssertFalse(LinkInterface.usableIPv4("0.0.0.0"))
         XCTAssertTrue(ethernet().canConnect)
+    }
+    func testProvisionalDHCPLeaseIsNotOfferedUntilBound() {
+        // Physical replug 2026-09-12: macOS published the INIT-REBOOT address,
+        // then withdrew it 4.7 s later when the server never answered.
+        let provisional = """
+        <dictionary> {
+          IPv4 : <array> {
+            0 : <dictionary> {
+              Addresses : <array> { 0 : 192.168.1.235 }
+              ConfigMethod : DHCP
+              DHCP : <dictionary> {
+                State : INIT-REBOOT
+              }
+            }
+            1 : <dictionary> { ConfigMethod : LinkLocal }
+          }
+        }
+        """
+        XCTAssertEqual(InterfaceInventory.dhcpConfirmed(summary: provisional), false)
+        XCTAssertEqual(InterfaceInventory.dhcpConfirmed(summary: provisional.replacingOccurrences(of: "INIT-REBOOT", with: "BOUND")), true)
+        XCTAssertEqual(InterfaceInventory.dhcpConfirmed(summary: provisional.replacingOccurrences(of: "INIT-REBOOT", with: "RENEW")), true)
+        XCTAssertNil(InterfaceInventory.dhcpConfirmed(summary: provisional.replacingOccurrences(of: "ConfigMethod : DHCP", with: "ConfigMethod : Manual")))
+        var port = ethernet()
+        port.dhcpConfirmed = false
+        XCTAssertFalse(port.canConnect)
+        XCTAssertTrue(port.isConnected)
+        XCTAssertEqual(port.status, "Confirming DHCP lease")
+        port.dhcpConfirmed = true
+        XCTAssertTrue(port.canConnect)
+        port.dhcpConfirmed = nil
+        XCTAssertTrue(port.canConnect, "static addressing has no lease to confirm")
     }
     func testOnlyConnectedPortsAreVisibleIncludingDHCPInProgress() {
         XCTAssertFalse(ethernet(link: false).isConnected)

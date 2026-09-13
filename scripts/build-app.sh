@@ -10,6 +10,7 @@ mkdir -p "$PROJECT_DIR/dist"
 # Verify and archive the signed Xcode product outside iCloud Desktop. File
 # Provider can re-add FinderInfo to a Desktop .app immediately after removal.
 codesign --verify --deep --strict --verbose=2 "$APP"
+swift scripts/verify-udp-signing.swift "$APP"
 lipo -archs "$APP/Contents/MacOS/VERZLink"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$PROJECT_DIR/dist/VERZ Link Mac Universal.zip"
 DIST_APP="$PROJECT_DIR/dist/VERZ Link.app"

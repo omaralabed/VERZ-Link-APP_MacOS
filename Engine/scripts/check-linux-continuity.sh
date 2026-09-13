@@ -3,6 +3,7 @@
 set -euo pipefail
 umask 077
 MODE=${1:-cuts}
+POLICY=${VERZ_TEST_POLICY:-continuity}
 BOND_BIN=${VERZ_TEST_BOND_BIN:-/opt/verz-link-lab/verz-bond}
 CLIENT_BIN=${VERZ_TEST_CLIENT_BIN:-$BOND_BIN}
 HTTP_BIN=${VERZ_TEST_HTTP_BIN:-/opt/verz-link-lab/verz-tunnel-http}
@@ -13,6 +14,7 @@ HTTP_ARGS=()
 if [ -n "${VERZ_TEST_STREAM_DELAY_MS:-}" ]; then HTTP_ARGS+=(--stream-delay-ms "$VERZ_TEST_STREAM_DELAY_MS"); fi
 if [ -n "${VERZ_TEST_STREAM_REPEATS:-}" ]; then HTTP_ARGS+=(--stream-repeats "$VERZ_TEST_STREAM_REPEATS"); fi
 case "$MODE" in cuts|both|low|high) ;; *) echo "Use cuts, both, low, or high" >&2; exit 1;; esac
+case "$POLICY" in smart|performance|continuity|data-saver) ;; *) echo "Use a valid VERZ_TEST_POLICY" >&2; exit 1;; esac
 PATHS=(vzbc0 vzbc1)
 EXPECTED_PATHS=2
 if [ "$MODE" = low ]; then PATHS=(vzbc0); EXPECTED_PATHS=1; fi
@@ -88,7 +90,8 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 ip netns exec "$NS" "$CLIENT_BIN" client --relay 10.203.240.1:39002 \
-    --interface "${PATHS[@]}" --secret-file /etc/verz-link-lab/secret >"$TEST_DIR/client.log" 2>&1 &
+    --interface "${PATHS[@]}" --secret-file /etc/verz-link-lab/secret \
+    --policy "$POLICY" >"$TEST_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 TUN=
 for _ in $(seq 1 100); do

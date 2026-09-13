@@ -359,6 +359,12 @@ fn main() -> Result<()> {
                     continue;
                 }
                 interfaces = names;
+                // The engine must learn about a lost adapter before this
+                // process spends time in route/networksetup calls; it retries
+                // a not-yet-routed new adapter on its own 500 ms cadence.
+                if let Some(input) = child.stdin.as_mut() {
+                    let _ = writeln!(input, "{value}");
+                }
                 if let Some(guard) = network.as_mut() {
                     for interface in &interfaces {
                         if let Err(error) = guard.add_uplink(interface, &relay.ip().to_string()) {
@@ -382,9 +388,6 @@ fn main() -> Result<()> {
                         &events,
                         json!({"event":"engine_error", "line":format!("Direct proxy configuration: {error}")}),
                     );
-                }
-                if let Some(input) = child.stdin.as_mut() {
-                    let _ = writeln!(input, "{value}");
                 }
             }
             Ok(Control::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {

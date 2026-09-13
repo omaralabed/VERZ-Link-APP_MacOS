@@ -271,6 +271,7 @@ impl Path {
 
 #[derive(Clone)]
 struct Runtime {
+    payload: Arc<PayloadTotals>,
     paths: Arc<RwLock<Vec<Arc<Path>>>>,
     policy: Arc<AtomicUsize>,
     cursor: Arc<AtomicUsize>,
@@ -599,7 +600,16 @@ impl Drop for PathLease {
 /// Count successful socket IO as it happens, including partial transfers and
 /// resets. Counting only when copy_bidirectional finishes hid long downloads
 /// and live uploads from the brain entirely.
+#[derive(Default)]
+struct PayloadTotals {
+    upload: AtomicU64,
+    download: AtomicU64,
+    unmeasured: AtomicU64,
+}
+
 struct MeteredStream {
+    payload: Option<Arc<PayloadTotals>>,
+    payload_acknowledged: u64,
     inner: TcpStream,
     path: Option<Arc<Path>>,
     uploaded: u64,
@@ -626,6 +636,8 @@ impl MeteredStream {
             p.busy.fetch_add(1, Ordering::Relaxed);
         }
         Self {
+            payload: None,
+            payload_acknowledged: 0,
             inner,
             path,
             uploaded: 0,
@@ -657,10 +669,25 @@ impl MeteredStream {
     }
 
     fn sample(&mut self) {
+        if self.path.is_none() && self.payload.is_none() {
+            return;
+        }
+        let snapshot = tcp_metrics::snapshot(self.inner.as_raw_fd(), self.uploaded);
+        if let Some(total) = &self.payload {
+            if let Some(s) = snapshot {
+                let acknowledged = s
+                    .acknowledged
+                    .min(self.uploaded)
+                    .max(self.payload_acknowledged);
+                total
+                    .upload
+                    .fetch_add(acknowledged - self.payload_acknowledged, Ordering::Relaxed);
+                self.payload_acknowledged = acknowledged;
+            }
+        }
         let Some(path) = &self.path else {
             return;
         };
-        let snapshot = tcp_metrics::snapshot(self.inner.as_raw_fd(), self.uploaded);
         if let Some(s) = snapshot {
             path.tcp_observed.store(true, Ordering::Relaxed);
             let acked = s.acknowledged.saturating_sub(self.acknowledged);
@@ -750,6 +777,13 @@ fn upload_congested(
 impl Drop for MeteredStream {
     fn drop(&mut self) {
         self.sample();
+        // A transient missing snapshot may recover while the socket is alive.
+        // Report a coverage gap only if it closes with unconfirmed bytes.
+        if let Some(total) = &self.payload
+            && self.uploaded > self.payload_acknowledged
+        {
+            total.unmeasured.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(path) = &self.path {
             path.queued.fetch_sub(self.queued, Ordering::Relaxed);
             if self.busy {
@@ -771,6 +805,9 @@ impl AsyncRead for MeteredStream {
             path.received.fetch_add(bytes, Ordering::Relaxed);
         }
         self.downloaded += bytes;
+        if let Some(total) = &self.payload {
+            total.download.fetch_add(bytes, Ordering::Relaxed);
+        }
         if bytes > 0 {
             self.last_activity = Instant::now();
             self.first_read.get_or_insert_with(Instant::now);
@@ -1176,7 +1213,10 @@ async fn handle_connection(mut client: TcpStream, runtime: Runtime) -> Result<()
     } else {
         runtime.relay_connections.fetch_add(1, Ordering::Relaxed);
     }
+    let direct_payload = path.as_ref().map(|_| runtime.payload.clone());
     let mut outbound = MeteredStream::new(outbound, path);
+    // Hybrid relay traffic is already counted by the TUN payload observer.
+    outbound.payload = direct_payload;
     let result =
         tokio::io::copy_bidirectional_with_sizes(&mut client, &mut outbound, 65_536, 65_536).await;
     runtime.active.fetch_sub(1, Ordering::Relaxed);
@@ -1300,6 +1340,7 @@ async fn probe(runtime: Runtime) {
 }
 
 async fn telemetry(runtime: Runtime) {
+    let payload_source = format!("proxy-{:016x}", rand::random::<u64>());
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut controller = Controller::default();
@@ -1357,6 +1398,11 @@ async fn telemetry(runtime: Runtime) {
             "DIRECT_STATE {}",
             json!({
                 "paths": reports, "healthy_paths": healthy, "assigned_ip": "", "server_ip": "",
+                "payload": {"version":1,"source_id":payload_source,"sampled_at_ms":runtime.epoch.elapsed().as_millis() as u64,
+                    "upload_bytes":runtime.payload.upload.load(Ordering::Relaxed),
+                    "download_bytes":runtime.payload.download.load(Ordering::Relaxed),
+                    "unmeasured_packets":runtime.payload.unmeasured.load(Ordering::Relaxed),
+                    "basis":"tcp_socket_payload"},
                 "active_connections": runtime.active.load(Ordering::Relaxed),
                 "accepted_connections": runtime.accepted.load(Ordering::Relaxed),
                 "direct_connections": runtime.direct_connections.load(Ordering::Relaxed),
@@ -1566,6 +1612,7 @@ pub async fn run_with_guidance(
     );
     let secure_domains = normalize_domains(args.secure_domain)?;
     let runtime = Runtime {
+        payload: Default::default(),
         paths: Arc::new(RwLock::new(paths)),
         policy: Arc::new(AtomicUsize::new(policy_number(args.policy))),
         cursor: Arc::new(AtomicUsize::new(0)),
@@ -1718,6 +1765,7 @@ mod tests {
 
     fn runtime(paths: Vec<Arc<Path>>, policy: Policy) -> Runtime {
         Runtime {
+            payload: Default::default(),
             paths: Arc::new(RwLock::new(paths)),
             policy: Arc::new(AtomicUsize::new(policy_number(policy))),
             cursor: Arc::new(AtomicUsize::new(0)),
@@ -1890,6 +1938,8 @@ mod tests {
         let (mut peer, _) = listener.accept().await?;
         let path = parse_path("en0=192.168.1.2,false")?;
         let mut socket = MeteredStream::new(socket, Some(path.clone()));
+        let totals = Arc::new(PayloadTotals::default());
+        socket.payload = Some(totals.clone());
         let writer = tokio::spawn(async move {
             let mut bytes = vec![];
             peer.read_to_end(&mut bytes).await.unwrap();
@@ -1907,6 +1957,12 @@ mod tests {
         socket.sample();
         assert!(path.acknowledged.load(Ordering::Relaxed) > 0);
         assert!(path.acknowledged.load(Ordering::Relaxed) <= 131_072);
+        assert_eq!(totals.download.load(Ordering::Relaxed), 128);
+        assert!(totals.upload.load(Ordering::Relaxed) > 0);
+        assert!(totals.upload.load(Ordering::Relaxed) <= 131_072);
+        let before = totals.upload.load(Ordering::Relaxed);
+        socket.sample();
+        assert_eq!(totals.upload.load(Ordering::Relaxed), before);
         drop(socket);
         assert_eq!(path.queued.load(Ordering::Relaxed), 0);
         assert_eq!(path.busy.load(Ordering::Relaxed), 0);
@@ -2060,7 +2116,12 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let path = parse_path("lo0=192.0.2.1,false")?;
+        let loopback = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let path = parse_path(&format!("{loopback}=192.0.2.1,false"))?;
         let path = Path {
             address: Ipv4Addr::LOCALHOST,
             ..Arc::into_inner(path).expect("unshared path")

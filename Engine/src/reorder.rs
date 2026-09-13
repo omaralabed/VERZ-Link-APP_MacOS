@@ -1,5 +1,6 @@
 //! Bounded, per-TCP-flow resequencing for unequal-delay links. ACK-only TCP,
 //! UDP and unrelated flows never wait behind a missing bulk segment.
+use serde::Serialize;
 use std::collections::HashMap;
 
 const MAX_FLOWS: usize = 1024;
@@ -16,6 +17,28 @@ const HOLD_MS: u64 = 80;
 pub struct TcpReorder {
     flows: HashMap<[u8; 12], Flow>,
     buffered: usize,
+    stats: ReorderStats,
+}
+
+/// Receiver ordering observations, not application throughput or path RTT.
+#[derive(Clone, Copy, Default, Serialize)]
+pub struct ReorderStats {
+    pub buffered_packets: usize,
+    pub peak_buffered_packets: usize,
+    pub held_packets: u64,
+    pub released_held_packets: u64,
+    pub total_hold_ms: u64,
+    pub max_hold_ms: u64,
+    pub deadline_gap_releases: u64,
+    pub limit_gap_releases: u64,
+}
+impl ReorderStats {
+    fn release(&mut self, arrived: u64, now: u64) {
+        let hold = now.saturating_sub(arrived);
+        self.released_held_packets += 1;
+        self.total_hold_ms += hold;
+        self.max_hold_ms = self.max_hold_ms.max(hold);
+    }
 }
 struct Flow {
     next: u32,
@@ -57,19 +80,31 @@ fn advance(flow: &mut Flow, seq: u32, length: u32) {
         flow.next = end;
     }
 }
-fn flush_contiguous(flow: &mut Flow, output: &mut Vec<Vec<u8>>) {
+fn flush_contiguous(
+    flow: &mut Flow,
+    output: &mut Vec<Vec<u8>>,
+    now: u64,
+    stats: &mut ReorderStats,
+) {
     while let Some(index) = flow
         .pending
         .iter()
         .position(|(seq, _, _, _)| seq.wrapping_sub(flow.next) as i32 <= 0)
     {
-        let (seq, length, _, ip) = flow.pending.swap_remove(index);
+        let (seq, length, arrived, ip) = flow.pending.swap_remove(index);
+        stats.release(arrived, now);
         advance(flow, seq, length);
         output.push(ip);
     }
 }
 
 impl TcpReorder {
+    pub fn snapshot(&self) -> ReorderStats {
+        ReorderStats {
+            buffered_packets: self.buffered,
+            ..self.stats
+        }
+    }
     pub fn push(&mut self, ip: Vec<u8>, now: u64) -> Vec<Vec<u8>> {
         let Some((key, seq, length)) = segment(&ip) else {
             return vec![ip];
@@ -103,12 +138,17 @@ impl TcpReorder {
             && self.buffered < MAX_BUFFERED
         {
             flow.pending.push((seq, length, now, ip));
+            self.stats.held_packets += 1;
         } else {
+            if seq.wrapping_sub(flow.next) as i32 > 0 {
+                self.stats.limit_gap_releases += 1;
+            }
             advance(flow, seq, length);
             output.push(ip);
-            flush_contiguous(flow, &mut output);
+            flush_contiguous(flow, &mut output, now, &mut self.stats);
         }
         self.buffered = self.buffered + flow.pending.len() - before;
+        self.stats.peak_buffered_packets = self.stats.peak_buffered_packets.max(self.buffered);
         output
     }
 
@@ -131,10 +171,12 @@ impl TcpReorder {
                 .min_by_key(|(_, (seq, _, _, _))| seq.wrapping_sub(flow.next))
                 .map(|(i, _)| i)
                 .unwrap();
-            let (seq, length, _, ip) = flow.pending.swap_remove(index);
+            let (seq, length, arrived, ip) = flow.pending.swap_remove(index);
+            self.stats.release(arrived, now);
+            self.stats.deadline_gap_releases += 1;
             advance(flow, seq, length);
             output.push(ip);
-            flush_contiguous(flow, &mut output);
+            flush_contiguous(flow, &mut output, now, &mut self.stats);
             self.buffered -= before - flow.pending.len();
         }
         output

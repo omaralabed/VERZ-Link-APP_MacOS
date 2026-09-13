@@ -8,7 +8,7 @@ protocol VERZSessionServiceProtocol {
                withReply reply: @escaping (Int32, String) -> Void)
 }
 
-let serviceName = "com.verz.link.session-service"
+let serviceName = "com.omaralabed.verzlink.classic.session-service"
 var executableBuffer = [CChar](repeating: 0, count: 4096)
 guard proc_pidpath(getpid(), &executableBuffer, UInt32(executableBuffer.count)) > 0 else { exit(1) }
 let executable = URL(fileURLWithPath: String(cString: executableBuffer)).resolvingSymlinksInPath()
@@ -50,7 +50,24 @@ final class Sessions {
         guard users.count < 16 else { return false }
         return users.insert(uid).inserted
     }
-    func release(_ uid: uid_t) { lock.lock(); users.remove(uid); lock.unlock() }
+    func release(_ uid: uid_t) {
+        lock.lock()
+        users.remove(uid)
+        let idle = users.isEmpty
+        lock.unlock()
+        guard idle else { return }
+        // A launchd Mach service does not need to remain resident between VERZ
+        // sessions. Exiting after the reply prevents an in-place Xcode rebuild
+        // from leaving a stale signed process behind; launchd starts the
+        // current bundled executable on the next connection.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillIdle = self.users.isEmpty
+            self.lock.unlock()
+            if stillIdle { exit(0) }
+        }
+    }
 }
 
 final class Controller: NSObject, VERZSessionServiceProtocol {
@@ -108,7 +125,7 @@ final class Delegate: NSObject, NSXPCListenerDelegate {
     let team: String
     init(team: String) {
         self.team = team
-        self.requirement = "anchor apple generic and identifier \"com.verz.link.mac\" and certificate leaf[subject.OU] = \"\(team)\""
+        self.requirement = "anchor apple generic and identifier \"com.omaralabed.verzlink.classic\" and certificate leaf[subject.OU] = \"\(team)\""
     }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard connection.effectiveUserIdentifier >= 501 else { return false }

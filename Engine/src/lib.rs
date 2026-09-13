@@ -6,9 +6,14 @@
 pub mod bond;
 pub mod brain;
 pub mod direct;
+pub mod egress;
+pub mod intake;
+pub mod payload_meter;
 pub mod reorder;
 mod tcp_metrics;
 pub mod tunnel;
+pub mod udp_lane;
+mod udp_reassembly;
 
 use std::{
     fs,
@@ -439,7 +444,81 @@ pub fn recovery_decision(
     })
 }
 
-pub fn bind_interface_socket(interface: &str, relay: SocketAddr) -> Result<UdpSocket> {
+/// Query physical carrier without waiting for the UI's interface inventory.
+/// Unknown driver/media status leaves authenticated path probes authoritative.
+#[cfg(target_os = "macos")]
+pub fn interface_carrier(socket: &impl std::os::fd::AsRawFd, interface: &str) -> Option<bool> {
+    // The independent UDP engine treats IFF_UP + IFF_RUNNING as the first
+    // carrier gate. Do the same here before consulting SIOCGIFMEDIA. Some USB
+    // Ethernet drivers leave the media status active for several seconds
+    // after a physical cable pull even though IFF_RUNNING clears immediately.
+    // Returning false here lets the scheduler notify the peer and repair
+    // outstanding TCP packets on a surviving path without waiting for probes.
+    let mut flags: libc::ifreq = unsafe { std::mem::zeroed() };
+    if interface.len() >= libc::IFNAMSIZ || interface.as_bytes().contains(&0) {
+        return None;
+    }
+    for (destination, source) in flags
+        .ifr_name
+        .iter_mut()
+        .zip(interface.as_bytes().iter().copied())
+    {
+        *destination = source as libc::c_char;
+    }
+    // SAFETY: the borrowed datagram socket remains valid, `flags` has libc's
+    // Darwin ifreq layout, and SIOCGIFFLAGS writes only that local structure.
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut flags) } == 0 {
+        let value = unsafe { flags.ifr_ifru.ifru_flags } as libc::c_int;
+        if value & (libc::IFF_UP | libc::IFF_RUNNING) != libc::IFF_UP | libc::IFF_RUNNING {
+            return Some(false);
+        }
+    }
+
+    // Darwin net/if.h uses #pragma pack(4) for ifmediareq, including on arm64.
+    #[repr(C, packed(4))]
+    struct MediaRequest {
+        name: [u8; libc::IFNAMSIZ],
+        current: libc::c_int,
+        mask: libc::c_int,
+        status: libc::c_int,
+        active: libc::c_int,
+        count: libc::c_int,
+        list: *mut libc::c_int,
+    }
+    let mut req = MediaRequest {
+        name: [0; libc::IFNAMSIZ],
+        current: 0,
+        mask: 0,
+        status: 0,
+        active: 0,
+        count: 0,
+        list: std::ptr::null_mut(),
+    };
+    req.name[..interface.len()].copy_from_slice(interface.as_bytes());
+    // SIOCGIFMEDIA = _IOWR('i', 56, struct ifmediareq), from Darwin sockio.h.
+    let command = 0xc000_0000
+        | ((std::mem::size_of::<MediaRequest>() as libc::c_ulong) << 16)
+        | ((b'i' as libc::c_ulong) << 8)
+        | 56;
+    // SAFETY: socket is borrowed; req has Darwin's exact C layout and remains
+    // alive throughout ioctl. count=0 means no external media list is written.
+    let result = unsafe { libc::ioctl(socket.as_raw_fd(), command, &mut req) };
+    if result != 0 || req.status & 1 == 0 {
+        return None;
+    }
+    Some(req.status & 2 != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn interface_carrier(_socket: &impl std::os::fd::AsRawFd, _interface: &str) -> Option<bool> {
+    None
+}
+
+/// Create and bind the operating-system socket without registering it with a
+/// Tokio reactor. Re-opening an adapter can block in the kernel while carrier
+/// or routing is changing, so live data planes use this from `spawn_blocking`
+/// and convert it to `tokio::net::UdpSocket` only after it is ready.
+pub fn bind_interface_std_socket(interface: &str, relay: SocketAddr) -> Result<StdUdpSocket> {
     if !relay.is_ipv4() {
         bail!("the first lab build supports IPv4 relay addresses only");
     }
@@ -451,7 +530,12 @@ pub fn bind_interface_socket(interface: &str, relay: SocketAddr) -> Result<UdpSo
         .connect(relay)
         .with_context(|| format!("connect {interface} to {relay}"))?;
     socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket).context("register UDP socket with Tokio")
+    Ok(socket)
+}
+
+pub fn bind_interface_socket(interface: &str, relay: SocketAddr) -> Result<UdpSocket> {
+    UdpSocket::from_std(bind_interface_std_socket(interface, relay)?)
+        .context("register UDP socket with Tokio")
 }
 
 /// Size this socket for short packet bursts without changing host-wide sysctls.

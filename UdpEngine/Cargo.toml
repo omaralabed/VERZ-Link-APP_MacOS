@@ -1,0 +1,21 @@
+[package]
+name = "verz-udp-proxy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+verz-link-core = { path = "../Engine/vendor/verz-link-core" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snow = "0.10"
+sha2 = "0.10"
+rand = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

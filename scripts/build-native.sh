@@ -2,6 +2,7 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
+swift scripts/verify-udp-signing.swift --source "$PROJECT_DIR"
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 OUTPUT="$PROJECT_DIR/.build/Native"
@@ -26,10 +27,10 @@ for arch in arm64 x86_64; do
     xcrun swiftc -swift-version 5 -O -target "$arch-apple-macos14.0" HelperService/main.swift -o "$OUTPUT/verz-session-service-$arch"
 done
 lipo -create "$OUTPUT/verz-session-service-arm64" "$OUTPUT/verz-session-service-x86_64" -output "$OUTPUT/verz-session-service"
-codesign --force --sign "$VERZ_SIGN_IDENTITY" --identifier com.verz.link.session-service "$OUTPUT/verz-session-service"
+codesign --force --sign "$VERZ_SIGN_IDENTITY" --identifier com.omaralabed.verzlink.classic.session-service "$OUTPUT/verz-session-service"
 if [ -n "${TARGET_BUILD_DIR:-}" ] && [ -n "${CONTENTS_FOLDER_PATH:-}" ]; then
     mkdir -p "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchDaemons"
-    install -m 644 Resources/com.verz.link.session-service.plist "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchDaemons/com.verz.link.session-service.plist"
+    install -m 644 Resources/com.omaralabed.verzlink.classic.session-service.plist "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchDaemons/com.omaralabed.verzlink.classic.session-service.plist"
 fi
 if [ -f "Resources/AppIcon.icns" ]; then
     cp "Resources/AppIcon.icns" "$OUTPUT/AppIcon.icns"
