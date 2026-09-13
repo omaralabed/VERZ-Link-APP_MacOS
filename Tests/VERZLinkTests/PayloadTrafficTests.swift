@@ -2,9 +2,10 @@ import XCTest
 @testable import VERZLink
 
 final class PayloadTrafficTests: XCTestCase {
-    private func report(_ ms: UInt64, _ up: UInt64, _ down: UInt64, source: String = "a", missed: UInt64 = 0) -> PayloadTelemetry {
+    private func report(_ ms: UInt64, _ up: UInt64, _ down: UInt64, source: String = "a",
+                        missed: UInt64 = 0, basis: String = "tcp_socket_payload") -> PayloadTelemetry {
         PayloadTelemetry(version: 1, sourceId: source, sampledAtMs: ms,
-                         uploadBytes: up, downloadBytes: down, unmeasuredPackets: missed, basis: "tcp_socket_payload")
+                         uploadBytes: up, downloadBytes: down, unmeasuredPackets: missed, basis: basis)
     }
     func testRatesUseProducerTimeNotBunchedUICallbacks() {
         var meter = PayloadRateTracker()
@@ -103,5 +104,17 @@ final class PayloadTrafficTests: XCTestCase {
         XCTAssertTrue(meter.incompleteTotals)
         XCTAssertEqual(meter.rate(at: 4)!.up, 8)
         XCTAssertEqual(meter.uploaded, 4_000_000)
+    }
+    func testUDPProviderEnvelopeDecodesUniqueDatagramCounters() throws {
+        let data = Data(#"{"payload":{"version":1,"source_id":"udp-1","sampled_at_ms":2000,"upload_bytes":750000,"download_bytes":250000,"unmeasured_packets":0,"basis":"udp_datagrams"}}"#.utf8)
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let payload = try XCTUnwrap(decoder.decode(UDPProviderTelemetry.self, from: data).payload)
+        var meter = PayloadRateTracker()
+        meter.receive(report(1000, 0, 0, source: "udp-1", basis: "udp_datagrams"), at: 1)
+        meter.receive(payload, at: 2)
+        XCTAssertEqual(meter.rate(at: 2)!.up, 6, accuracy: 0.0001)
+        XCTAssertEqual(meter.rate(at: 2)!.down, 2, accuracy: 0.0001)
+        XCTAssertEqual(meter.uploaded, 750_000)
+        XCTAssertEqual(meter.downloaded, 250_000)
     }
 }

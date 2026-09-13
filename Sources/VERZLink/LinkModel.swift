@@ -125,6 +125,10 @@ struct UDPPathTelemetry {
     let downloadMbps: Double
 }
 
+struct UDPProviderTelemetry: Decodable {
+    let payload: PayloadTelemetry?
+}
+
 struct BrainState: Decodable {
     let connected: Bool
     let generation: UInt64
@@ -173,6 +177,9 @@ final class LinkModel: ObservableObject {
     private var pathRateSample: (at: Date, paths: [String: (sent: UInt64, received: UInt64)])?
     @Published var udpPaths: [String: UDPPathTelemetry] = [:]
     private var udpTelemetryTime: Date?
+    private var udpPayloadMeter = PayloadRateTracker()
+    private var interfaceReceivedMbps = 0.0
+    private var interfaceSentMbps = 0.0
     @Published var privateServerIP = "10.78.0.1"
     @Published var brainConnected = false
     @Published var brainGeneration: UInt64 = 0
@@ -248,6 +255,15 @@ final class LinkModel: ObservableObject {
         udpConnection.onTelemetry = { [weak self] data in
             guard let self, let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
             let now = Date()
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            if let payload = try? decoder.decode(UDPProviderTelemetry.self, from: data).payload {
+                let previousUploaded = self.udpPayloadMeter.uploaded
+                let previousDownloaded = self.udpPayloadMeter.downloaded
+                self.udpPayloadMeter.receive(payload, at: now.timeIntervalSinceReferenceDate)
+                self.sentBytes += self.udpPayloadMeter.uploaded - previousUploaded
+                self.receivedBytes += self.udpPayloadMeter.downloaded - previousDownloaded
+                self.refreshHeadlineRates(at: now)
+            }
             let elapsed = self.udpTelemetryTime.map { now.timeIntervalSince($0) } ?? 0
             let names = object["adapters"] as? [String: String] ?? [:]
             let wire = object["wire"] as? [String: [String: NSNumber]] ?? [:]
@@ -324,7 +340,8 @@ final class LinkModel: ObservableObject {
         publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
         pathRates = [:]; pathRateSample = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
-        udpPaths = [:]; udpTelemetryTime = nil
+        interfaceReceivedMbps = 0; interfaceSentMbps = 0
+        udpPaths = [:]; udpTelemetryTime = nil; udpPayloadMeter = PayloadRateTracker()
         brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
         directHealthyPaths = 0; secureHealthyPaths = 0
         sessionID = UUID()
@@ -476,6 +493,7 @@ final class LinkModel: ObservableObject {
             brainConnected = false; brainGeneration = 0; directHealthyPaths = 0; secureHealthyPaths = 0
             runner?.cancel(); testTask?.cancel(); testRunning = false
             session = nil; receivedMbps = 0; sentMbps = 0; publicIP = nil
+            interfaceReceivedMbps = 0; interfaceSentMbps = 0; udpPayloadMeter = PayloadRateTracker()
             refreshInterfaces()
             log(restorationFailed ? "Disconnected · check Activity for network restoration errors" : "Disconnected · network restoration finished")
             whenDisconnected?(); whenDisconnected = nil
@@ -709,11 +727,24 @@ final class LinkModel: ObservableObject {
         }
         lastInterfaceCounters = current
         let seconds = max(lastSampleAt.map { now.timeIntervalSince($0) } ?? 1, 0.01)
-        receivedMbps = Double(receivedDelta) * 8 / seconds / 1_000_000
-        sentMbps = Double(sentDelta) * 8 / seconds / 1_000_000
+        interfaceReceivedMbps = Double(receivedDelta) * 8 / seconds / 1_000_000
+        interfaceSentMbps = Double(sentDelta) * 8 / seconds / 1_000_000
         receivedBytes += receivedDelta; sentBytes += sentDelta; lastSampleAt = now
+        refreshHeadlineRates(at: now)
         samples.append(TrafficSample(received: receivedMbps, sent: sentMbps))
         if samples.count > 60 { samples.removeFirst(samples.count - 60) }
+    }
+
+    /// Secure Continuity's TCP engine is visible on its tunnel interface, while
+    /// the independent UDP extension bypasses that interface. Add the UDP
+    /// provider's unique application datagrams once; never add per-WAN wire
+    /// counters because continuity copies would inflate the displayed speed.
+    private func refreshHeadlineRates(at now: Date) {
+        let udpRate = mode == .secure
+            ? udpPayloadMeter.rate(at: now.timeIntervalSinceReferenceDate)
+            : nil
+        receivedMbps = interfaceReceivedMbps + (udpRate?.down ?? 0)
+        sentMbps = interfaceSentMbps + (udpRate?.up ?? 0)
     }
 
     nonisolated private static func fetchPublicIP(proxy: String?) async -> String? {
