@@ -100,7 +100,7 @@ struct ContentView: View {
         switch model.selectedPage {
         case "Diagnostics": return "Measure the connection carrying your Mac’s traffic."
         case "Activity": return "A live record of your connection and test results."
-        case "Settings": return "Choose direct acceleration or encrypted continuity."
+        case "Settings": return "Your profile, protection summary and advanced options."
         default: return model.mode == .secure ? "Your networks. One encrypted connection."
             : model.mode == .hybrid ? "Direct speed. Encrypted continuity when needed."
             : "Your networks. Direct, adaptive flow steering."
@@ -126,9 +126,9 @@ struct ContentView: View {
                         Picker("Connection mode", selection: $model.mode) {
                             ForEach(TransportMode.allCases) { mode in Text(mode.title).tag(mode) }
                         }.pickerStyle(.segmented).disabled(model.busy)
-                        Text(model.mode == .direct ? "No relay and no VERZ payload encryption. TCP connections are assigned directly across the selected adapters and stay on that adapter for life."
-                             : model.mode == .hybrid ? "Direct-first flow steering with a warm encrypted relay. Secure-domain rules, calls, live streams and failed direct connections use the relay."
-                             : "Everything through the encrypted relay: one stable public IP and session-preserving failover across all links.")
+                        Text(model.mode == .direct ? "No VERZ server. Each connection uses one adapter directly and stays on it for its whole life."
+                             : model.mode == .hybrid ? "Direct first. Calls, live streams, listed sites and any direct connection that fails use the encrypted VERZ server."
+                             : "Everything through the encrypted VERZ server: one stable public IP and connections that survive link failures.")
                             .font(.system(size: 10)).foregroundStyle(muted)
                         Text("Links · what should several links be used for?").font(.system(size: 11, weight: .medium)).padding(.top, 4)
                         Picker("Connection preference", selection: $model.policy) {
@@ -155,8 +155,8 @@ struct ContentView: View {
                         eyebrow("CONNECTION STATUS")
                         Text(model.state.rawValue).font(.system(size: 29, weight: .medium))
                         Text(model.state == .connected
-                             ? (model.mode == .secure ? "Internet traffic uses the encrypted VERZ relay."
-                                : model.mode == .hybrid ? "Direct and secure paths are active; the encrypted brain advises flow placement."
+                             ? (model.mode == .secure ? "Internet traffic is protected by the encrypted VERZ server."
+                                : model.mode == .hybrid ? "Direct and protected paths are active and optimised automatically."
                                 : "Supported TCP applications use direct flows across your enabled networks.")
                              : model.state == .reconnecting
                              ? (model.mode == .secure ? "Waiting for a usable path. Your secure tunnel stays in place." : "No direct path is healthy; adapters continue probing.")
@@ -190,7 +190,7 @@ struct ContentView: View {
                 }
                 Divider().overlay(.white.opacity(0.03))
                 HStack(spacing: 16) {
-                    detail(model.mode == .secure ? "RELAY" : "DATA PATH",
+                    detail(model.mode == .secure ? "VERZ SERVER" : "DATA PATH",
                            model.mode == .secure ? model.relay : model.mode == .hybrid ? "Direct + selective relay" : "Direct to destination")
                     Spacer()
                     detail("PUBLIC IPv4", model.publicIP ?? (model.state == .connected ? "Verifying…" : "—"))
@@ -324,9 +324,9 @@ struct ContentView: View {
                     ProgressView(value: model.testProgress)
                     Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint)
                 } else if model.mode == .direct {
-                    Label("These relay diagnostics belong to Secure Continuity. Use a browser speed test for Direct Smart.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
+                    Label("These diagnostics measure the protected VERZ connection. Use a browser speed test for Direct, no server.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
                 } else if model.state != .connected {
-                    Label("Connect with Secure Continuity before starting a relay test.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
+                    Label("Connect with a protected connection before starting a test.", systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(muted)
                 } else if !model.testStage.isEmpty { Text(model.testStage).font(.system(size: 12)).foregroundStyle(mint) }
             }.padding(24).card()
             if let result = model.result {
@@ -352,7 +352,7 @@ struct ContentView: View {
                 VStack(spacing: 14) {
                     Image(systemName: "waveform.path.ecg").font(.system(size: 38, weight: .ultraLight)).foregroundStyle(mint)
                     Text("Your first measurement starts here").font(.system(size: 16))
-                    Text("Results will be saved on this Mac. No generated numbers.").font(.system(size: 12)).foregroundStyle(muted)
+                    Text("Results are saved on this Mac.").font(.system(size: 12)).foregroundStyle(muted)
                 }.frame(maxWidth: .infinity).padding(.vertical, 70).card()
             }
             Label("100 ms maximum failover disruption is a release gate. Passing ping or file-transfer checks alone does not validate that gate.", systemImage: "hammer")
@@ -375,83 +375,75 @@ struct ContentView: View {
         }
     }
 
+    @State private var showServerOverride = false
+    @State private var showSettingsAdvanced = false
+
     private var settings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 16) {
-                eyebrow("ARCHITECTURE")
-                settingRow("Selected mode", model.mode.title)
-                settingRow("Data route", model.mode == .secure ? "Encrypted relay"
-                           : model.mode == .hybrid ? "Direct with selective encrypted relay" : "Direct to destination")
-                settingRow("VERZ payload encryption", model.mode == .secure ? "All payloads"
-                           : model.mode == .hybrid ? "Escalated payloads only" : "None")
-                Text("HTTPS, TLS, and other application encryption remain unchanged in every mode. The Direct Smart engine never decrypts or inspects payloads.")
-                    .font(.system(size: 11)).foregroundStyle(muted)
-            }.padding(24).card()
-            if model.mode != .direct {
             VStack(alignment: .leading, spacing: 18) {
-                eyebrow(model.mode == .hybrid ? "HYBRID SECURITY" : "SECURE CONTINUITY RELAY")
-                if model.mode == .secure {
-                    Text("Server address").font(.system(size: 13, weight: .medium))
-                    TextField("IPv4:port", text: $model.relay).textFieldStyle(.roundedBorder).disabled(model.busy)
-                    Text("Use the same relay profile on another Mac. Each connection receives its own encrypted session and private IPv4 address.")
-                        .font(.system(size: 12)).foregroundStyle(muted)
-                } else {
-                    HStack {
-                        Label(model.brainConnected ? "Encrypted brain connected" : "Local policy fallback",
-                              systemImage: model.brainConnected ? "brain.head.profile.fill" : "brain.head.profile")
-                            .foregroundStyle(model.brainConnected ? mint : muted)
-                        Spacer()
-                        Text(model.brainConnected ? "ADVICE #\(model.brainGeneration)" : "OFFLINE-SAFE")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(muted)
-                    }.font(.system(size: 12))
-                    Text("The encrypted brain learns from per-link TCP delivery, byte counts, timing and reachability. Unknown connections use conservative upload/download estimates, not a previous connection's direction. The Mac detects upload congestion locally and keeps its own controller during outages. No payloads or destinations are sent to the brain.")
-                        .font(.system(size: 11)).foregroundStyle(muted)
-                    if model.brainConnected {
-                        Text(model.brainLearnedPaths == 0 ? "Learning from traffic as you use the connection…"
-                             : "Transfer performance observed on \(model.brainLearnedPaths) links")
-                            .font(.system(size: 11)).foregroundStyle(mint)
-                    }
-                    Divider()
-                    Text("Always use Secure Continuity for these domains").font(.system(size: 13, weight: .medium))
-                    TextEditor(text: $model.secureDomainsText)
-                        .font(.system(size: 11, design: .monospaced))
-                        .frame(height: 76).padding(6)
-                        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 7))
-                        .disabled(model.busy)
-                    Text("Add call and live-stream domains before starting them; encrypted traffic on port 443 cannot be identified reliably. Recognized RTMP/RTSP/SIP/TURN ports also use the warm relay. Continuity preference relays all new supported TCP flows. Direct sessions cannot migrate to a different public IP.")
-                        .font(.system(size: 11)).foregroundStyle(muted)
-                }
-                Divider()
+                eyebrow("ACCOUNT")
                 HStack {
-                    Label(model.hasCredential ? "Connection key installed" : "Connection key required", systemImage: model.hasCredential ? "checkmark.shield" : "key")
+                    Label(model.hasCredential ? "Profile installed" : "Profile required", systemImage: model.hasCredential ? "checkmark.shield" : "key")
                         .foregroundStyle(model.hasCredential ? mint : .orange)
                     Spacer()
-                    Button("Import profile or key…") { model.importKey() }.disabled(model.busy)
+                    Button("Import profile…") { model.importKey() }.disabled(model.busy)
                 }.font(.system(size: 12))
-                Button("Export private profile for another Mac…") { model.exportProfile() }.disabled(!model.hasCredential)
-                Text("The app never contains your key. Profiles include relay access credentials: transfer them privately. Credentials are stored in a permission-restricted file on this Mac.")
+                Button("Export profile for another Mac…") { model.exportProfile() }.disabled(!model.hasCredential)
+                Text("Your profile contains your access credentials. Share it only privately; it is stored in a permission-restricted file on this Mac.")
                     .font(.system(size: 11)).foregroundStyle(muted)
             }.padding(24).card()
-            }
             VStack(alignment: .leading, spacing: 16) {
-                eyebrow("THIS BUILD")
-                settingRow("Networking engine", model.mode == .secure ? "Rust · native system tunnel"
-                           : model.mode == .hybrid ? "Rust · direct + warm secure tunnel" : "Rust · local TCP flow engine")
-                settingRow("Authentication", model.mode == .direct ? "Local signed helper" : "Noise PSK + ephemeral X25519")
-                settingRow("Traffic", model.mode == .secure ? "IPv4 internet + DNS through relay"
-                           : model.mode == .hybrid ? "Proxy-aware TCP direct or selectively relayed" : "Proxy-aware IPv4 TCP direct")
-                settingRow("DNS", model.mode == .secure ? "Relay DNS while connected" : "Existing Mac DNS settings preserved")
-                settingRow("IPv6", model.mode == .secure ? "Blocked by tunnel routes while connected" : "Direct support pending")
-                settingRow("Local network", "Existing more-specific LAN routes remain local")
-                settingRow("Uplinks", "Dynamic Wi-Fi and Ethernet paths")
-                settingRow("Distribution", "Universal · macOS 14+ · development-signed")
-                Divider()
-                Text(model.mode == .secure
-                     ? "Secure Continuity uses the current test relay. Production enrollment and audited release gates are not complete."
-                     : model.mode == .hybrid
-                     ? "Proxy-aware TCP is classified by Hybrid. Traffic that does not honor the system SOCKS proxy currently stays on the warm secure tunnel; transparent per-flow UDP/QUIC classification requires the Apple Network Extension production gate."
-                     : "Direct Smart currently covers macOS applications that honor the system SOCKS proxy. Transparent UDP/QUIC and single-session migration require the Apple Network Extension production gate.")
-                    .font(.system(size: 12)).foregroundStyle(muted)
+                eyebrow("PROTECTION")
+                settingRow("Connection", model.preset == .custom ? "Custom" : model.preset.title)
+                settingRow("Encryption", model.mode == .secure ? "All traffic encrypted to the VERZ server"
+                           : model.mode == .hybrid ? "Calls, streams and listed sites encrypted" : "Application encryption only")
+                settingRow("Public IP", model.mode == .secure ? "Stable" : model.mode == .hybrid ? "Stable for encrypted traffic" : "Changes with the active link")
+                settingRow("Link failure", model.policy == "continuity" && model.mode != .direct ? "No drop"
+                           : model.mode == .direct ? "Connections on the failed link end" : "Brief pause, connections continue")
+                Text("HTTPS and other application encryption always remain in place. VERZ never inspects your content.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+            }.padding(24).card()
+            VStack(alignment: .leading, spacing: 14) {
+                DisclosureGroup(isExpanded: $showSettingsAdvanced) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if model.mode != .direct {
+                            HStack {
+                                Text("VERZ server").font(.system(size: 12))
+                                Spacer()
+                                if showServerOverride {
+                                    TextField("IPv4:port", text: $model.relay).textFieldStyle(.roundedBorder).frame(width: 190).disabled(model.busy)
+                                } else {
+                                    Text(model.relay).font(.system(size: 12, design: .monospaced)).foregroundStyle(muted)
+                                    Button("Change…") { showServerOverride = true }.disabled(model.busy).controlSize(.small)
+                                }
+                            }
+                            Text("The server comes from your profile. Change it only if your organisation runs its own VERZ server.")
+                                .font(.system(size: 11)).foregroundStyle(muted)
+                        }
+                        if model.mode == .hybrid {
+                            Divider()
+                            Text("Always protect these sites").font(.system(size: 13, weight: .medium))
+                            TextEditor(text: $model.secureDomainsText)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(height: 76).padding(6)
+                                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 7))
+                                .disabled(model.busy)
+                            Text("One domain per line. Add call and streaming services before you start them; connections already open keep their current route.")
+                                .font(.system(size: 11)).foregroundStyle(muted)
+                        }
+                        Divider()
+                        Text("Route and link options are under Advanced on the Connection page.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                    }.padding(.top, 10)
+                } label: {
+                    eyebrow("ADVANCED")
+                }.onAppear { if model.preset == .custom { showSettingsAdvanced = true } }
+            }.padding(24).card()
+            VStack(alignment: .leading, spacing: 16) {
+                eyebrow("ABOUT")
+                settingRow("Version", "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "–"))")
+                settingRow("Requires", "macOS 14 or later · Apple silicon and Intel")
+                settingRow("Support", "Use Activity to copy a connection log when contacting support")
             }.padding(24).card()
         }
     }
