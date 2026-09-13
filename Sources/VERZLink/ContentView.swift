@@ -255,8 +255,9 @@ struct ContentView: View {
                         VStack(alignment: .trailing, spacing: 4) {
                             Text(path.state == "offline" ? "Offline" : path.uploadHeld == true
                                  ? "Upload congested · new flows prefer another link" : (path.latencyExcluded == true || path.realtimePreferred == false)
-                                 ? "Transfers · calls prefer another link" : path.state.capitalized)
+                                 ? "Transfers · calls prefer another link" : "Web & transfers · \(path.state.capitalized)")
                                 .foregroundStyle(path.state == "healthy" ? mint : muted)
+                                .lineLimit(1)
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
                             let rate = model.pathRates[path.name] ?? (upMbps: 0, downMbps: 0)
                             Text(String(format: "↑ %.2f  ↓ %.2f Mbps", rate.upMbps, rate.downMbps))
@@ -272,7 +273,7 @@ struct ContentView: View {
                                     Text("Upload delivery: not measured yet").foregroundStyle(muted)
                                 }
                             }
-                        }.font(.system(size: 10))
+                        }.font(.system(size: 10)).frame(width: 180, alignment: .trailing)
                     }
                     if let udp = model.udpPaths[interface.name], model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
@@ -281,9 +282,9 @@ struct ContentView: View {
                             Text(String(format: "↑ %.2f  ↓ %.2f Mbps", udp.uploadMbps, udp.downloadMbps))
                                 .font(.system(size: 12, weight: .semibold)).monospacedDigit()
                                 .foregroundStyle(udp.healthy ? Color.primary : muted)
-                                .help("Live traffic of the streams-and-calls lane on this link (SRT, RTP, WebRTC, QUIC), including protection copies.")
-                            Text("SRT · RTP · WebRTC · QUIC (UDP lane) · includes copies")
-                        }.font(.system(size: 10)).foregroundStyle(muted)
+                                .help("Live traffic of the streams-and-calls lane on this link (SRT, RTP, WebRTC, QUIC over UDP), including protection copies.")
+                            Text("UDP lane · includes copies")
+                        }.font(.system(size: 10)).foregroundStyle(muted).frame(width: 150, alignment: .trailing)
                     }
                     Toggle("Use", isOn: Binding(get: { !model.disabledInterfaces.contains(interface.name) },
                         set: { model.setInterface(interface.name, enabled: $0) })).toggleStyle(.switch).controlSize(.small)
