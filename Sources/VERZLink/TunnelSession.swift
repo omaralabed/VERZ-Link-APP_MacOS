@@ -76,7 +76,7 @@ final class TunnelSession: @unchecked Sendable {
         do {
             for name in ["verz-bond"] {
                 guard let binary = Bundle.main.url(forResource: name, withExtension: nil) else {
-                    throw LinkError.message("The app is missing its Rust engine. Rebuild VERZ Link.")
+                    throw LinkError.message("The app is damaged. Please reinstall VERZ Link.")
                 }
                 let staged = directory.appendingPathComponent(name)
                 try manager.copyItem(at: binary, to: staged)
@@ -119,7 +119,7 @@ final class TunnelSession: @unchecked Sendable {
             }
         }
         guard status == 0, Darwin.listen(fd, 1) == 0 else {
-            throw LinkError.message("Could not listen for the Rust engine.")
+            throw LinkError.message("Could not start the connection engine.")
         }
         _ = chmod(directory.appendingPathComponent("app.sock").path, 0o600)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global(qos: .userInitiated))

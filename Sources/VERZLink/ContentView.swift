@@ -54,11 +54,11 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 7) {
                         Circle().fill(model.state == .connected ? mint : muted).frame(width: 6, height: 6)
-                        Text(model.state == .connected ? "RUST ENGINE ACTIVE" : "RUST ENGINE READY")
+                        Text(model.state == .connected ? "PROTECTED" : "READY")
                             .font(.system(size: 9, weight: .bold)).tracking(0.8)
                     }.foregroundStyle(model.state == .connected ? mint : muted)
-                    Text("Native macOS · v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")").font(.system(size: 11)).foregroundStyle(muted)
-                    Text("Development build").font(.system(size: 10)).foregroundStyle(muted.opacity(0.65))
+                    Text("VERZ Link \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.system(size: 11)).foregroundStyle(muted)
+                    Text("Build \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")").font(.system(size: 10)).foregroundStyle(muted.opacity(0.65))
                 }.padding(.bottom, 24)
             }.padding(.horizontal, 22).frame(width: 214)
                 .background(Color(red: 0.035, green: 0.047, blue: 0.060))

@@ -144,7 +144,7 @@ do {
         let team = try signingTeam()
         try verifyExecutable(resources.appendingPathComponent("verz-bond"), identifier: "com.verz.link.engine", team: team)
         try verifyExecutable(resources.appendingPathComponent("verz-app-helper"), identifier: "com.verz.link.helper", team: team)
-        print("Signed VERZ app and Rust executables verified")
+        print("Signed VERZ app and components verified")
         exit(0)
     }
     guard geteuid() == 0 else { throw NSError(domain: serviceName, code: 3) }

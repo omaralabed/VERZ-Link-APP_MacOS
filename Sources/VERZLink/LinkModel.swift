@@ -467,7 +467,7 @@ final class LinkModel: ObservableObject {
         case "flow":
             if let line = event.line { recordFlow(line) }
         case "launch_error":
-            let text = event.line ?? "Unable to start the Rust engine."
+            let text = event.line ?? "Unable to start the connection engine."
             errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
             log(errorMessage!)
         case "session_ended":

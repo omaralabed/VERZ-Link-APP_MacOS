@@ -202,7 +202,7 @@ fn main() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("start Rust networking engine")?;
+        .context("start networking engine")?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let input_tx = stop_tx.clone();
     thread::spawn(move || {
