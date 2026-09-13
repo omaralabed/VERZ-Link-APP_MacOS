@@ -278,7 +278,10 @@ struct ContentView: View {
                         VStack(alignment: .trailing, spacing: 4) {
                             Text(udp.healthy ? "UDP ready" : "UDP waiting").foregroundStyle(udp.healthy ? mint : muted)
                             Text(String(format: "%.1f ms RTT", udp.rtt))
-                            Text(String(format: "↓ %.1f  ↑ %.1f Mbps", udp.downloadMbps, udp.uploadMbps))
+                            Text(String(format: "↑ %.2f  ↓ %.2f Mbps", udp.uploadMbps, udp.downloadMbps))
+                                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                                .foregroundStyle(udp.healthy ? Color.primary : muted)
+                                .help("Live UDP wire traffic on this link, including protection copies.")
                             Text("UDP carrier · includes copies")
                         }.font(.system(size: 10)).foregroundStyle(muted)
                     }

@@ -5,7 +5,7 @@
 <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 <key>CFBundleName</key><string>VERZ Link</string>
 <key>CFBundleDisplayName</key><string>VERZ Link</string>
-<key>CFBundleVersion</key><string>51</string>
+<key>CFBundleVersion</key><string>52</string>
 <key>CFBundleShortVersionString</key><string>0.7.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
