@@ -122,6 +122,9 @@ final class LinkModel: ObservableObject {
     @Published var disabledInterfaces = Set<String>()
     @Published var meteredInterfaces = Set<String>()
     @Published var bondTelemetry: BondTelemetry?
+    /// Live per-path wire rate in Mbps, from consecutive engine reports.
+    @Published var pathRates: [String: (upMbps: Double, downMbps: Double)] = [:]
+    private var pathRateSample: (at: Date, paths: [String: (sent: UInt64, received: UInt64)])?
     @Published var udpPaths: [String: UDPPathTelemetry] = [:]
     private var udpTelemetryTime: Date?
     @Published var privateServerIP = "10.78.0.1"
@@ -273,6 +276,7 @@ final class LinkModel: ObservableObject {
         state = .authorizing
         restorationFailed = false
         publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
+        pathRates = [:]; pathRateSample = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
         udpPaths = [:]; udpTelemetryTime = nil
         brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
@@ -370,6 +374,7 @@ final class LinkModel: ObservableObject {
                     }
                     let previous = bondTelemetry
                     bondTelemetry = report
+                    updatePathRates(report)
                     if !report.serverIp.isEmpty { privateServerIP = report.serverIp }
                     for path in report.paths {
                         if previous?.paths.first(where: { $0.name == path.name })?.state != path.state {
@@ -389,6 +394,7 @@ final class LinkModel: ObservableObject {
                 if let report = try? decoder.decode(BondTelemetry.self, from: data) {
                     let previous = bondTelemetry
                     bondTelemetry = report
+                    updatePathRates(report)
                     directHealthyPaths = report.healthyPaths
                     for path in report.paths where previous?.paths.first(where: { $0.name == path.name })?.state != path.state {
                         log("\(path.name): \(path.state)")
@@ -600,6 +606,30 @@ final class LinkModel: ObservableObject {
             state = .connected
             log("Delivery restored without creating a new Hybrid session")
         }
+    }
+
+    private func updatePathRates(_ report: BondTelemetry) {
+        let now = Date()
+        let current = Dictionary(uniqueKeysWithValues: report.paths.map { ($0.name, (sent: $0.sentBytes, received: $0.receivedBytes)) })
+        guard let last = pathRateSample else { pathRateSample = (now, current); return }
+        let seconds = now.timeIntervalSince(last.at)
+        guard seconds >= 0.2 else { return }
+        pathRateSample = (now, current)
+        var rates = pathRates
+        for (name, counters) in current {
+            // A rejoined path restarts its counters; treat a decrease as zero.
+            let up = counters.sent >= (last.paths[name]?.sent ?? counters.sent) ? counters.sent - (last.paths[name]?.sent ?? counters.sent) : 0
+            let down = counters.received >= (last.paths[name]?.received ?? counters.received) ? counters.received - (last.paths[name]?.received ?? counters.received) : 0
+            let sample = (upMbps: Double(up) * 8 / seconds / 1_000_000, downMbps: Double(down) * 8 / seconds / 1_000_000)
+            // Two-report smoothing hides 500 ms sampling jitter without lagging.
+            if let old = rates[name] {
+                rates[name] = (0.5 * old.upMbps + 0.5 * sample.upMbps, 0.5 * old.downMbps + 0.5 * sample.downMbps)
+            } else {
+                rates[name] = sample
+            }
+        }
+        for name in rates.keys where current[name] == nil { rates[name] = (0, 0) }
+        pathRates = rates
     }
 
     private func sampleTraffic() {

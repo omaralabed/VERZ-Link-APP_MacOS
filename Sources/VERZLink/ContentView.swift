@@ -228,7 +228,11 @@ struct ContentView: View {
                                  ? "Transfers · calls prefer another link" : path.state.capitalized)
                                 .foregroundStyle(path.state == "healthy" ? mint : muted)
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
-                            Text("↑ \(ByteCountFormatter.string(fromByteCount: Int64(path.sentBytes), countStyle: .decimal))  ↓ \(ByteCountFormatter.string(fromByteCount: Int64(path.receivedBytes), countStyle: .decimal))").foregroundStyle(muted)
+                            let rate = model.pathRates[path.name] ?? (upMbps: 0, downMbps: 0)
+                            Text(String(format: "↑ %.2f  ↓ %.2f Mbps", rate.upMbps, rate.downMbps))
+                                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                                .foregroundStyle(path.state == "healthy" ? Color.primary : muted)
+                                .help("Live tunnel bytes carried on this link, including protection copies and repairs. Links can add up to more than the headline rate.")
                             if let down = path.downloadBps, let up = path.uploadBps {
                                 Text(String(format: "↓ %.1f  ↑ %.1f Mbps · %llu flows", down / 1_000_000, up / 1_000_000, path.activeFlows ?? 0))
                                     .foregroundStyle(muted)
@@ -264,6 +268,10 @@ struct ContentView: View {
                  ? "The Mac measures TCP upload delivery and congestion. New connections use conservative two-way estimates; unknown or recovering links get limited trials. Existing direct flows stay on their original ISP."
                  : "Direct Smart shares new TCP flows using measured delivery and congestion. Unknown or recovering links get limited trials. One established direct connection stays on its original adapter.")
                 .font(.system(size: 10)).foregroundStyle(muted)
+            if model.busy && model.mode == .secure {
+                Text("Per-link rates are live wire traffic on each adapter, including protection copies and repairs, so links can add up to more than the payload rate shown below.")
+                    .font(.system(size: 10)).foregroundStyle(muted)
+            }
             HStack {
                 Text("Connection preference").font(.system(size: 12))
                 Spacer()
