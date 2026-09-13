@@ -276,12 +276,19 @@ struct ContentView: View {
                 Text("Connection preference").font(.system(size: 12))
                 Spacer()
                 Picker("Connection preference", selection: $model.policy) {
-                    Text("Smart").tag("smart")
-                    Text("Performance").tag("performance")
+                    Text("Bonding").tag("smart")
                     Text("Continuity").tag("continuity")
                     Text("Data saver").tag("data-saver")
+                    // Legacy value: identical to Bonding for TCP; only spreads UDP flows.
+                    if model.policy == "performance" { Text("Performance").tag("performance") }
                 }.labelsHidden().frame(width: 160)
             }
+            Text(model.policy == "continuity"
+                 ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight. Session and public IP never change."
+                 : model.policy == "data-saver"
+                 ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
+                 : "Bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
+                .font(.system(size: 10)).foregroundStyle(muted)
         }.padding(20).card()
     }
 
