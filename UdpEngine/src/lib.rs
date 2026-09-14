@@ -181,25 +181,33 @@ impl Engine {
             ..Default::default()
         };
         let links = self.links();
-        let now_us = self.start.elapsed().as_micros() as u64;
-        let wire_bytes = payload
-            .len()
-            .saturating_add(verz_link_core::HEADER + verz_link_core::TAG);
-        let result = if self.mode == 1 {
+        let (result, bonded_send) = if self.mode == 1 {
+            let now_us = self.start.elapsed().as_micros() as u64;
+            let wire_bytes = payload
+                .len()
+                .saturating_add(verz_link_core::HEADER + verz_link_core::TAG);
             let preferred = self
                 .bonded
                 .select(&links, wire_bytes, now_us)
                 .ok_or_else(|| "no healthy WAN for Bonded Speed".to_owned())?;
-            self.sender
-                .forward_on(p.clone(), &links, &mut self.sockets, preferred)
+            (
+                self.sender
+                    .forward_on(p.clone(), &links, &mut self.sockets, preferred),
+                Some((wire_bytes, now_us)),
+            )
         } else {
-            self.sender.forward(p.clone(), &links, &mut self.sockets)
+            // Keep the proven Continuity path on Sender::forward exactly as it
+            // was before Bonded Speed was introduced.
+            (
+                self.sender.forward(p.clone(), &links, &mut self.sockets),
+                None,
+            )
         };
         let sent = result.map_err(|e| {
             self.errors += 1;
             e.to_string()
         })?;
-        if self.mode == 1 {
+        if let Some((wire_bytes, now_us)) = bonded_send {
             self.bonded
                 .sent(port, sent.sequence, sent.primary, wire_bytes, now_us);
         }
@@ -291,46 +299,44 @@ impl Engine {
                         }
                     }
                 }
-                ACK | NACK => {
+                ACK | NACK if self.mode == 1 => {
                     let mut repairs = Vec::new();
-                    if self.mode == 1 {
-                        let now_us = self.start.elapsed().as_micros() as u64;
-                        if p.flags == ACK {
-                            self.bonded.acknowledge(p.local_port, p.sequence, now_us);
-                        } else if let Ok(sequences) = decode_nack(&p.payload) {
-                            let fresh = self.bonded.nack(p.local_port, &sequences, now_us);
-                            if let Ok(payload) = encode_nack(&fresh) {
-                                let mut control = p.clone();
-                                control.payload = payload;
-                                if let Ok(authenticated) =
-                                    control.encode(self.enrollment.key.as_bytes())
-                                    && let Ok(sent) = self.sender.control_on(
-                                        &authenticated,
-                                        &self.links(),
-                                        &mut self.sockets,
-                                        Some(id),
-                                    )
-                                {
-                                    repairs = sent;
-                                }
+                    let now_us = self.start.elapsed().as_micros() as u64;
+                    if p.flags == ACK {
+                        self.bonded.acknowledge(p.local_port, p.sequence, now_us);
+                        let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
+                    } else if let Ok(sequences) = decode_nack(&p.payload) {
+                        let fresh = self.bonded.nack(p.local_port, &sequences, now_us);
+                        if let Ok(payload) = encode_nack(&fresh) {
+                            let mut control = p.clone();
+                            control.payload = payload;
+                            if let Ok(authenticated) =
+                                control.encode(self.enrollment.key.as_bytes())
+                                && let Ok(sent) = self.sender.control_on(
+                                    &authenticated,
+                                    &self.links(),
+                                    &mut self.sockets,
+                                    Some(id),
+                                )
+                            {
+                                repairs = sent;
                             }
                         }
                     }
-                    if self.mode != 1 || p.flags == ACK {
-                        let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
+                    let now_us = self.start.elapsed().as_micros() as u64;
+                    for repair in repairs {
+                        self.bonded.repair_sent(
+                            p.local_port,
+                            repair.sequence,
+                            repair.path,
+                            repair.wire_bytes,
+                            now_us,
+                        );
                     }
-                    if self.mode == 1 {
-                        let now_us = self.start.elapsed().as_micros() as u64;
-                        for repair in repairs {
-                            self.bonded.repair_sent(
-                                p.local_port,
-                                repair.sequence,
-                                repair.path,
-                                repair.wire_bytes,
-                                now_us,
-                            );
-                        }
-                    }
+                }
+                ACK | NACK => {
+                    // This is the exact pre-Bonded-Speed Continuity control path.
+                    let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
                 }
                 DOWNLINK => {
                     if !self

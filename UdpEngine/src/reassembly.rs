@@ -32,14 +32,6 @@ impl Stream {
     }
     /// Durations are microseconds. Caller owns class-dependent/adaptive budgets.
     pub fn new(budget: u64, grace: u64, capacity: usize) -> Self {
-        Self::configured(budget, grace, capacity, false)
-    }
-
-    pub fn new_repairing(budget: u64, grace: u64, capacity: usize) -> Self {
-        Self::configured(budget, grace, capacity, true)
-    }
-
-    fn configured(budget: u64, grace: u64, capacity: usize, repair_before_release: bool) -> Self {
         Self {
             next: 0,
             pending: BTreeMap::new(),
@@ -51,7 +43,23 @@ impl Stream {
             grace,
             latest_sent: 0,
             capacity: capacity.max(1),
-            repair_before_release,
+            repair_before_release: false,
+        }
+    }
+
+    pub fn new_repairing(budget: u64, grace: u64, capacity: usize) -> Self {
+        Self {
+            next: 0,
+            pending: BTreeMap::new(),
+            copies: BTreeMap::new(),
+            gap: None,
+            nack_at: None,
+            retries: 0,
+            budget,
+            grace,
+            latest_sent: 0,
+            capacity: capacity.max(1),
+            repair_before_release: true,
         }
     }
     fn clear_gap(&mut self) {

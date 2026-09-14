@@ -91,15 +91,40 @@ impl Sender {
     /// Metadata/classification is supplied by the ingress layer; payload is a full IP packet for TUN.
     pub fn forward(
         &mut self,
-        packet: Packet,
+        mut packet: Packet,
         snapshot: &[Link],
         writer: &mut impl WanWriter,
     ) -> io::Result<Sent> {
+        if packet.payload.len() > crate::MAX_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload too large",
+            ));
+        }
         let decision = self
             .scheduler
             .schedule(packet.class, snapshot)
             .map_err(io::Error::other)?;
-        self.forward_with_decision(packet, snapshot, writer, decision.primary, decision.fec)
+        let sequence = self.sequences.entry(packet.local_port).or_default();
+        packet.sequence = *sequence;
+        *sequence = sequence.wrapping_add(1);
+        packet.session = self.session;
+        packet.flags = PRIMARY | (packet.flags & TUN);
+        let primary = self.send_any(&packet, decision.primary, snapshot, writer)?;
+        packet.link = primary;
+        self.cache.store(packet.clone());
+        let mut duplicate = None;
+        if decision.fec != 0 && decision.fec != primary {
+            packet.flags = FEC | (packet.flags & TUN);
+            if self.send_one(&packet, decision.fec, writer).is_ok() {
+                duplicate = Some(decision.fec);
+            }
+        }
+        Ok(Sent {
+            sequence: packet.sequence,
+            primary,
+            duplicate,
+        })
     }
 
     /// Send through a path selected by a caller that owns a stronger scheduler.
@@ -166,8 +191,35 @@ impl Sender {
         snapshot: &[Link],
         writer: &mut impl WanWriter,
     ) -> io::Result<usize> {
-        self.control_on(wire, snapshot, writer, None)
-            .map(|repairs| repairs.len())
+        let control = Packet::decode(wire, &self.key).map_err(io::Error::other)?;
+        if control.session != self.session {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wrong session",
+            ));
+        }
+        if control.flags == ACK {
+            self.cache
+                .trim_through(control.local_port, control.sequence);
+            return Ok(0);
+        }
+        if control.flags != NACK {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not ACK/NACK"));
+        }
+        let sequences = decode_nack(&control.payload).map_err(io::Error::other)?;
+        let mut sent = 0;
+        for sequence in sequences {
+            if let Some(mut packet) = self.cache.get(control.local_port, sequence).cloned() {
+                packet.flags |= RESEND;
+                if self
+                    .send_any(&packet, packet.link, snapshot, writer)
+                    .is_ok()
+                {
+                    sent += 1;
+                }
+            }
+        }
+        Ok(sent)
     }
 
     /// Handle authenticated feedback and, for NACKs, optionally prefer the WAN
