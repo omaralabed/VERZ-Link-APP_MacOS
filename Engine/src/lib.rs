@@ -5,6 +5,7 @@
 
 pub mod bond;
 pub mod brain;
+pub mod carrier_io;
 pub mod direct;
 pub mod egress;
 pub mod intake;

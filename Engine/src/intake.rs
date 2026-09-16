@@ -223,12 +223,11 @@ impl KernelTxMonitor {
             .and_then(|(c, p)| c.checked_sub(p));
         // Interface replacement/counter reset must not wrap or report a false
         // zero-loss interval. A missing sysfs statistic is null, not zero.
-        if let Some(current) = current {
-            if self.baseline.is_none_or(|b| current < b)
-                || self.previous.is_some_and(|p| current < p)
-            {
-                self.baseline = Some(current);
-            }
+        if let Some(current) = current
+            && (self.baseline.is_none_or(|b| current < b)
+                || self.previous.is_some_and(|p| current < p))
+        {
+            self.baseline = Some(current);
         }
         self.previous = current;
         KernelTxSnapshot {

@@ -130,6 +130,72 @@ fn continuity_with_one_path_does_not_create_a_same_path_protection_copy() {
 }
 
 #[test]
+fn single_path_bulk_tcp_uses_native_recovery_instead_of_blind_outer_copy() {
+    let mut s = ready(&[8]);
+    s.policy = Policy::Smart;
+    s.enqueue(tcp(0, 5000));
+    let original = data(&mut s, 230).remove(0);
+    assert_eq!(original.path, 0);
+
+    for now in [250, 275, 299] {
+        refresh(&mut s, now, &[8]);
+        assert!(data(&mut s, now).is_empty());
+    }
+    refresh(&mut s, 300, &[8]);
+    assert!(data(&mut s, 300).is_empty());
+    assert_eq!(s.pending_packets(), 0);
+    assert_eq!(s.paths[0].in_flight, 0);
+    assert_eq!(s.counters.repairs, 0);
+    assert_eq!(s.counters.tcp_same_path_repairs, 0);
+    assert_eq!(s.counters.tcp_single_path_native_recoveries, 1);
+}
+
+#[test]
+fn single_path_small_tcp_control_keeps_bounded_outer_repair() {
+    let mut s = ready(&[8]);
+    s.policy = Policy::Smart;
+    let mut syn = tcp(0, 5000);
+    syn.truncate(40);
+    syn[2..4].copy_from_slice(&40_u16.to_be_bytes());
+    syn[33] = 0x02;
+    s.enqueue(syn);
+    let original = data(&mut s, 230).remove(0);
+    assert_eq!(original.path, 0);
+
+    for now in [250, 275, 299] {
+        refresh(&mut s, now, &[8]);
+        assert!(data(&mut s, now).is_empty());
+    }
+    refresh(&mut s, 300, &[8]);
+    let repaired = data(&mut s, 300);
+    assert_eq!(repaired.len(), 1);
+    assert_eq!((repaired[0].id, repaired[0].path), (original.id, 0));
+    assert_eq!(s.counters.repairs, 1);
+    assert_eq!(s.counters.tcp_same_path_repairs, 1);
+    assert_eq!(s.counters.tcp_single_path_native_recoveries, 0);
+}
+
+#[test]
+fn rollback_switch_restores_single_path_outer_repair() {
+    let mut s = ready(&[8]);
+    s.policy = Policy::Smart;
+    s.set_single_path_tcp_fast(false);
+    s.enqueue(tcp(0, 5000));
+    let original = data(&mut s, 230).remove(0);
+
+    for now in [250, 275, 299] {
+        refresh(&mut s, now, &[8]);
+        assert!(data(&mut s, now).is_empty());
+    }
+    refresh(&mut s, 300, &[8]);
+    let repaired = data(&mut s, 300);
+    assert_eq!(repaired.len(), 1);
+    assert_eq!((repaired[0].id, repaired[0].path), (original.id, 0));
+    assert_eq!(s.counters.tcp_same_path_repairs, 1);
+    assert_eq!(s.counters.tcp_single_path_native_recoveries, 0);
+}
+
+#[test]
 fn tcp_physical_failure_repairs_without_waiting_for_packet_deadline() {
     for removed in [false, true] {
         let mut s = ready(&[6, 40]);
@@ -578,13 +644,43 @@ fn tcp_large_backlog_can_bond_but_other_flows_do_not_force_a_slow_spill() {
     for i in 0..400 {
         s.enqueue(tcp(i * (BOND_MTU - 40) as u32, 5000));
     }
-    assert!(data(&mut s, 230).iter().any(|f| f.path == 1));
+    assert!(
+        data(&mut s, 230).is_empty(),
+        "briefly wait for the earlier-arriving path instead of reordering"
+    );
+    let bonded = data(&mut s, 236);
+    assert!(
+        bonded.iter().any(|f| f.path == 1),
+        "a persistently full path must not disable bonding"
+    );
+    assert!(
+        bonded.len() > 1,
+        "an expired wait must release a paced alternate-path burst"
+    );
     let mut isolated = ready(&[6, 40]);
     isolated.paths[0].in_flight = isolated.paths[0].congestion_window;
     for port in 5000..5400 {
         isolated.enqueue(tcp(0, port));
     }
     assert!(data(&mut isolated, 230).is_empty());
+}
+
+#[test]
+fn queued_flow_size_cannot_force_early_tcp_segments_onto_a_slower_path() {
+    let mut s = ready(&[6, 40]);
+    s.policy = Policy::Smart;
+    s.paths[0].next_send = 240.0;
+    let step = (BOND_MTU - 40) as u32;
+    for sequence in 0..2000 {
+        s.enqueue(tcp(sequence * step, 5000));
+    }
+    assert!(
+        data(&mut s, 230).is_empty(),
+        "total application backlog is not the next segment's completion time"
+    );
+    let sent = data(&mut s, 240);
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|frame| frame.path == 0));
 }
 
 #[test]
@@ -615,7 +711,7 @@ fn tcp_loaded_rate_is_used_but_quiet_rate_expires_and_rejoin_resets_it() {
     p.tcp_sent(230);
     p.tcp_acked(100_000, 280);
     assert_eq!(p.tcp_delivery_bps, 16_000_000.0);
-    assert_eq!(p.tcp_bytes_per_ms(281), 2500.0);
+    assert_eq!(p.tcp_bytes_per_ms(281), 8000.0);
     assert_eq!(p.tcp_bytes_per_ms(1281), p.estimated_bytes_per_ms());
     p.in_flight = 0;
     p.capacity_used_until = None;

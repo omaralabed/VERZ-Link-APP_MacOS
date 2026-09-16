@@ -673,17 +673,17 @@ impl MeteredStream {
             return;
         }
         let snapshot = tcp_metrics::snapshot(self.inner.as_raw_fd(), self.uploaded);
-        if let Some(total) = &self.payload {
-            if let Some(s) = snapshot {
-                let acknowledged = s
-                    .acknowledged
-                    .min(self.uploaded)
-                    .max(self.payload_acknowledged);
-                total
-                    .upload
-                    .fetch_add(acknowledged - self.payload_acknowledged, Ordering::Relaxed);
-                self.payload_acknowledged = acknowledged;
-            }
+        if let Some(total) = &self.payload
+            && let Some(s) = snapshot
+        {
+            let acknowledged = s
+                .acknowledged
+                .min(self.uploaded)
+                .max(self.payload_acknowledged);
+            total
+                .upload
+                .fetch_add(acknowledged - self.payload_acknowledged, Ordering::Relaxed);
+            self.payload_acknowledged = acknowledged;
         }
         let Some(path) = &self.path else {
             return;

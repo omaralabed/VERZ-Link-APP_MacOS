@@ -4,7 +4,7 @@ import Charts
 private let mint = Color(red: 0.12, green: 0.91, blue: 0.72)
 private let cyan = Color(red: 0.20, green: 0.76, blue: 0.98)
 private let panel = Color(red: 0.075, green: 0.09, blue: 0.11)
-private let muted = Color(red: 0.52, green: 0.58, blue: 0.63)
+private let muted = Color(red: 0.78, green: 0.80, blue: 0.82)
 
 struct BrandMark: View {
     var body: some View {
@@ -132,18 +132,21 @@ struct ContentView: View {
                             .font(.system(size: 10)).foregroundStyle(muted)
                         Text("Links · what should several links be used for?").font(.system(size: 11, weight: .medium)).padding(.top, 4)
                         Picker("Connection preference", selection: $model.policy) {
-                            Text("Bonding").tag("smart")
+                            Text("Smart bonding").tag("smart")
                             Text("Bonded speed").tag("performance")
                             Text("Continuity").tag("continuity")
+                            Text("Adaptive protection").tag("adaptive-protection")
                             Text("Data saver").tag("data-saver")
                         }.pickerStyle(.segmented)
                         Text(model.policy == "continuity"
                              ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight."
+                             : model.policy == "adaptive-protection"
+                             ? "Adaptive protection: every outgoing UDP packet travels on each healthy WAN. A measured playout buffer absorbs their delay difference before release, so a slower copy can fill a faster WAN's gap. This adds latency, and every surviving WAN must carry the complete stream."
                              : model.policy == "data-saver"
                              ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
                              : model.policy == "performance"
                              ? "Bonded speed: measures delivered UDP upload capacity and allocates outgoing packets proportionally across every healthy WAN. The gateway restores packet order and requests missing packets; continuous duplicate payload is disabled."
-                             : "Bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
+                             : "Smart bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
                             .font(.system(size: 10)).foregroundStyle(muted)
                     }.padding(.top, 8)
                 } label: {

@@ -4,6 +4,8 @@ Native SwiftUI/Xcode client with a Rust direct multi-flow engine plus an
 optional encrypted multipath relay. **Development build; not a completed V3
 product.** See [architecture V3](ARCHITECTURE_V3.md) and [implementation
 status](IMPLEMENTATION_STATUS.md) for measured results and gaps.
+The planned shared-Rust design for macOS, iOS, Android, Windows and Linux
+clients is documented in [cross-platform architecture](CROSS_PLATFORM_ARCHITECTURE.md).
 The current throughput investigation and repeatable test command are in
 [performance notes](PERFORMANCE.md); do not use the deliberately delayed
 continuity stream as a speed benchmark.

@@ -139,7 +139,12 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
             }
         }
     }
-    private func mode(_ policy: String) -> Int { policy == "performance" ? 1 : policy == "data-saver" ? 3 : 2 }
+    private func mode(_ policy: String) -> Int {
+        policy == "performance" ? 1
+            : policy == "data-saver" ? 3
+            : policy == "adaptive-protection" ? 4
+            : 2
+    }
     func update(disabled: [String], policy: String) {
         guard let session = manager?.connection as? NETunnelProviderSession, session.status == .connected,
               let data = try? JSONSerialization.data(withJSONObject: ["disabled": disabled, "mode": mode(policy)]) else { return }

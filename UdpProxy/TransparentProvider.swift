@@ -29,6 +29,7 @@ final class TransparentProvider: NETransparentProxyProvider {
     private var payloadEpoch = ProcessInfo.processInfo.systemUptime
     private var payloadSent: UInt64 = 0
     private var payloadReceived: UInt64 = 0
+    private var requestedMode = 0
 
     override func startProxy(options: [String: Any]?, completionHandler: @escaping (Error?) -> Void) {
         work.async {
@@ -43,10 +44,11 @@ final class TransparentProvider: NETransparentProxyProvider {
             self.payloadSource = UUID().uuidString
             self.payloadEpoch = ProcessInfo.processInfo.systemUptime
             self.payloadSent = 0; self.payloadReceived = 0
+            self.requestedMode = config["mode"] as? Int ?? 0
             self.disabled = Set(config["disabled"] as? [String] ?? [])
             self.engine = data.withUnsafeBytes { verz_create($0.bindMemory(to: UInt8.self).baseAddress, data.count) }
             guard self.engine != nil else {completionHandler(self.failure("Rust engine rejected enrollment")); return}
-            verz_mode(self.engine, Int32(config["mode"] as? Int ?? 0))
+            verz_mode(self.engine, Int32(self.requestedMode))
             self.scan()
             self.monitor.pathUpdateHandler = { [weak self] _ in self?.work.async { self?.scan() } }
             self.monitor.start(queue: DispatchQueue(label: "com.verz.link.macos2.path-events"))
@@ -136,7 +138,10 @@ final class TransparentProvider: NETransparentProxyProvider {
             var status = [UInt8](repeating: 0, count: 65536)
             let n = verz_status(engine, &status, status.count)
             let object = (try? JSONSerialization.jsonObject(with: Data(status.prefix(n)))) as? [String: Any]
-            let ready = (object?["paths"] as? [[String: Any]])?.contains { ($0["status"] as? Int) == 1 } ?? false
+            let pathReady = (object?["paths"] as? [[String: Any]])?.contains { ($0["status"] as? Int) == 1 } ?? false
+            let adaptiveReady = self.requestedMode != 4
+                || ((object?["adaptive_protection"] as? [String: Any])?["supported"] as? Bool == true)
+            let ready = pathReady && adaptiveReady
             if ready { startup = nil; callback(nil) }
             else if Date().timeIntervalSince(startTime) > 10 {
                 startup = nil; cleanup(); callback(failure("Encrypted UDP gateway did not authenticate on any adapter.")); return
@@ -195,7 +200,10 @@ final class TransparentProvider: NETransparentProxyProvider {
             guard let engine=self.engine else {completionHandler?(nil);return}
             if let settings = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any] {
                 if let names = settings["disabled"] as? [String] { self.disabled = Set(names); self.scan() }
-                if let mode = settings["mode"] as? Int { verz_mode(engine, Int32(mode)) }
+                if let mode = settings["mode"] as? Int {
+                    self.requestedMode = mode
+                    verz_mode(engine, Int32(mode))
+                }
             }
             var buffer=[UInt8](repeating:0,count:65536)
             let n=verz_status(engine,&buffer,buffer.count)

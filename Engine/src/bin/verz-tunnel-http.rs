@@ -124,16 +124,23 @@ async fn serve(
             .map(|(_, value)| value.trim().parse::<usize>())
             .transpose()?
             .unwrap_or(0);
-        ensure!(length <= 16 * 1024 * 1024, "upload too large");
+        ensure!(length <= 256 * 1024 * 1024, "upload too large");
         if text
             .lines()
             .any(|line| line.eq_ignore_ascii_case("expect: 100-continue"))
         {
             socket.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
         }
-        let mut content = vec![0; length];
-        socket.read_exact(&mut content).await?;
-        let hash = format!("{}\n", hex::encode(Sha256::digest(&content)));
+        let mut digest = Sha256::new();
+        let mut remaining = length;
+        let mut content = vec![0; 64 * 1024];
+        while remaining > 0 {
+            let chunk = remaining.min(content.len());
+            socket.read_exact(&mut content[..chunk]).await?;
+            digest.update(&content[..chunk]);
+            remaining -= chunk;
+        }
+        let hash = format!("{}\n", hex::encode(digest.finalize()));
         println!(
             "HTTP upload verified: {length} bytes / SHA256 {}",
             hash.trim()

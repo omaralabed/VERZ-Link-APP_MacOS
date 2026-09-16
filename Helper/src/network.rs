@@ -59,6 +59,8 @@ fn run(program: &str, args: &[&str]) -> Result<String> {
 pub struct NetworkGuard {
     routes: Vec<Vec<String>>,
     dns: Vec<(String, Vec<String>)>,
+    ipv6_interfaces: Vec<(String, bool)>,
+    physical: Vec<String>,
     tun: String,
     preserve_dns: bool,
     captured: bool,
@@ -94,9 +96,11 @@ impl NetworkGuard {
         );
         let mut guard = Self {
             tun: tun.to_owned(),
+            physical: physical.to_vec(),
             preserve_dns,
             routes: Vec::new(),
             dns: Vec::new(),
+            ipv6_interfaces: Vec::new(),
             captured: false,
         };
         let mut configured = 0;
@@ -125,14 +129,46 @@ impl NetworkGuard {
         let tun = self.tun.clone();
         self.add_route(&["-net", "0.0.0.0/1", "-interface", &tun])?;
         self.add_route(&["-net", "128.0.0.0/1", "-interface", &tun])?;
-        self.add_route(&["-inet6", "-net", "::/1", "-interface", &tun])?;
-        self.add_route(&["-inet6", "-net", "8000::/1", "-interface", &tun])?;
+        // The current bonded tunnel is IPv4-only. macOS accepts IPv6 routes
+        // attached to an unnumbered utun and then removes them, which lets a
+        // dual-stack browser silently escape through the physical ISP. Keep
+        // IPv6 unavailable only for this session so Happy Eyeballs selects the
+        // protected IPv4 route. restore() returns every interface to the exact
+        // enabled/disabled state observed before capture.
+        let physical = self.physical.clone();
+        self.protect_ipv6(&physical)?;
         self.refresh_dns()?;
         ensure!(
             self.preserve_dns || !self.dns.is_empty(),
             "no active network service found for tunnel DNS"
         );
         self.captured = true;
+        Ok(())
+    }
+
+    pub fn protect_ipv6(&mut self, physical: &[String]) -> Result<()> {
+        for interface in physical {
+            let snapshot = run("/sbin/ifconfig", &[interface])?;
+            let disabled = ipv6_is_disabled(&snapshot);
+            if !self
+                .ipv6_interfaces
+                .iter()
+                .any(|(known, _)| known == interface)
+            {
+                self.ipv6_interfaces.push((interface.clone(), disabled));
+            }
+            // Recheck on every interface update. Wi-Fi and USB drivers can
+            // clear IFDISABLED when an adapter disappears and comes back.
+            if !disabled {
+                run("/sbin/ifconfig", &[interface, "inet6", "ifdisabled"])
+                    .with_context(|| format!("disable direct IPv6 on {interface}"))?;
+                let verified = run("/sbin/ifconfig", &[interface])?;
+                ensure!(
+                    ipv6_is_disabled(&verified),
+                    "direct IPv6 remained active on {interface}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -305,8 +341,25 @@ impl NetworkGuard {
                 }
             }
         }
+        for (interface, was_disabled) in self.ipv6_interfaces.drain(..).rev() {
+            if was_disabled {
+                continue;
+            }
+            if let Err(error) = run(
+                "/sbin/ifconfig",
+                &[interface.as_str(), "inet6", "-ifdisabled"],
+            ) {
+                failures.push(format!("restore IPv6 on {interface}: {error}"));
+            }
+        }
         failures
     }
+}
+
+fn ipv6_is_disabled(snapshot: &str) -> bool {
+    snapshot
+        .lines()
+        .any(|line| line.trim_start().starts_with("nd6 options=") && line.contains("IFDISABLED"))
 }
 
 /// No bulk transfer and no changes to the user's network preferences. This
@@ -402,6 +455,8 @@ mod gateway_tests {
             tun: String::new(),
             routes: Vec::new(),
             dns: Vec::new(),
+            ipv6_interfaces: Vec::new(),
+            physical: Vec::new(),
             captured: false,
         };
         guard.refresh_dns().unwrap();
@@ -488,6 +543,19 @@ mod gateway_tests {
             "destination: default\ngateway: 192.168.1.1\ninterface: en7"
         ));
         assert!(!matches_owned_scoped_route(&record, ""));
+    }
+
+    #[test]
+    fn ipv6_guard_detects_only_the_disabled_nd6_flag() {
+        assert!(!ipv6_is_disabled(
+            "en0: flags=8863<UP,RUNNING>\n\tnd6 options=201<PERFORMNUD,DAD>\n"
+        ));
+        assert!(ipv6_is_disabled(
+            "en0: flags=8863<UP,RUNNING>\n\tnd6 options=801<PERFORMNUD,IFDISABLED>\n"
+        ));
+        assert!(!ipv6_is_disabled(
+            "status: inactive\nIFDISABLED elsewhere\n"
+        ));
     }
 }
 

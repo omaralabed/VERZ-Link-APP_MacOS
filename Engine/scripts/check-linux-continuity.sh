@@ -7,14 +7,26 @@ POLICY=${VERZ_TEST_POLICY:-continuity}
 BOND_BIN=${VERZ_TEST_BOND_BIN:-/opt/verz-link-lab/verz-bond}
 CLIENT_BIN=${VERZ_TEST_CLIENT_BIN:-$BOND_BIN}
 HTTP_BIN=${VERZ_TEST_HTTP_BIN:-/opt/verz-link-lab/verz-tunnel-http}
+DIRECTION=${VERZ_TEST_DIRECTION:-download}
+UPLOAD_MIB=${VERZ_TEST_UPLOAD_MIB:-16}
 RATE=${VERZ_TEST_RATE:-10mbit}
+RATE_LOW=${VERZ_TEST_RATE_LOW:-$RATE}
+RATE_HIGH=${VERZ_TEST_RATE_HIGH:-$RATE}
 DELAY_LOW=${VERZ_TEST_DELAY_LOW:-10ms}
 DELAY_HIGH=${VERZ_TEST_DELAY_HIGH:-30ms}
+LOSS_LOW=${VERZ_TEST_LOSS_LOW:-}
+LOSS_HIGH=${VERZ_TEST_LOSS_HIGH:-}
 HTTP_ARGS=()
 if [ -n "${VERZ_TEST_STREAM_DELAY_MS:-}" ]; then HTTP_ARGS+=(--stream-delay-ms "$VERZ_TEST_STREAM_DELAY_MS"); fi
 if [ -n "${VERZ_TEST_STREAM_REPEATS:-}" ]; then HTTP_ARGS+=(--stream-repeats "$VERZ_TEST_STREAM_REPEATS"); fi
 case "$MODE" in cuts|both|low|high) ;; *) echo "Use cuts, both, low, or high" >&2; exit 1;; esac
 case "$POLICY" in smart|performance|continuity|data-saver) ;; *) echo "Use a valid VERZ_TEST_POLICY" >&2; exit 1;; esac
+case "$DIRECTION" in download|upload) ;; *) echo "Use download or upload for VERZ_TEST_DIRECTION" >&2; exit 1;; esac
+case "$UPLOAD_MIB" in ''|*[!0-9]*) echo "VERZ_TEST_UPLOAD_MIB must be an integer" >&2; exit 1;; esac
+if [ "$UPLOAD_MIB" -lt 1 ] || [ "$UPLOAD_MIB" -gt 256 ]; then
+    echo "VERZ_TEST_UPLOAD_MIB must be between 1 and 256" >&2
+    exit 1
+fi
 PATHS=(vzbc0 vzbc1)
 EXPECTED_PATHS=2
 if [ "$MODE" = low ]; then PATHS=(vzbc0); EXPECTED_PATHS=1; fi
@@ -69,12 +81,17 @@ ip -n "$NS" route add table 202 10.203.240.1/32 via 10.203.241.1 dev vzbc1 src 1
 # Configure reverse-path validation only inside this disposable namespace.
 ip netns exec "$NS" sysctl -qw net.ipv4.conf.all.rp_filter=0
 ip netns exec "$NS" sysctl -qw net.ipv4.conf.vzbc1.rp_filter=0
-# 20 ms RTT versus 60 ms RTT, each limited to 10 Mbps independently.
+# Each virtual WAN has an independent delay and rate limit. RATE remains the
+# common default; RATE_LOW/RATE_HIGH allow asymmetric regression coverage.
 # Shaping applies ONLY to interfaces created by this test, never eth0/SSH.
-ip netns exec "$RELAY_NS" tc qdisc add dev vzbh0 root netem delay "$DELAY_LOW" rate "$RATE"
-ip netns exec "$NS" tc qdisc add dev vzbc0 root netem delay "$DELAY_LOW" rate "$RATE"
-ip netns exec "$RELAY_NS" tc qdisc add dev vzbh1 root netem delay "$DELAY_HIGH" rate "$RATE"
-ip netns exec "$NS" tc qdisc add dev vzbc1 root netem delay "$DELAY_HIGH" rate "$RATE"
+LOW_NETEM=(delay "$DELAY_LOW" rate "$RATE_LOW")
+HIGH_NETEM=(delay "$DELAY_HIGH" rate "$RATE_HIGH")
+if [ -n "$LOSS_LOW" ]; then LOW_NETEM+=(loss "$LOSS_LOW"); fi
+if [ -n "$LOSS_HIGH" ]; then HIGH_NETEM+=(loss "$LOSS_HIGH"); fi
+ip netns exec "$RELAY_NS" tc qdisc add dev vzbh0 root netem "${LOW_NETEM[@]}"
+ip netns exec "$NS" tc qdisc add dev vzbc0 root netem "${LOW_NETEM[@]}"
+ip netns exec "$RELAY_NS" tc qdisc add dev vzbh1 root netem "${HIGH_NETEM[@]}"
+ip netns exec "$NS" tc qdisc add dev vzbc1 root netem "${HIGH_NETEM[@]}"
 ip netns exec "$RELAY_NS" "$BOND_BIN" server --listen 10.203.240.1:39002 \
     --secret-file /etc/verz-link-lab/secret --tun-name vzrelay >"$TEST_DIR/relay.log" 2>&1 &
 RELAY_PID=$!
@@ -125,15 +142,31 @@ PING_PID=$!
     ip -n "$NS" route replace table 202 10.203.240.1/32 via 10.203.241.1 dev vzbc1 src 10.203.241.2
 ) &
 FAULT_PID=$!
-ip netns exec "$NS" curl --fail --silent --show-error --noproxy '*' --max-time 40 \
-    http://10.78.0.1:8080/stream --output "$TEST_DIR/stream.bin" --write-out 'TCP download: %{speed_download} bytes/sec, %{time_total} seconds\n'
+if [ "$DIRECTION" = download ]; then
+    ip netns exec "$NS" curl --fail --silent --show-error --noproxy '*' --max-time 40 \
+        http://10.78.0.1:8080/stream --output "$TEST_DIR/stream.bin" --write-out 'TCP download: %{speed_download} bytes/sec, %{time_total} seconds\n'
+else
+    dd if=/dev/zero of="$TEST_DIR/upload.bin" bs=1048576 count="$UPLOAD_MIB" status=none
+    UPLOAD_HASH=$(sha256sum "$TEST_DIR/upload.bin" | awk '{print $1}')
+    ip netns exec "$NS" curl --fail --silent --show-error --noproxy '*' --max-time 40 \
+        -H 'Content-Type: application/octet-stream' --data-binary @"$TEST_DIR/upload.bin" \
+        http://10.78.0.1:8080/upload --output "$TEST_DIR/upload.sha256" \
+        --write-out 'TCP upload: %{speed_upload} bytes/sec, %{time_total} seconds\n'
+    test "$(tr -d '\r\n' < "$TEST_DIR/upload.sha256")" = "$UPLOAD_HASH"
+fi
 wait "$FAULT_PID"; FAULT_PID=
-EXPECTED=$(ip netns exec "$NS" curl --fail --silent --show-error --noproxy '*' --max-time 10 http://10.78.0.1:8080/stream-sha256)
-ACTUAL=$(sha256sum "$TEST_DIR/stream.bin" | awk '{print $1}')
-test "$EXPECTED" = "$ACTUAL"
+if [ "$DIRECTION" = download ]; then
+    EXPECTED=$(ip netns exec "$NS" curl --fail --silent --show-error --noproxy '*' --max-time 10 http://10.78.0.1:8080/stream-sha256)
+    ACTUAL=$(sha256sum "$TEST_DIR/stream.bin" | awk '{print $1}')
+    test "$EXPECTED" = "$ACTUAL"
+fi
 kill -0 "$CLIENT_PID"
 wait "$PING_PID"; PING_PID=
-echo "PASS ($MODE): one real TCP stream completed; SHA-256 matches."
-wc -c "$TEST_DIR/stream.bin"
+echo "PASS ($MODE/$DIRECTION): one real TCP stream completed; SHA-256 matches."
+if [ "$DIRECTION" = download ]; then
+    wc -c "$TEST_DIR/stream.bin"
+else
+    wc -c "$TEST_DIR/upload.bin"
+fi
 tail -n 4 "$TEST_DIR/ping.log"
 awk '/bytes from/ {gsub(/\[|\]/,"",$1); if (last && ($1-last)>max) max=$1-last; last=$1} END {printf "Maximum observed ICMP reply gap: %.3f ms (virtual-link test, not physical Mac acceptance)\n", max*1000}' "$TEST_DIR/ping.log"

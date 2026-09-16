@@ -51,7 +51,7 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .neverDrop: "Never drop"
+        case .neverDrop: "Continuity"
         case .fastest: "Fastest"
         case .direct: "Direct, no server"
         case .custom: "Custom"
@@ -73,7 +73,7 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
         case .neverDrop:
             "Recommended. All traffic goes through the encrypted VERZ server over every link, and calls, UDP and light TCP are carried on two links at once. Losing a cable, or loss on one ISP, causes no drop: the session and public IP stay the same."
         case .fastest:
-            "All traffic goes through the encrypted VERZ server. TCP uses every responsive link, while UDP Bonded Speed measures delivered upload capacity and divides an outgoing stream proportionally across the available WANs. Missing packets are repaired, but unlike Never drop, payload is not continuously duplicated."
+            "All traffic goes through the encrypted VERZ server. TCP uses every responsive link, while UDP Bonded Speed measures delivered upload capacity and divides an outgoing stream proportionally across the available WANs. Missing packets are repaired, but unlike Continuity, payload is not continuously duplicated."
         case .direct:
             "No server. Each connection is pinned to one adapter and ISP for its whole life, so loss, congestion or an outage on that ISP hits it directly and nothing can carry or repair it over the other link. Only new connections can pick a better adapter."
         case .custom:
@@ -371,7 +371,7 @@ final class LinkModel: ObservableObject {
 
     private func startTunnel(secret: Data, names: [String], identifier: UUID) {
         do {
-            session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: policy, configuration: configurationData()) { [weak self] event in
+            session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: tcpPolicy, configuration: configurationData()) { [weak self] event in
                 Task { @MainActor in
                     guard let self, self.sessionID == identifier else { return }
                     self.handle(event)
@@ -627,11 +627,17 @@ final class LinkModel: ObservableObject {
         configurationChanged()
     }
 
+    // Adaptive Protection is an isolated UDP policy. The TCP engine keeps its
+    // already-tested Continuity behavior while this UDP mode is selected.
+    private var tcpPolicy: String {
+        policy == "adaptive-protection" ? "continuity" : policy
+    }
+
     private func configurationData() -> Data {
         let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "address": $0.address ?? "", "metered": meteredInterfaces.contains($0.name)] }
         return (try? JSONSerialization.data(withJSONObject: [
             "interfaces": paths,
-            "policy": policy,
+            "policy": tcpPolicy,
             "mode": mode.rawValue,
             "secureDomains": secureDomains() ?? []
         ], options: [.sortedKeys])) ?? Data()

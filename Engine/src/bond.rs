@@ -62,6 +62,13 @@ const FAST_ACK_SCAN: usize = 8;
 // high-rate TCP therefore keeps essentially all capacity for normal bonding.
 const TCP_CONTINUITY_BYTES_PER_MS: u64 = 256;
 const TCP_CONTINUITY_BURST_BYTES: u64 = (64 * BOND_MTU) as u64;
+// A per-path TCP delivery sample is partly a measurement of how much work the
+// scheduler assigned to that path.  Treating it as a hard capacity estimate
+// creates a feedback loop: a lightly used path appears slow, receives still
+// less work, and bonding collapses onto one interface.  Keep bounded probing
+// headroom in the TCP-only completion estimate; the normal congestion window
+// and pacing budget still enforce every actual send.
+const TCP_RATE_EXPLORATION_FACTOR: f64 = 4.0;
 // A standing queue keeps every RTT sample elevated. A Wi-Fi radio that goes
 // off-channel (AWDL slots, roaming/full-band scans after an IPv4 change)
 // delays a burst instead: when it returns, the last packets sent before the
@@ -275,9 +282,7 @@ impl RecentPeak {
             let shift = elapsed.min(PAUSE_BUCKETS);
             self.values.rotate_right(shift);
             self.values[..shift].fill(0);
-            self.start = self
-                .start
-                .saturating_add(elapsed as u64 * PAUSE_BUCKET_MS);
+            self.start = self.start.saturating_add(elapsed as u64 * PAUSE_BUCKET_MS);
         }
         self.values[0] = self.values[0].max(value);
     }
@@ -565,10 +570,12 @@ impl Path {
             && self.tcp_delivery_bps > 0.0
         {
             // Loaded delivery is a better ordering estimate than an inflated
-            // cwnd. Leave 25% exploration headroom; this does NOT cap pacing
-            // or cwnd growth. Quiet/old samples must not pin a path to a low rate.
+            // cwnd. It still needs probing headroom because the sample reflects
+            // the scheduler's previous allocation as well as physical capacity.
+            // This does NOT change pacing or the congestion-window send budget.
+            // Quiet/old samples must not pin a path to a low rate.
             window_rate
-                .min(self.tcp_delivery_bps / 8000.0 * 1.25)
+                .min(self.tcp_delivery_bps / 8000.0 * TCP_RATE_EXPLORATION_FACTOR)
                 .max(1.0)
         } else {
             window_rate
@@ -623,8 +630,6 @@ impl Path {
 
     fn tcp_send_wait_ms(&self, bytes: usize, now: u64) -> f64 {
         let paced = (self.next_send - now as f64).max(0.0);
-        // ECF-style conservative window wait. The bounded per-flow hold
-        // below prevents continuously answering probes from creating a deadlock.
         if self.in_flight.saturating_add(bytes) > self.send_window_limit(bytes, false) {
             paced.max(self.rtt_ms.unwrap_or(30.0))
         } else {
@@ -817,6 +822,9 @@ pub struct Counters {
     pub tcp_early_deferrals_acked: u64,
     pub tcp_deadline_repairs: u64,
     pub tcp_unavailable_path_repairs: u64,
+    /// Single-path bulk TCP packets handed back to the native TCP recovery
+    /// loop instead of being copied again on the same outer path.
+    pub tcp_single_path_native_recoveries: u64,
     /// New packets refused before acknowledgement; the sender may retry them.
     pub receive_backpressure: u64,
     pub socket_backpressure: u64,
@@ -862,6 +870,7 @@ pub struct Scheduler {
     tcp_continuity_tokens: u64,
     tcp_continuity_refill_at: u64,
     last_flow_prune: u64,
+    single_path_tcp_fast: bool,
 }
 impl Scheduler {
     pub fn new(names: Vec<(String, bool)>, policy: Policy) -> Result<Self> {
@@ -896,7 +905,14 @@ impl Scheduler {
             tcp_continuity_tokens: TCP_CONTINUITY_BURST_BYTES,
             tcp_continuity_refill_at: 0,
             last_flow_prune: 0,
+            single_path_tcp_fast: true,
         })
+    }
+    pub fn set_single_path_tcp_fast(&mut self, enabled: bool) {
+        self.single_path_tcp_fast = enabled;
+    }
+    pub fn single_path_tcp_fast(&self) -> bool {
+        self.single_path_tcp_fast
     }
     pub fn set_realtime_advice(&mut self, weights: BTreeMap<String, u32>, until: u64) {
         self.realtime_advice = weights;
@@ -1056,6 +1072,12 @@ impl Scheduler {
         output
     }
     pub fn receive(&mut self, frame: &Frame, now: u64) -> (Option<Vec<u8>>, Vec<Frame>) {
+        self.receive_owned(frame.clone(), now)
+    }
+
+    /// Receive an owned frame so successfully delivered payload can move to
+    /// the TUN writer without one additional packet-sized allocation/copy.
+    pub fn receive_owned(&mut self, frame: Frame, now: u64) -> (Option<Vec<u8>>, Vec<Frame>) {
         let index = usize::from(frame.path);
         if index >= self.paths.len() {
             return (None, Vec::new());
@@ -1135,13 +1157,13 @@ impl Scheduler {
                 (None, Vec::new())
             }
             Kind::AckBatch => {
-                self.receive(
-                    &Frame::control(Kind::Ack, frame.path, frame.id, frame.stamp),
+                self.receive_owned(
+                    Frame::control(Kind::Ack, frame.path, frame.id, frame.stamp),
                     now,
                 );
                 for ack in frame.body.chunks_exact(16) {
-                    self.receive(
-                        &Frame::control(
+                    self.receive_owned(
+                        Frame::control(
                             Kind::Ack,
                             frame.path,
                             u64::from_be_bytes(ack[..8].try_into().expect("ACK ID")),
@@ -1162,7 +1184,7 @@ impl Scheduler {
                 self.received.mark(frame.id);
                 self.counters.delivered_packets += 1;
                 self.counters.delivered_bytes += frame.body.len() as u64;
-                (Some(frame.body.clone()), vec![ack])
+                (Some(frame.body), vec![ack])
             }
             Kind::Close | Kind::Udp | Kind::UdpReady | Kind::PathFailureReady | Kind::PathDown => {
                 (None, Vec::new())
@@ -1335,18 +1357,11 @@ impl Scheduler {
     }
 
     /// TCP-only completion/blocking estimate. Unlike targets(), a temporarily
-    /// paced/full fast path participates in the decision. Backlog is PER FLOW:
-    /// unrelated transfers must not justify putting this flow's early segment
-    /// on a path whose propagation delay exceeds its entire fast-path transfer.
-    fn tcp_target(
-        &mut self,
-        key: [u8; 12],
-        bytes: usize,
-        backlog: usize,
-        now: u64,
-    ) -> Option<usize> {
+    /// paced/full fast path participates in the decision. Only the next
+    /// segment's predicted completion is compared: queued application backlog
+    /// must not force an early sequence segment onto a slower path.
+    fn tcp_target(&mut self, key: [u8; 12], bytes: usize, now: u64) -> Option<usize> {
         let all = self.data_paths(now);
-        let &fast = all.first()?;
         let candidate = all
             .iter()
             .copied()
@@ -1365,27 +1380,53 @@ impl Scheduler {
         }
         let flow = self.tcp_flows.entry(key).or_default();
         flow.touched = now;
-        let p = &self.paths[fast];
-        let fast_finish =
-            (now as f64 + p.tcp_send_wait_ms(bytes, now) + p.tcp_forward_ms(now, bytes))
-                .max(flow.last_arrival)
-                + backlog.saturating_sub(bytes) as f64 / p.tcp_bytes_per_ms(now);
-        let slow_arrival =
-            (now as f64 + self.paths[candidate].tcp_forward_ms(now, bytes)).max(flow.last_arrival);
-        if candidate != fast && fast_finish + 0.25 < slow_arrival {
-            if p.send_budget_allows(bytes, false, now) {
+        // Compare the next segment on every path, including a temporarily
+        // paced/window-full path. The previous implementation added the
+        // entire queued flow backlog to one path's cost. A speed test always
+        // has a large backlog, so that calculation sent early sequence bytes
+        // over a slower WAN and manufactured head-of-line blocking.
+        let preferred = all.iter().copied().min_by(|&a, &b| {
+            let cost = |i: usize| {
+                let p = &self.paths[i];
+                p.tcp_send_wait_ms(bytes, now)
+                    + p.tcp_forward_ms(now, bytes)
+                    + p.in_flight as f64 / p.tcp_bytes_per_ms(now)
+            };
+            cost(a).total_cmp(&cost(b))
+        })?;
+        let preferred_path = &self.paths[preferred];
+        let preferred_arrival = (now as f64
+            + preferred_path.tcp_send_wait_ms(bytes, now)
+            + preferred_path.tcp_forward_ms(now, bytes)
+            + preferred_path.in_flight as f64 / preferred_path.tcp_bytes_per_ms(now))
+        .max(flow.last_arrival);
+        let candidate_path = &self.paths[candidate];
+        let candidate_arrival = (now as f64
+            + candidate_path.tcp_forward_ms(now, bytes)
+            + candidate_path.in_flight as f64 / candidate_path.tcp_bytes_per_ms(now))
+        .max(flow.last_arrival);
+        if candidate != preferred && preferred_arrival + 0.25 < candidate_arrival {
+            if preferred_path.send_budget_allows(bytes, false, now) {
                 flow.waiting_since = None;
-                return Some(fast);
+                return Some(preferred);
             }
             let since = *flow.waiting_since.get_or_insert(now);
             // At most one RTT, capped at 20 ms; no permanent waiting for a
             // preferred adapter. Failed paths disappear from `all` immediately.
-            let limit = p.rtt_ms.unwrap_or(20.0).ceil().clamp(2.0, 20.0) as u64;
+            let limit = preferred_path
+                .rtt_ms
+                .unwrap_or(20.0)
+                .ceil()
+                .clamp(2.0, 20.0) as u64;
             if now.saturating_sub(since) < limit {
                 self.counters.tcp_path_waits += 1;
                 return None;
             }
             self.counters.tcp_bounded_wait_fallbacks += 1;
+            // Keep the expired wait marker while the preferred path remains
+            // blocked. This permits a paced burst on the useful alternate
+            // instead of sending one packet and then waiting another RTT.
+            return Some(candidate);
         }
         flow.waiting_since = None;
         Some(candidate)
@@ -1395,9 +1436,12 @@ impl Scheduler {
         if let Some(flow) = self.tcp_flows.get_mut(&key) {
             // This is predicted receiver ordering, NOT an application ACK.
             // It expires with time, without waiting for receiver feedback.
-            flow.last_arrival = flow
-                .last_arrival
-                .max(now as f64 + self.paths[path].tcp_forward_ms(now, bytes));
+            let p = &self.paths[path];
+            flow.last_arrival = flow.last_arrival.max(
+                now as f64
+                    + p.tcp_forward_ms(now, bytes)
+                    + p.in_flight as f64 / p.tcp_bytes_per_ms(now),
+            );
             flow.touched = now;
         }
     }
@@ -1693,6 +1737,41 @@ impl Scheduler {
                         path.generation != attempt.generation || !path.ready(now)
                     })
                 });
+            let current_attempts = packet
+                .attempts
+                .iter()
+                .filter(|&(&index, attempt)| {
+                    self.paths
+                        .get(index)
+                        .is_some_and(|path| path.generation == attempt.generation)
+                })
+                .count();
+            let ready_paths = self.paths.iter().filter(|path| path.ready(now)).count();
+            // A blind resend on the only live outer path competes with the
+            // original packet and hides loss from the inner TCP sender. For
+            // bulk, sequence-bearing TCP, release the outer accounting and
+            // let native TCP recover with its own current congestion state.
+            // Explicit path failure still uses the alternate-path repair
+            // above, and small/SYN/FIN packets keep bounded outer repair.
+            if self.single_path_tcp_fast
+                && tcp
+                && packet.body.len() >= 600
+                && tcp_flow_key(&packet.body).is_some()
+                && ready_paths == 1
+                && !has_unavailable_attempt
+                && current_attempts == 1
+            {
+                self.release_flight(&packet);
+                for (&index, attempt) in &packet.attempts {
+                    if let Some(path) = self.paths.get_mut(index)
+                        && path.generation == attempt.generation
+                    {
+                        path.repair_timeout(now, false);
+                    }
+                }
+                self.counters.tcp_single_path_native_recoveries += 1;
+                continue;
+            }
             let target = if tcp {
                 // A prior attempt is not a reason to reject the fastest healthy
                 // path. Same-path retries reuse their existing flight charge;
@@ -1764,15 +1843,6 @@ impl Scheduler {
                         path.generation != attempt.generation || !path.recently_responding(now)
                     })
                 });
-                let current_attempts = packet
-                    .attempts
-                    .iter()
-                    .filter(|&(&index, attempt)| {
-                        self.paths
-                            .get(index)
-                            .is_some_and(|path| path.generation == attempt.generation)
-                    })
-                    .count();
                 let redundant_responsive_loss = !has_unresponsive_attempt && current_attempts > 1;
                 for (&index, attempt) in &packet.attempts {
                     if let Some(path) = self.paths.get_mut(index) {
@@ -1809,11 +1879,7 @@ impl Scheduler {
             .chain(&self.streaming)
             .map(Vec::len)
             .min();
-        let mut tcp_backlog = BTreeMap::<[u8; 12], usize>::new();
         for packet in &self.queued {
-            if let Some(key) = tcp_flow_key(packet) {
-                *tcp_backlog.entry(key).or_default() += packet.len();
-            }
             let minimum = if packet.get(9) == Some(&17) {
                 &mut minimum_priority
             } else {
@@ -1901,12 +1967,7 @@ impl Scheduler {
                     }
                 });
             let primary = if let Some(key) = tcp_key {
-                self.tcp_target(
-                    key,
-                    body.len(),
-                    tcp_backlog.get(&key).copied().unwrap_or(body.len()),
-                    now,
-                )
+                self.tcp_target(key, body.len(), now)
             } else {
                 pinned_primary.or_else(|| targets.first().copied())
             };
@@ -1925,9 +1986,6 @@ impl Scheduler {
             let primary = primary.expect("eligible primary");
             if let Some(key) = tcp_key {
                 self.note_tcp_placement(key, primary, body.len(), now);
-                if let Some(bytes) = tcp_backlog.get_mut(&key) {
-                    *bytes = bytes.saturating_sub(body.len());
-                }
             }
             let id = self.next_id;
             let Some(next) = id.checked_add(1) else {
@@ -3935,7 +3993,10 @@ mod tests {
         while now < first + REJOIN_STABLE_MS - 20 {
             now += 20;
             scheduler.receive(&Frame::control(Kind::Pong, 1, now, now - 5), now);
-            assert!(!scheduler.paths[1].ready(now), "admitted too early at {now}");
+            assert!(
+                !scheduler.paths[1].ready(now),
+                "admitted too early at {now}"
+            );
         }
         now += 20;
         scheduler.receive(&Frame::control(Kind::Pong, 1, now, now - 5), now);
@@ -3962,7 +4023,10 @@ mod tests {
         while now < restarted + REJOIN_STABLE_MS - 20 {
             now += 20;
             scheduler.receive(&Frame::control(Kind::Pong, 1, now, now - 5), now);
-            assert!(!scheduler.paths[1].ready(now), "a silence must restart the clock");
+            assert!(
+                !scheduler.paths[1].ready(now),
+                "a silence must restart the clock"
+            );
         }
         now += 20;
         scheduler.receive(&Frame::control(Kind::Pong, 1, now, now - 5), now);

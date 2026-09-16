@@ -2,7 +2,7 @@
 //! Removing a WAN return path does not replace that socket or the reassembly stream.
 use crate::reassembly::{Output, Stream};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     os::fd::AsRawFd,
@@ -23,6 +23,164 @@ const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
 const UDP_IDLE_US: u64 = 300_000_000;
 const DNS_PENDING_IDLE_US: u64 = 30_000_000;
 const DNS_COMPLETE_IDLE_US: u64 = 2_000_000;
+const ADAPTIVE_CLASS: u16 = 5;
+const ADAPTIVE_NACK_US: u64 = 30_000;
+const ADAPTIVE_MIN_HOLD_US: u64 = 80_000;
+const ADAPTIVE_MAX_HOLD_US: u64 = 2_000_000;
+const ADAPTIVE_MARGIN_US: u64 = 50_000;
+const ADAPTIVE_SAMPLE_LIMIT: usize = 256;
+const ADAPTIVE_SAMPLE_MAX_AGE_US: u64 = 10_000_000;
+const ADAPTIVE_ARRIVAL_LIMIT: usize = 4_096;
+
+#[derive(Clone, Copy)]
+struct PathTiming {
+    rtt_us: u64,
+    jitter_us: u64,
+    updated_us: u64,
+}
+
+struct FirstArrival {
+    path: u8,
+    at_us: u64,
+    observed_paths: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ProtectionTiming {
+    paths: HashMap<u8, PathTiming>,
+    arrivals: HashMap<(u16, u32), FirstArrival>,
+    arrival_order: VecDeque<(u16, u32)>,
+    skew_samples: VecDeque<(u64, u64)>,
+}
+
+impl ProtectionTiming {
+    fn update_links(&mut self, value: &serde_json::Value, now_us: u64) {
+        let Some(links) = value.get("links").and_then(|links| links.as_array()) else {
+            return;
+        };
+        for link in links {
+            let Some(id) = link.get("id").and_then(|id| id.as_u64()) else {
+                continue;
+            };
+            let status = link.get("status").and_then(|status| status.as_u64());
+            let disabled = link
+                .get("disabled")
+                .and_then(|disabled| disabled.as_bool())
+                .unwrap_or(false);
+            let rtt = link.get("rtt").and_then(|rtt| rtt.as_f64());
+            let jitter = link
+                .get("jitter")
+                .and_then(|jitter| jitter.as_f64())
+                .unwrap_or(0.0);
+            if id == 0
+                || id > u8::MAX as u64
+                || disabled
+                || !matches!(status, Some(1 | 2))
+                || rtt.is_none_or(|rtt| !rtt.is_finite() || rtt <= 0.0)
+                || !jitter.is_finite()
+            {
+                continue;
+            }
+            self.paths.insert(
+                id as u8,
+                PathTiming {
+                    rtt_us: (rtt.unwrap().clamp(0.0, 10_000.0) * 1_000.0) as u64,
+                    jitter_us: (jitter.clamp(0.0, 10_000.0) * 1_000.0) as u64,
+                    updated_us: now_us,
+                },
+            );
+        }
+        self.paths
+            .retain(|_, timing| now_us.saturating_sub(timing.updated_us) < 2_000_000);
+    }
+
+    fn observe_copy(&mut self, packet: &Packet, now_us: u64) {
+        if packet.class != ADAPTIVE_CLASS || packet.link == 0 {
+            return;
+        }
+        let key = (packet.local_port, packet.sequence);
+        if let Some(first) = self.arrivals.get_mut(&key) {
+            if packet.link != first.path && !first.observed_paths.contains(&packet.link) {
+                first.observed_paths.push(packet.link);
+                self.skew_samples
+                    .push_back((now_us, now_us.saturating_sub(first.at_us)));
+                while self.skew_samples.len() > ADAPTIVE_SAMPLE_LIMIT {
+                    self.skew_samples.pop_front();
+                }
+            }
+            return;
+        }
+        self.arrivals.insert(
+            key,
+            FirstArrival {
+                path: packet.link,
+                at_us: now_us,
+                observed_paths: vec![packet.link],
+            },
+        );
+        self.arrival_order.push_back(key);
+        while self.arrivals.len() > ADAPTIVE_ARRIVAL_LIMIT {
+            if let Some(oldest) = self.arrival_order.pop_front() {
+                self.arrivals.remove(&oldest);
+            }
+        }
+        while self.arrival_order.len() > ADAPTIVE_ARRIVAL_LIMIT * 2 {
+            if let Some(oldest) = self.arrival_order.pop_front()
+                && self.arrivals.contains_key(&oldest)
+            {
+                self.arrival_order.push_back(oldest);
+                break;
+            }
+        }
+    }
+
+    fn hold_us(&self, now_us: u64) -> u64 {
+        let recent: Vec<_> = self
+            .paths
+            .values()
+            .filter(|timing| now_us.saturating_sub(timing.updated_us) < 2_000_000)
+            .collect();
+        let reported_skew = if recent.len() >= 2 {
+            let fastest = recent
+                .iter()
+                .map(|timing| timing.rtt_us / 2)
+                .min()
+                .unwrap_or(0);
+            recent
+                .iter()
+                .map(|timing| timing.rtt_us / 2 + timing.jitter_us.saturating_mul(4))
+                .max()
+                .unwrap_or(fastest)
+                .saturating_sub(fastest)
+        } else {
+            0
+        };
+        let mut samples: Vec<_> = self
+            .skew_samples
+            .iter()
+            .filter(|(at, _)| now_us.saturating_sub(*at) <= ADAPTIVE_SAMPLE_MAX_AGE_US)
+            .map(|(_, skew)| *skew)
+            .collect();
+        let measured_skew = if samples.is_empty() {
+            0
+        } else {
+            samples.sort_unstable();
+            let rank = (samples.len() * 99).div_ceil(100).saturating_sub(1);
+            samples[rank]
+        };
+        reported_skew
+            .max(measured_skew)
+            .saturating_add(ADAPTIVE_MARGIN_US)
+            .clamp(ADAPTIVE_MIN_HOLD_US, ADAPTIVE_MAX_HOLD_US)
+    }
+
+    fn recent_sample_count(&self, now_us: u64) -> usize {
+        self.skew_samples
+            .iter()
+            .filter(|(at, _)| now_us.saturating_sub(*at) <= ADAPTIVE_SAMPLE_MAX_AGE_US)
+            .count()
+    }
+}
 
 // UDP has no remote FIN. Only validated DNS request/response exchanges use a
 // short idle timer; arbitrary UDP retains a five-minute idle mapping. See
@@ -83,10 +241,12 @@ struct Peer {
     paths: HashMap<u8, (SocketAddr, u64)>,
     disabled: HashMap<u8, bool>,
     sequence: u32,
+    protection: ProtectionTiming,
 }
 struct Ordered {
     stream: Stream,
     last: u64,
+    class: u16,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Counters {
@@ -99,6 +259,8 @@ pub struct Counters {
     pub capacity_rejections: u64,
     pub buffer_rejections: u64,
     pub peak_flows: usize,
+    pub adaptive_hold_us: u64,
+    pub adaptive_skew_samples: usize,
 }
 pub struct Gateway {
     socket: UdpSocket,
@@ -133,6 +295,7 @@ impl Gateway {
                     paths: HashMap::new(),
                     disabled: HashMap::new(),
                     sequence: 0,
+                    protection: ProtectionTiming::default(),
                 },
             );
         }
@@ -165,6 +328,7 @@ impl Gateway {
                 paths: HashMap::new(),
                 disabled: HashMap::new(),
                 sequence: 0,
+                protection: ProtectionTiming::default(),
             },
         );
         Ok(())
@@ -329,7 +493,11 @@ impl Gateway {
                         peer.disabled.insert(id as u8, disabled);
                     }
                 }
+                peer.protection.update_links(&value, now);
             }
+            let adaptive_hold_us = peer.protection.hold_us(now);
+            self.counters.adaptive_hold_us = adaptive_hold_us;
+            self.counters.adaptive_skew_samples = peer.protection.recent_sample_count(now);
             let reply = Packet {
                 flags: HEARTBEAT,
                 class: p.class,
@@ -338,6 +506,11 @@ impl Gateway {
                 timestamp_us: stamp(),
                 link: p.link,
                 protocol: p.protocol,
+                payload: serde_json::to_vec(&serde_json::json!({
+                    "adaptive_protection": 1,
+                    "protection_hold_us": adaptive_hold_us
+                }))
+                .unwrap_or_default(),
                 ..Default::default()
             };
             if let Ok(wire) = reply.encode(&peer.key) {
@@ -355,7 +528,19 @@ impl Gateway {
         }
         peer.paths.insert(p.link, (remote, now));
         let port = p.local_port;
-        if p.protocol == 4 || (5100..=5134).contains(&port) || p.destination_port == 53 {
+        let class = p.normalized_class();
+        let adaptive_hold_us = if class == ADAPTIVE_CLASS {
+            peer.protection.observe_copy(&p, now);
+            let hold = peer.protection.hold_us(now);
+            self.counters.adaptive_hold_us = hold;
+            self.counters.adaptive_skew_samples = peer.protection.recent_sample_count(now);
+            Some(hold)
+        } else {
+            None
+        };
+        if class != ADAPTIVE_CLASS
+            && (p.protocol == 4 || (5100..=5134).contains(&port) || p.destination_port == 53)
+        {
             // DNS transactions are independently matched by their IDs. They do
             // not need a ten-minute reorder stream, but copies still deduplicate.
             let mut result = Output {
@@ -389,7 +574,6 @@ impl Gateway {
             self.counters.rejected += 1;
             return;
         }
-        let class = p.normalized_class();
         let (budget, grace, capacity) = match class {
             // Bonded Speed stripes one flow across unequal paths. At 20 Mbps a
             // 100 ms path skew can hold roughly 200 full-sized datagrams, so its
@@ -397,25 +581,44 @@ impl Gateway {
             // Request a repair after 30 ms; waiting 100 ms here caused the media
             // receiver to exhaust its own latency budget during a silent cut.
             3 => (30_000, 50_000, 1_024),
+            // Adaptive Protection keeps early repair requests but delays final
+            // release long enough for a proactively duplicated high-latency
+            // copy. The wait is derived from live path evidence and bounded.
+            ADAPTIVE_CLASS => (ADAPTIVE_NACK_US, 50_000, 8_192),
             4 => (50_000, 25_000, 64),
             2 => (2_000_000, 200_000, 64),
             _ => (5_000_000, 200_000, 64),
         };
-        let stream = self
+        let ordered = self
             .streams
             .entry((session, port))
             .or_insert_with(|| Ordered {
-                stream: if class == 3 {
+                stream: if matches!(class, 3 | ADAPTIVE_CLASS) {
                     Stream::new_repairing(budget, grace, capacity)
                 } else {
                     Stream::new(budget, grace, capacity)
                 },
                 last: now,
+                class,
             });
-        stream.last = now;
-        let before = stream.stream.buffered_bytes();
-        let result = stream.stream.insert(p, now);
-        self.buffered_bytes = self.buffered_bytes - before + stream.stream.buffered_bytes();
+        if ordered.class != class && (ordered.class == ADAPTIVE_CLASS || class == ADAPTIVE_CLASS) {
+            ordered.stream = if matches!(class, 3 | ADAPTIVE_CLASS) {
+                Stream::new_repairing_from(p.sequence, budget, grace, capacity)
+            } else {
+                Stream::new_from(p.sequence, budget, grace, capacity)
+            };
+            ordered.class = class;
+        }
+        if class == ADAPTIVE_CLASS {
+            ordered.stream.set_adaptive_window(
+                ADAPTIVE_NACK_US,
+                adaptive_hold_us.unwrap_or(ADAPTIVE_MIN_HOLD_US),
+            );
+        }
+        ordered.last = now;
+        let before = ordered.stream.buffered_bytes();
+        let result = ordered.stream.insert(p, now);
+        self.buffered_bytes = self.buffered_bytes - before + ordered.stream.buffered_bytes();
         match result {
             Ok(result) => self.output(session, port, result, now),
             Err(_) => self.counters.rejected += 1,
@@ -596,6 +799,122 @@ mod lifecycle_tests {
                 pending: Default::default(),
             }),
         }
+    }
+
+    fn unequal_path_report() -> serde_json::Value {
+        serde_json::json!({"links":[
+            {"id":1,"status":1,"disabled":false,"rtt":50.0,"jitter":2.0},
+            {"id":2,"status":1,"disabled":false,"rtt":600.0,"jitter":10.0}
+        ]})
+    }
+
+    #[test]
+    fn adaptive_hold_uses_reported_latency_spread_and_jitter() {
+        let mut timing = ProtectionTiming::default();
+        timing.update_links(&unequal_path_report(), 1_000_000);
+        // Fastest one-way estimate: 25 ms. Slow estimate plus four jitter
+        // deviations: 340 ms. Add the bounded 50 ms protection margin.
+        assert_eq!(timing.hold_us(1_000_000), 365_000);
+    }
+
+    #[test]
+    fn adaptive_hold_is_data_driven_for_two_or_more_arbitrary_wans() {
+        let profiles = [
+            (
+                serde_json::json!({"links":[
+                    {"id":1,"status":1,"disabled":false,"rtt":20.0,"jitter":1.0},
+                    {"id":2,"status":1,"disabled":false,"rtt":20.0,"jitter":1.0}
+                ]}),
+                80_000,
+            ),
+            (
+                serde_json::json!({"links":[
+                    {"id":4,"status":1,"disabled":false,"rtt":40.0,"jitter":2.0},
+                    {"id":9,"status":1,"disabled":false,"rtt":120.0,"jitter":8.0}
+                ]}),
+                122_000,
+            ),
+            (
+                serde_json::json!({"links":[
+                    {"id":2,"status":1,"disabled":false,"rtt":80.0,"jitter":4.0},
+                    {"id":7,"status":1,"disabled":false,"rtt":300.0,"jitter":20.0},
+                    {"id":11,"status":1,"disabled":false,"rtt":45.0,"jitter":3.0}
+                ]}),
+                257_500,
+            ),
+        ];
+        for (profile, expected) in profiles {
+            let mut timing = ProtectionTiming::default();
+            timing.update_links(&profile, 1_000_000);
+            assert_eq!(timing.hold_us(1_000_000), expected);
+        }
+    }
+
+    #[test]
+    fn observed_copy_arrival_skew_can_extend_the_reported_hold() {
+        let mut timing = ProtectionTiming::default();
+        let mut p = packet(10000, 9000, 7);
+        p.class = ADAPTIVE_CLASS;
+        p.link = 1;
+        timing.observe_copy(&p, 1_000_000);
+        p.flags = verz_link_core::FEC;
+        p.link = 2;
+        timing.observe_copy(&p, 1_700_000);
+        assert_eq!(timing.hold_us(1_700_000), 750_000);
+        assert_eq!(timing.skew_samples.len(), 1);
+        timing.update_links(
+            &serde_json::json!({"links":[
+                {"id":1,"status":1,"disabled":false,"rtt":20.0,"jitter":1.0},
+                {"id":2,"status":1,"disabled":false,"rtt":20.0,"jitter":1.0}
+            ]}),
+            11_700_001,
+        );
+        assert_eq!(
+            timing.hold_us(11_700_001),
+            ADAPTIVE_MIN_HOLD_US,
+            "expired path skew must not permanently inflate the buffer"
+        );
+        assert_eq!(timing.recent_sample_count(11_700_001), 0);
+    }
+
+    #[test]
+    fn adaptive_stream_waits_for_delayed_cross_wan_copy() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        g.peers
+            .get_mut(&1)
+            .unwrap()
+            .protection
+            .update_links(&unequal_path_report(), 0);
+
+        let mut later = packet(10000, destination, 1);
+        later.class = ADAPTIVE_CLASS;
+        later.payload = vec![1];
+        ingest(&mut g, &later, 0);
+        let request = g.streams.get_mut(&(1, 10000)).unwrap().stream.tick(100_000);
+        assert!(
+            request.ready.is_empty(),
+            "later packet escaped before protection deadline"
+        );
+
+        let mut delayed = packet(10000, destination, 0);
+        delayed.class = ADAPTIVE_CLASS;
+        delayed.flags = verz_link_core::FEC;
+        delayed.link = 2;
+        delayed.payload = vec![0];
+        ingest(&mut g, &delayed, 300_000);
+        assert_eq!(
+            g.counters.uplink_bytes, 0,
+            "adaptive traffic escaped before the playout deadline"
+        );
+        let result = g.streams.get_mut(&(1, 10000)).unwrap().stream.tick(365_000);
+        g.output(1, 10000, result, 365_000);
+
+        let mut payload = [0u8; 8];
+        assert_eq!(sink.recv_from(&mut payload).unwrap().0, 1);
+        assert_eq!(payload[0], 0);
+        assert_eq!(sink.recv_from(&mut payload).unwrap().0, 1);
+        assert_eq!(payload[0], 1);
     }
 
     #[test]

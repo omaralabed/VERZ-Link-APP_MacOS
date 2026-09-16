@@ -167,6 +167,20 @@ impl Transport {
     }
 
     pub fn open(&mut self, packet: &[u8]) -> Result<(u8, Vec<u8>)> {
+        let mut plaintext = [0; MAX_PAYLOAD + 17];
+        let (kind, body) = self.open_into(packet, &mut plaintext)?;
+        Ok((kind, body.to_vec()))
+    }
+
+    /// Open a transport packet into caller-owned scratch space.
+    ///
+    /// This is wire-identical to `open`; it only lets hot receive loops avoid
+    /// allocating and copying the decrypted body before decoding it.
+    pub fn open_into<'a>(
+        &mut self,
+        packet: &[u8],
+        plaintext: &'a mut [u8; MAX_PAYLOAD + 17],
+    ) -> Result<(u8, &'a [u8])> {
         let header = Header::parse(packet)?;
         ensure!(
             packet.len() <= HEADER + 1 + self.max_payload + 16,
@@ -180,17 +194,16 @@ impl Transport {
             !self.replay.contains(header.counter),
             "replayed transport packet"
         );
-        let mut plaintext = [0; MAX_PAYLOAD + 17];
         let len = self
             .noise
-            .read_message(header.counter, &packet[HEADER..], &mut plaintext)?;
+            .read_message(header.counter, &packet[HEADER..], plaintext)?;
         ensure!(
             len >= 1 && (IP..=CLOSE).contains(&plaintext[0]),
             "invalid encrypted type"
         );
         ensure!(plaintext[0] == IP || len == 1, "invalid control body");
         self.replay.mark(header.counter);
-        Ok((plaintext[0], plaintext[1..len].to_vec()))
+        Ok((plaintext[0], &plaintext[1..len]))
     }
 }
 

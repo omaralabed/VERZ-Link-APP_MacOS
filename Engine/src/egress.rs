@@ -44,6 +44,9 @@ pub struct Egress {
     pub counters: SendCounters,
 }
 
+// The derived default would disable Linux UDP GSO and change production
+// behavior; the platform-dependent default is intentional.
+#[allow(clippy::derivable_impls)]
 impl Default for Egress {
     fn default() -> Self {
         Self {

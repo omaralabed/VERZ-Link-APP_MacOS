@@ -24,14 +24,15 @@ use verz_link_lab::{
         AckBatcher, BOND_MTU, FEATURE_ACK_BATCH, FEATURE_PATH_FAILURE, FEATURE_UDP_LANE, Frame,
         Kind, MAX_PATHS, Policy, Scheduler, handshake, transport as bond_transport,
     },
+    carrier_io::ReceiveBatch,
     egress::{Datagram, Egress},
     intake::{INTAKE_BATCH, KernelTxMonitor, TunIntake},
     interface_carrier, load_secret,
     payload_meter::{Direction, PayloadMeter, udp_payload_len},
     reorder::{ReorderStats, TcpReorder},
     tunnel::{
-        HEADER, HELLO, Header, IP, MAX_WIRE, Transport, WELCOME, internet_destination_allowed,
-        validate_ipv4,
+        HEADER, HELLO, Header, IP, MAX_PAYLOAD, MAX_WIRE, Transport, WELCOME,
+        internet_destination_allowed, validate_ipv4,
     },
     udp_lane::{self, UdpLane},
 };
@@ -40,8 +41,35 @@ const SERVER_IP: [u8; 4] = [10, 78, 0, 1];
 const DEFAULT_RELAY: &str = "69.164.213.57:443";
 const PACKET_WRITER_QUEUE: usize = 8192;
 
+fn single_path_tcp_fast_enabled() -> bool {
+    std::env::var("VERZ_TCP_SINGLE_PATH_FAST")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn carrier_receive_batch_enabled() -> bool {
+    std::env::var("VERZ_TCP_CARRIER_BATCH")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+struct PacketDelivery {
+    packet: Vec<u8>,
+    reorder_tcp: bool,
+}
+
 struct PacketWriter {
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<PacketDelivery>,
     task: JoinHandle<std::io::Result<()>>,
     reorder: Arc<Mutex<ReorderStats>>,
     udp_payload: Arc<AtomicU64>,
@@ -52,13 +80,14 @@ impl PacketWriter {
         *self.reorder.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn udp(tun: Arc<AsyncDevice>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
+        let (sender, mut receiver) = mpsc::channel::<PacketDelivery>(1024);
         let udp_payload = Arc::new(AtomicU64::new(0));
         let udp_unmeasured = Arc::new(AtomicU64::new(0));
         let received = udp_payload.clone();
         let unmeasured = udp_unmeasured.clone();
         let task = tokio::spawn(async move {
-            while let Some(packet) = receiver.recv().await {
+            while let Some(delivery) = receiver.recv().await {
+                let packet = delivery.packet;
                 if tun.send(&packet).await? != packet.len() {
                     return Err(std::io::Error::other("short UDP TUN write"));
                 }
@@ -83,7 +112,7 @@ impl PacketWriter {
         // megabytes while the TUN writer drains. Keep this bounded, but large
         // enough that recovery does not turn a short path event into packet
         // drops and thousands of repairs.
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>(PACKET_WRITER_QUEUE);
+        let (sender, receiver) = mpsc::channel::<PacketDelivery>(PACKET_WRITER_QUEUE);
         let reorder = Arc::new(Mutex::new(ReorderStats::default()));
         let task = tokio::spawn(run_packet_writer_observed(
             receiver,
@@ -118,7 +147,7 @@ impl PacketWriter {
 // by 8,192 admitted packets plus TcpReorder's 8,192-packet global bound.
 #[cfg(test)]
 async fn run_packet_writer<F, Fut>(
-    receiver: mpsc::Receiver<Vec<u8>>,
+    receiver: mpsc::Receiver<PacketDelivery>,
     write: F,
 ) -> std::io::Result<()>
 where
@@ -129,7 +158,7 @@ where
 }
 
 async fn run_packet_writer_observed<F, Fut>(
-    mut receiver: mpsc::Receiver<Vec<u8>>,
+    mut receiver: mpsc::Receiver<PacketDelivery>,
     observed: Arc<Mutex<ReorderStats>>,
     mut write: F,
 ) -> std::io::Result<()>
@@ -151,7 +180,10 @@ where
                 continue;
             },
             packet = receiver.recv() => match packet {
-                Some(packet) => reorder.push(packet, now(epoch)),
+                Some(delivery) if delivery.reorder_tcp => {
+                    reorder.push(delivery.packet, now(epoch))
+                },
+                Some(delivery) => reorder.push_single_path(delivery.packet, now(epoch)),
                 None => return Ok(()),
             },
             _ = tick.tick() => reorder.drain_due(now(epoch)),
@@ -176,10 +208,20 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn receive_to_writer(
     scheduler: &mut Scheduler,
     writer: &PacketWriter,
     frame: &Frame,
+    moment: u64,
+) -> Result<Vec<Frame>> {
+    receive_owned_to_writer(scheduler, writer, frame.clone(), moment)
+}
+
+fn receive_owned_to_writer(
+    scheduler: &mut Scheduler,
+    writer: &PacketWriter,
+    frame: Frame,
     moment: u64,
 ) -> Result<Vec<Frame>> {
     let permit = if frame.kind == Kind::Data && !scheduler.has_received(frame.id) {
@@ -199,11 +241,20 @@ fn receive_to_writer(
     } else {
         None
     };
-    let (delivery, responses) = scheduler.receive(frame, moment);
+    let (delivery, responses) = scheduler.receive_owned(frame, moment);
     if let Some(packet) = delivery {
+        // Cross-path arrival differences require a short userspace reorder
+        // hold. With zero or one usable path, deliver directly and let native
+        // TCP expose real loss immediately instead of manufacturing an extra
+        // 80+ ms head-of-line pause.
+        let reorder_tcp =
+            !scheduler.single_path_tcp_fast() || scheduler.data_paths(moment).len() > 1;
         permit
             .context("new packet has no reserved delivery capacity")?
-            .send(packet);
+            .send(PacketDelivery {
+                packet,
+                reorder_tcp,
+            });
     }
     Ok(responses)
 }
@@ -673,7 +724,12 @@ fn drain_udp(lane: &mut UdpLane, writer: &PacketWriter) -> Result<()> {
     while lane.front().is_some() {
         match writer.sender.try_reserve() {
             Ok(permit) => {
-                permit.send(lane.pop().expect("front checked"));
+                permit.send(PacketDelivery {
+                    packet: lane.pop().expect("front checked"),
+                    // The independent UDP lane has never used TCP sequence
+                    // reordering; preserve that direct-delivery behavior.
+                    reorder_tcp: false,
+                });
             }
             Err(mpsc::error::TrySendError::Full(_)) => break,
             Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("UDP tunnel writer stopped"),
@@ -704,6 +760,7 @@ async fn client_with_controls(
         names.iter().map(|name| (name.clone(), false)).collect(),
         args.policy,
     )?;
+    scheduler.set_single_path_tcp_fast(single_path_tcp_fast_enabled());
     let (sender, mut input) = mpsc::channel(1024);
     let mut sockets: Vec<Option<Subflow>> = names
         .iter()
@@ -789,6 +846,7 @@ async fn client_with_controls(
         });
     }
     let mut ip = [0; 65536];
+    let mut decrypted = [0; MAX_PAYLOAD + 17];
     let mut tick = time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut report = time::interval(Duration::from_millis(500));
@@ -914,9 +972,9 @@ async fn client_with_controls(
                     }
                     Incoming::Wire(index, generation, packet) => {
                         if !sockets.get(index).and_then(Option::as_ref).is_some_and(|socket| socket.generation == generation) { continue; }
-                        let Ok((kind, body)) = transport.open(&packet) else { continue; };
+                        let Ok((kind, body)) = transport.open_into(&packet, &mut decrypted) else { continue; };
                         if kind != IP { continue; }
-                        let Ok(frame) = Frame::decode(&body) else { continue; };
+                        let Ok(frame) = Frame::decode(body) else { continue; };
                         if usize::from(frame.path) != index { continue; }
                         if frame.kind == Kind::PathFailureReady {
                             if frame.id == FEATURE_PATH_FAILURE {
@@ -953,7 +1011,7 @@ async fn client_with_controls(
                             && let Some(path) = sockets[index].as_mut() { path.ack_batching = true; }
                         if frame.kind == Kind::Data && validate_ipv4(&frame.body, None, Some(assigned)).is_err() { continue; }
                         if frame.kind == Kind::Data { payload.observe(&frame.body, Direction::Download, now(epoch)); }
-                        let responses = receive_to_writer(&mut scheduler, &writer, &frame, now(epoch))?;
+                        let responses = receive_owned_to_writer(&mut scheduler, &writer, frame, now(epoch))?;
                         send_client(responses, &mut transport, &mut sockets, &mut scheduler)?;
                     }
                 }
@@ -1149,7 +1207,8 @@ async fn server(args: Server) -> Result<()> {
     let mut writer = PacketWriter::new(tun.clone());
     let mut peers: HashMap<[u8; 16], Peer> = HashMap::new();
     let mut udp_writer = PacketWriter::udp(tun.clone());
-    let mut wire = [0; MAX_WIRE + 1];
+    let mut carrier_rx = ReceiveBatch::new(MAX_WIRE + 1, carrier_receive_batch_enabled());
+    let mut decrypted = [0; MAX_PAYLOAD + 17];
     let epoch = Instant::now();
     let mut tick = time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1167,7 +1226,7 @@ async fn server(args: Server) -> Result<()> {
             result = &mut writer.task => { result.context("tunnel writer task")??; anyhow::bail!("tunnel writer stopped"); }
             _ = report.tick() => {
                 peers.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(120));
-                println!("{}", json!({"devices":peers.len(), "tcp_reorder":writer.reorder_snapshot(), "tun_intake":intake.snapshot(), "kernel_tx":kernel_tx.snapshot(), "tcp_socket_tx":egress, "healthy_paths":peers.values().map(|peer| peer.scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count()).sum::<usize>(),
+                println!("{}", json!({"devices":peers.len(), "carrier_rx":carrier_rx.snapshot(), "tcp_reorder":writer.reorder_snapshot(), "tun_intake":intake.snapshot(), "kernel_tx":kernel_tx.snapshot(), "tcp_socket_tx":egress, "healthy_paths":peers.values().map(|peer| peer.scheduler.paths.iter().filter(|path| path.ready(now(epoch))).count()).sum::<usize>(),
                     "clients":peers.values().map(|peer| json!({"ip":Ipv4Addr::from(peer.assigned).to_string(), "ack_batching":peer.ack_batching, "paths":peer.scheduler.paths, "counters":peer.scheduler.counters, "udp_enabled":peer.udp_enabled, "path_failure_enabled":peer.path_failure_enabled, "udp_lane":peer.udp.counters})).collect::<Vec<_>>()}));
             }
             _ = tick.tick(), if !peers.is_empty() => {
@@ -1185,9 +1244,10 @@ async fn server(args: Server) -> Result<()> {
                 }
             }
             result = &mut udp_writer.task => { result.context("UDP tunnel writer task")??; anyhow::bail!("UDP tunnel writer stopped"); }
-            received = socket.recv_from(&mut wire) => {
-                let (length, address) = received?;
-                let packet = &wire[..length];
+            count = carrier_rx.recv(&socket) => {
+                let count = count?;
+                for received in 0..count {
+                let Some((packet, address)) = carrier_rx.datagram(received) else { continue; };
                 let Ok(header) = Header::parse(packet) else { continue; };
                 if header.kind == HELLO {
                     if let Some(peer) = peers.get(&header.session) {
@@ -1204,6 +1264,7 @@ async fn server(args: Server) -> Result<()> {
                     let welcome = Header { kind: WELCOME, session: header.session, counter: 0 }.wrap(&plain[..length]);
                     let _ = socket.try_send_to(&welcome, address);
                     let mut scheduler = Scheduler::new(vec![("path0".into(), false)], Policy::Smart)?;
+                    scheduler.set_single_path_tcp_fast(single_path_tcp_fast_enabled());
                     scheduler.remove_path(0);
                     peers.insert(header.session, Peer { transport: bond_transport(header.session, noise)?, assigned,
                         addresses: vec![None], join_stamps: vec![0], scheduler, hello: packet.to_vec(), welcome, last_seen: Instant::now(),
@@ -1213,9 +1274,9 @@ async fn server(args: Server) -> Result<()> {
                     continue;
                 }
                 let Some(peer) = peers.get_mut(&header.session) else { continue; };
-                let Ok((kind, body)) = peer.transport.open(packet) else { continue; };
+                let Ok((kind, body)) = peer.transport.open_into(packet, &mut decrypted) else { continue; };
                 if kind != IP { continue; }
-                let Ok(frame) = Frame::decode(&body) else { continue; };
+                let Ok(frame) = Frame::decode(body) else { continue; };
                 let index = usize::from(frame.path);
                 if frame.kind == Kind::Join {
                     while peer.addresses.len() <= index {
@@ -1262,17 +1323,21 @@ async fn server(args: Server) -> Result<()> {
                     continue;
                 }
                 if frame.kind == Kind::Data && (validate_ipv4(&frame.body, Some(peer.assigned), None).is_err() || !destination_allowed(&frame.body)) { continue; }
-                let mut responses = receive_to_writer(&mut peer.scheduler, &writer, &frame, now(epoch))?;
-                if frame.kind == Kind::Join && peer.ack_batching {
+                let frame_kind = frame.kind;
+                let frame_path = frame.path;
+                let frame_stamp = frame.stamp;
+                let mut responses = receive_owned_to_writer(&mut peer.scheduler, &writer, frame, now(epoch))?;
+                if frame_kind == Kind::Join && peer.ack_batching {
                     for response in &mut responses { response.kind = Kind::JoinAck; }
                 }
-                if frame.kind == Kind::Join && peer.udp_enabled {
-                    responses.push(Frame::control(Kind::UdpReady, frame.path, FEATURE_UDP_LANE, frame.stamp));
+                if frame_kind == Kind::Join && peer.udp_enabled {
+                    responses.push(Frame::control(Kind::UdpReady, frame_path, FEATURE_UDP_LANE, frame_stamp));
                 }
-                if frame.kind == Kind::Join && peer.path_failure_enabled {
-                    responses.push(Frame::control(Kind::PathFailureReady, frame.path, FEATURE_PATH_FAILURE, frame.stamp));
+                if frame_kind == Kind::Join && peer.path_failure_enabled {
+                    responses.push(Frame::control(Kind::PathFailureReady, frame_path, FEATURE_PATH_FAILURE, frame_stamp));
                 }
                 send_server(&socket, peer, responses, &mut egress)?;
+                }
             }
             count = intake.recv_batch(&mut intake_batch) => {
                 if count == 0 {
@@ -1483,14 +1548,51 @@ mod tests {
             receive_to_writer(&mut scheduler, &writer, &probe, 2)?[0].kind,
             Kind::Pong
         );
-        assert_eq!(receiver.try_recv()?, first.body);
+        let received = receiver.try_recv()?;
+        assert!(!received.reorder_tcp);
+        assert_eq!(received.packet, first.body);
         assert_eq!(
             receive_to_writer(&mut scheduler, &writer, &next, 70)?.len(),
             1
         );
-        assert_eq!(receiver.try_recv()?, next.body);
+        assert_eq!(receiver.try_recv()?.packet, next.body);
         assert_eq!(scheduler.counters.delivered_packets, 2);
         assert_eq!(scheduler.counters.queue_drops, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_writer_holds_only_when_multiple_paths_are_ready() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let writer = PacketWriter {
+            sender,
+            task: tokio::spawn(std::future::pending()),
+            reorder: Default::default(),
+            udp_payload: Default::default(),
+            udp_unmeasured: Default::default(),
+        };
+        let mut single = Scheduler::new(vec![("wifi".into(), false)], Policy::Smart)?;
+        for at in [10, 20, 30] {
+            single.receive(&Frame::control(Kind::Pong, 0, 0, at - 5), at);
+        }
+        receive_to_writer(&mut single, &writer, &data(0), 31)?;
+        assert!(!receiver.try_recv()?.reorder_tcp);
+
+        let mut multiple = Scheduler::new(
+            vec![("wifi".into(), false), ("lan".into(), false)],
+            Policy::Smart,
+        )?;
+        for at in [10, 20, 30] {
+            for path in 0..2 {
+                multiple.receive(&Frame::control(Kind::Pong, path, 0, at - 5), at);
+            }
+        }
+        receive_to_writer(&mut multiple, &writer, &data(0), 31)?;
+        assert!(receiver.try_recv()?.reorder_tcp);
+
+        single.set_single_path_tcp_fast(false);
+        receive_to_writer(&mut single, &writer, &data(1), 32)?;
+        assert!(receiver.try_recv()?.reorder_tcp);
         Ok(())
     }
 
@@ -1555,7 +1657,13 @@ mod tests {
     #[tokio::test]
     async fn writer_failure_is_reported_not_silently_discarded() {
         let (sender, receiver) = mpsc::channel(1);
-        sender.send(data(0).body).await.unwrap();
+        sender
+            .send(PacketDelivery {
+                packet: data(0).body,
+                reorder_tcp: false,
+            })
+            .await
+            .unwrap();
         let error = run_packet_writer(receiver, |_| {
             std::future::ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,

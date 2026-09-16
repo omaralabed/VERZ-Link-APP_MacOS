@@ -21,6 +21,12 @@ use verz_link_core::{
     transport::{Sender, WanWriter},
 };
 
+const MODE_BONDED_SPEED: i32 = 1;
+const MODE_CONTINUITY: i32 = 2;
+const MODE_DATA_SAVER: i32 = 3;
+const MODE_ADAPTIVE_PROTECTION: i32 = 4;
+const ADAPTIVE_CLASS: u16 = 5;
+
 #[derive(Deserialize)]
 struct Enrollment {
     gateway: SocketAddr,
@@ -56,6 +62,8 @@ pub struct Engine {
     pub errors: u64,
     mode: i32,
     bonded: BondedSpeed,
+    adaptive_supported: bool,
+    adaptive_hold_us: u64,
 }
 fn stamp() -> i64 {
     SystemTime::now()
@@ -86,6 +94,8 @@ impl Engine {
             errors: 0,
             mode: 0,
             bonded: BondedSpeed::default(),
+            adaptive_supported: false,
+            adaptive_hold_us: 0,
         })
     }
     fn adapters(&mut self, adapters: Vec<Adapter>) -> Result<(), String> {
@@ -159,7 +169,7 @@ impl Engine {
                     100.0 * p.outcomes.iter().filter(|v| !**v).count() as f64
                         / p.outcomes.len() as f64
                 },
-                capacity: if self.mode == 1 {
+                capacity: if self.mode == MODE_BONDED_SPEED {
                     self.bonded.capacity_bps(id).unwrap_or(0.0)
                 } else {
                     0.0
@@ -169,19 +179,32 @@ impl Engine {
             .collect()
     }
     fn send(&mut self, port: u16, ip: [u8; 4], remote: u16, payload: &[u8]) -> Result<(), String> {
+        // An older gateway does not understand class 5. Until the authenticated
+        // heartbeat advertises support, requested Adaptive Protection safely
+        // behaves as the existing Continuity mode and emits only class 4.
+        let adaptive = self.mode == MODE_ADAPTIVE_PROTECTION && self.adaptive_supported;
         let p = Packet {
             // Class 3 is reserved here for capacity-weighted Bonded Speed.
             // Existing continuity/latency behavior remains class 4.
-            class: if self.mode == 1 { 3 } else { 4 },
+            class: if self.mode == MODE_BONDED_SPEED {
+                3
+            } else if adaptive {
+                ADAPTIVE_CLASS
+            } else {
+                4
+            },
             local_port: port,
             destination: ip,
             destination_port: remote,
+            // The gateway uses only within-stream timestamp differences for
+            // adaptive playout; clocks do not need to be synchronized. Keeping
+            // the established timestamp also preserves restart detection.
             timestamp_us: stamp(),
             payload: payload.to_vec(),
             ..Default::default()
         };
         let links = self.links();
-        let (result, bonded_send) = if self.mode == 1 {
+        let (result, bonded_send) = if self.mode == MODE_BONDED_SPEED {
             let now_us = self.start.elapsed().as_micros() as u64;
             let wire_bytes = payload
                 .len()
@@ -194,6 +217,24 @@ impl Engine {
                 self.sender
                     .forward_on(p.clone(), &links, &mut self.sockets, preferred),
                 Some((wire_bytes, now_us)),
+            )
+        } else if adaptive {
+            let preferred = links
+                .iter()
+                .filter(|link| !link.disabled && link.status == 1)
+                .min_by(|left, right| {
+                    let left_arrival = left.rtt + left.jitter * 4.0;
+                    let right_arrival = right.rtt + right.jitter * 4.0;
+                    left_arrival
+                        .total_cmp(&right_arrival)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|link| link.id)
+                .ok_or_else(|| "no healthy WAN for Adaptive Protection".to_owned())?;
+            (
+                self.sender
+                    .forward_on(p.clone(), &links, &mut self.sockets, preferred),
+                None,
             )
         } else {
             // Keep the proven Continuity path on Sender::forward exactly as it
@@ -211,8 +252,10 @@ impl Engine {
             self.bonded
                 .sent(port, sent.sequence, sent.primary, wire_bytes, now_us);
         }
-        if self.mode == 2 {
-            // Redundancy mode sends a copy immediately, rather than waiting for failure detection.
+        if self.mode == MODE_CONTINUITY || self.mode == MODE_ADAPTIVE_PROTECTION {
+            // Continuity preserves its existing immediate-copy behavior.
+            // Adaptive Protection uses the same proven copy envelope, while its
+            // isolated packet class gives the gateway a longer measured wait.
             for link in links
                 .iter()
                 .filter(|l| l.status == 1 && l.id != sent.primary && Some(l.id) != sent.duplicate)
@@ -236,6 +279,13 @@ impl Engine {
         if self.heartbeat.elapsed().as_millis() >= 100 {
             self.heartbeat = Instant::now();
             self.probe = self.probe.wrapping_add(1);
+            // Preserve the exact legacy heartbeat payload outside the isolated
+            // Adaptive Protection mode.
+            let report = if self.mode == MODE_ADAPTIVE_PROTECTION {
+                serde_json::to_vec(&serde_json::json!({"links": self.links()})).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             for (&id, p) in &mut self.paths {
                 p.probes.retain(|_, t| {
                     if t.elapsed().as_secs() >= 2 {
@@ -254,6 +304,7 @@ impl Engine {
                     sequence: self.probe,
                     link: id,
                     timestamp_us: stamp(),
+                    payload: report.clone(),
                     ..Default::default()
                 };
                 if let Ok(w) = packet.encode(self.enrollment.key.as_bytes()) {
@@ -284,6 +335,18 @@ impl Engine {
             }
             match p.flags {
                 HEARTBEAT => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&p.payload)
+                        && value
+                            .get("adaptive_protection")
+                            .and_then(|value| value.as_u64())
+                            == Some(1)
+                    {
+                        self.adaptive_supported = true;
+                        self.adaptive_hold_us = value
+                            .get("protection_hold_us")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(self.adaptive_hold_us);
+                    }
                     if let Some(path) = self.paths.get_mut(&id)
                         && let Some(t) = path.probes.remove(&p.sequence)
                     {
@@ -299,7 +362,7 @@ impl Engine {
                         }
                     }
                 }
-                ACK | NACK if self.mode == 1 => {
+                ACK | NACK if self.mode == MODE_BONDED_SPEED => {
                     let mut repairs = Vec::new();
                     let now_us = self.start.elapsed().as_micros() as u64;
                     if p.flags == ACK {
@@ -331,6 +394,20 @@ impl Engine {
                             repair.path,
                             repair.wire_bytes,
                             now_us,
+                        );
+                    }
+                }
+                ACK | NACK if self.mode == MODE_ADAPTIVE_PROTECTION => {
+                    if p.flags == ACK {
+                        let _ = self.sender.control(&wire, &self.links(), &mut self.sockets);
+                    } else {
+                        // A NACK arriving through one path is fresh proof that
+                        // path can carry a repair around a silently failed peer.
+                        let _ = self.sender.control_on(
+                            &wire,
+                            &self.links(),
+                            &mut self.sockets,
+                            Some(id),
                         );
                     }
                 }
@@ -470,7 +547,7 @@ pub unsafe extern "C" fn verz_status(e: *mut Engine, out: *mut u8, cap: usize) -
         return 0;
     }
     let e = unsafe { &*e };
-    let value = serde_json::json!({"upload":e.upload,"download":e.download,"errors":e.errors,"wire":e.sockets.bytes,"paths":e.links(),"mode":e.mode,"bonded_speed":e.bonded.status(),"adapters":e.paths.iter().map(|(id,p)|(id.to_string(),p.adapter.name.clone())).collect::<BTreeMap<_,_>>()});
+    let value = serde_json::json!({"upload":e.upload,"download":e.download,"errors":e.errors,"wire":e.sockets.bytes,"paths":e.links(),"mode":e.mode,"bonded_speed":e.bonded.status(),"adaptive_protection":{"supported":e.adaptive_supported,"hold_us":e.adaptive_hold_us},"adapters":e.paths.iter().map(|(id,p)|(id.to_string(),p.adapter.name.clone())).collect::<BTreeMap<_,_>>()});
     let data = serde_json::to_vec(&value).unwrap_or_default();
     if data.len() > cap {
         return 0;
@@ -485,7 +562,7 @@ pub unsafe extern "C" fn verz_status(e: *mut Engine, out: *mut u8, cap: usize) -
 /// `e` must be null or a live engine with serial exclusive access.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn verz_mode(e: *mut Engine, mode: i32) {
-    if e.is_null() || !(0..=3).contains(&mode) {
+    if e.is_null() || !(0..=MODE_ADAPTIVE_PROTECTION).contains(&mode) {
         return;
     }
     let e = unsafe { &mut *e };
@@ -495,9 +572,12 @@ pub unsafe extern "C" fn verz_mode(e: *mut Engine, mode: i32) {
     e.mode = mode;
     e.sender.set_config(Config {
         // Mode 1 chooses through BondedSpeed::select and deliberately avoids
-        // duplicate payload. Modes 0/2/3 retain their previous core scheduler.
+        // duplicate payload. Modes 0/2/3 retain their previous core scheduler;
+        // mode 4 uses explicit protection copies and its isolated class.
         bond_all: false,
-        fec: mode != 1 && mode != 3,
+        fec: mode != MODE_BONDED_SPEED
+            && mode != MODE_DATA_SAVER
+            && mode != MODE_ADAPTIVE_PROTECTION,
         ..Default::default()
     });
 }
@@ -546,7 +626,11 @@ mod tests {
         }
         assert_eq!(e.links().iter().filter(|l| l.status == 1).count(), 3);
         let mut source = None;
-        for sequence in 0..12u8 {
+        assert!(
+            e.adaptive_supported,
+            "new gateway capability was not authenticated"
+        );
+        for sequence in 0..15u8 {
             if sequence == 3 {
                 e.adapters(vec![adapter(1), adapter(3)]).unwrap();
             }
@@ -555,7 +639,7 @@ mod tests {
                     .unwrap();
             }
             // Change policy without resetting stream sequence or stable server egress.
-            unsafe { verz_mode(&mut e, (sequence % 3) as i32) };
+            unsafe { verz_mode(&mut e, (sequence % 5) as i32) };
             e.send(32000, [127, 0, 0, 1], port, &[sequence]).unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
             let mut seen = 0;
@@ -588,8 +672,8 @@ mod tests {
                 "uplink copies delivered twice"
             );
         }
-        assert_eq!(g.counters()["udp"]["uplink_bytes"], 12);
-        assert_eq!(e.download, 12);
+        assert_eq!(g.counters()["udp"]["uplink_bytes"], 15);
+        assert_eq!(e.download, 15);
     }
     #[test]
     fn wrong_key_never_reports_healthy_or_sends_payload() {

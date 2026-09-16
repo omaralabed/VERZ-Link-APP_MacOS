@@ -31,6 +31,10 @@ pub struct ReorderStats {
     pub max_hold_ms: u64,
     pub deadline_gap_releases: u64,
     pub limit_gap_releases: u64,
+    /// Gaps released immediately because this TCP flow currently has only one
+    /// usable VERZ path. Native TCP loss recovery is faster and more accurate
+    /// than holding later segments behind a missing tunnel packet in that case.
+    pub single_path_gap_bypasses: u64,
 }
 impl ReorderStats {
     fn release(&mut self, arrived: u64, now: u64) {
@@ -152,6 +156,44 @@ impl TcpReorder {
         output
     }
 
+    /// Deliver a TCP flow without a userspace gap hold while only one VERZ
+    /// path is usable. Any packets already held for this same flow are emitted
+    /// in TCP-sequence order, then the flow's sequence cursor continues from
+    /// the newest delivered range. Other clients/flows using multipath keep
+    /// their independent reorder state.
+    pub fn push_single_path(&mut self, ip: Vec<u8>, now: u64) -> Vec<Vec<u8>> {
+        let Some((key, _, _)) = segment(&ip) else {
+            return vec![ip];
+        };
+        let mut output = self.push(ip, now);
+        let Some(flow) = self.flows.get_mut(&key) else {
+            return output;
+        };
+        if flow.pending.is_empty() {
+            return output;
+        }
+        self.stats.single_path_gap_bypasses += 1;
+        let before = flow.pending.len();
+        while !flow.pending.is_empty() {
+            let index = flow
+                .pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (seq, _, _, _))| {
+                    let distance = seq.wrapping_sub(flow.next) as i32;
+                    if distance <= 0 { 0 } else { distance as u32 }
+                })
+                .map(|(index, _)| index)
+                .expect("non-empty single-path reorder queue");
+            let (seq, length, arrived, packet) = flow.pending.swap_remove(index);
+            self.stats.release(arrived, now);
+            advance(flow, seq, length);
+            output.push(packet);
+        }
+        self.buffered -= before;
+        output
+    }
+
     pub fn drain_due(&mut self, now: u64) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
         for flow in self.flows.values_mut() {
@@ -231,5 +273,29 @@ mod tests {
             );
         }
         assert_eq!(q.buffered, 0);
+    }
+
+    #[test]
+    fn single_path_gap_is_delivered_immediately_and_cursor_stays_current() {
+        let mut q = TcpReorder::default();
+        assert_eq!(q.push_single_path(tcp(0), 0), vec![tcp(0)]);
+        assert_eq!(q.push_single_path(tcp(200), 1), vec![tcp(200)]);
+        let stats = q.snapshot();
+        assert_eq!(stats.buffered_packets, 0);
+        assert_eq!(stats.deadline_gap_releases, 0);
+        assert_eq!(stats.single_path_gap_bypasses, 1);
+        // Resuming multipath must not treat the next contiguous segment as a
+        // gap merely because the preceding one used single-path delivery.
+        assert_eq!(q.push(tcp(300), 2), vec![tcp(300)]);
+    }
+
+    #[test]
+    fn entering_single_path_flushes_only_that_tcp_flow_in_sequence() {
+        let mut q = TcpReorder::default();
+        assert_eq!(q.push(tcp(0), 0), vec![tcp(0)]);
+        assert!(q.push(tcp(200), 1).is_empty());
+        assert_eq!(q.push_single_path(tcp(100), 2), vec![tcp(100), tcp(200)]);
+        assert_eq!(q.snapshot().buffered_packets, 0);
+        assert_eq!(q.snapshot().single_path_gap_bypasses, 0);
     }
 }

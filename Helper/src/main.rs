@@ -366,6 +366,14 @@ fn main() -> Result<()> {
                     let _ = writeln!(input, "{value}");
                 }
                 if let Some(guard) = network.as_mut() {
+                    if let Err(error) = guard.protect_ipv6(&interfaces) {
+                        event(
+                            &events,
+                            json!({"event":"engine_error", "line":format!("IPv6 leak protection: {error}")}),
+                        );
+                        stop(&mut child)?;
+                        break 1;
+                    }
                     for interface in &interfaces {
                         if let Err(error) = guard.add_uplink(interface, &relay.ip().to_string()) {
                             event(
