@@ -120,7 +120,23 @@ struct ContentView: View {
                 }.pickerStyle(.segmented).disabled(model.busy)
                 Text(model.preset.description).font(.system(size: 11)).foregroundStyle(muted)
                 if model.busy { Text("Disconnect to change the connection type.").font(.system(size: 10)).foregroundStyle(muted) }
-                DisclosureGroup(isExpanded: $showAdvanced) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showAdvanced.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showAdvanced ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Advanced").font(.system(size: 11))
+                        Spacer()
+                    }
+                    .foregroundStyle(muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showAdvanced ? "Expanded" : "Collapsed")
+                .onAppear { if model.preset == .custom { showAdvanced = true } }
+                if showAdvanced {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Route · does traffic go through the VERZ server?").font(.system(size: 11, weight: .medium))
                         Picker("Connection mode", selection: $model.mode) {
@@ -149,9 +165,7 @@ struct ContentView: View {
                              : "Smart bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
                             .font(.system(size: 10)).foregroundStyle(muted)
                     }.padding(.top, 8)
-                } label: {
-                    Text("Advanced").font(.system(size: 11)).foregroundStyle(muted)
-                }.onAppear { if model.preset == .custom { showAdvanced = true } }
+                }
             }.padding(18).card()
             VStack(alignment: .leading, spacing: 24) {
                 HStack(alignment: .top) {
@@ -414,7 +428,22 @@ struct ContentView: View {
                     .font(.system(size: 11)).foregroundStyle(muted)
             }.padding(24).card()
             VStack(alignment: .leading, spacing: 14) {
-                DisclosureGroup(isExpanded: $showSettingsAdvanced) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showSettingsAdvanced.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showSettingsAdvanced ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                        eyebrow("ADVANCED")
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showSettingsAdvanced ? "Expanded" : "Collapsed")
+                .onAppear { if model.preset == .custom { showSettingsAdvanced = true } }
+                if showSettingsAdvanced {
                     VStack(alignment: .leading, spacing: 16) {
                         if model.mode != .direct {
                             HStack {
@@ -445,9 +474,7 @@ struct ContentView: View {
                         Text("Route and link options are under Advanced on the Connection page.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }.padding(.top, 10)
-                } label: {
-                    eyebrow("ADVANCED")
-                }.onAppear { if model.preset == .custom { showSettingsAdvanced = true } }
+                }
             }.padding(24).card()
             VStack(alignment: .leading, spacing: 16) {
                 eyebrow("ABOUT")

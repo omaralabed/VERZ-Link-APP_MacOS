@@ -1,11 +1,12 @@
-# VERZ Link 0.7.0 Build 65 Baseline
+# VERZ Link 0.7.0 Build 66 Baseline
 
-This file records the source and artifact boundary for the build-65 macOS and
-gateway release. The immutable Git reference is `v0.7.0-build65`.
+This file records the source and artifact boundary for the build-66 macOS and
+gateway release. The immutable Git reference is `v0.7.0-build66`. Build 66 is a
+macOS UI-only correction over the build-65 networking baseline.
 
 ## Versioned components
 
-- macOS application: `0.7.0 (65)`
+- macOS application: `0.7.0 (66)`
 - macOS UDP system extension: `0.7.0 (29)`
 - Linux TCP relay: built from this tag for `x86_64-unknown-linux-gnu.2.31`
 - Linux UDP gateway: built from this tag for `x86_64-unknown-linux-gnu.2.31`
@@ -14,10 +15,10 @@ gateway release. The immutable Git reference is `v0.7.0-build65`.
 
 | Component | SHA-256 |
 | --- | --- |
-| macOS `VERZLink` | `424f91f926162869ba9ec5da41d27950d639c1149ce4e8d19d9ee84effd62f92` |
-| macOS UDP system extension | `9cc2d7308a22f7b58cd201638d60f3924be4adc08509c638387d5ed24653e53a` |
-| bundled macOS `verz-bond` | `f927f123b8bb856b853ca1318cede21fad988051fe6434008eee1b8587d8702f` |
-| bundled macOS `verz-app-helper` | `b277c57cd9bc1e6e4bc2c2626a79a0b0ffe3f49d8efc00deb403a43071a61327` |
+| macOS `VERZLink` | `2cdf613ccfac9e1fe03c13118de1d58baed36682e6f4cdd2241dae6da83fd9ee` |
+| macOS UDP system extension | `8ba5ed9b72b7083264e61deab9930313c5e4de5724fee13b6db132465d28d8ef` |
+| bundled macOS `verz-bond` | `59f06a1b8ec9bb2e27377093a143adf799d528327c6e3ae99953c43c36671608` |
+| bundled macOS `verz-app-helper` | `bbc13d75ba2acc4a44f0f43d405d70cd7c228ae5b66ec973e67133a72940af67` |
 | Linux `verz-bond` | `9ad84109ea4c4e4fee4c9203d4769dade40bfe8fd7f72d93bf16abf03b004f64` |
 | Linux `verz-tunnel-http` | `d2398d7a45c001fabd0c8479d1eae83ba05c529ddee79ac0fb4f328860a650af` |
 | Linux `verz-udp-gateway` | `f7d6e2fcf1612e58b65e20b8489c5c704a106435f4095ddfb5aa547cac616623` |
@@ -30,8 +31,9 @@ gateway release. The immutable Git reference is `v0.7.0-build65`.
 - Linux TCP and UDP release cross-builds complete.
 - The signed macOS Release app passes strict deep signature verification.
 - The UDP extension passes the Team ID, App Group, and signing verifier.
-- Both directions of the isolated two-WAN TCP cut test complete on one TCP
-  connection with exact payload hashes.
+- The network core is source-identical to build 65, where both directions of
+  the isolated two-WAN TCP cut test completed on one TCP connection with exact
+  payload hashes.
 - The repository has no pending tracked or untracked release changes.
 
 The isolated cut test protects the automated regression boundary. Physical WAN
