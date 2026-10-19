@@ -114,7 +114,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 14) {
                 eyebrow("CONNECTION")
                 Picker("Connection", selection: Binding(get: { model.preset }, set: { model.preset = $0 })) {
-                    ForEach(ConnectionPreset.allCases.filter { $0 != .custom || model.preset == .custom }) { preset in
+                    ForEach(ConnectionPreset.allCases) { preset in
                         Text(preset.title).tag(preset)
                     }
                 }.pickerStyle(.segmented).disabled(model.busy)
@@ -135,34 +135,11 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityValue(showAdvanced ? "Expanded" : "Collapsed")
-                .onAppear { if model.preset == .custom { showAdvanced = true } }
                 if showAdvanced {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Route · does traffic go through the VERZ server?").font(.system(size: 11, weight: .medium))
-                        Picker("Connection mode", selection: $model.mode) {
-                            ForEach(TransportMode.allCases) { mode in Text(mode.title).tag(mode) }
-                        }.pickerStyle(.segmented).disabled(model.busy)
-                        Text(model.mode == .direct ? "No VERZ server. Each connection uses one adapter directly and stays on it for its whole life."
-                             : model.mode == .hybrid ? "Direct first. Calls, live streams, listed sites and any direct connection that fails use the encrypted VERZ server."
-                             : "Everything through the encrypted VERZ server: one stable public IP and connections that survive link failures.")
-                            .font(.system(size: 10)).foregroundStyle(muted)
-                        Text("Links · what should several links be used for?").font(.system(size: 11, weight: .medium)).padding(.top, 4)
-                        Picker("Connection preference", selection: $model.policy) {
-                            Text("Smart bonding").tag("smart")
-                            Text("Bonded speed").tag("performance")
-                            Text("Continuity").tag("continuity")
-                            Text("Adaptive protection").tag("adaptive-protection")
-                            Text("Data saver").tag("data-saver")
-                        }.pickerStyle(.segmented)
-                        Text(model.policy == "continuity"
-                             ? "Continuity: no drop during failover. Calls, UDP and TCP up to about 2 Mbps travel on two links at the same time; heavier transfers keep going on the surviving link and re-send only what was in flight."
-                             : model.policy == "adaptive-protection"
-                             ? "Adaptive protection: every outgoing UDP packet travels on each healthy WAN. A measured playout buffer absorbs their delay difference before release, so a slower copy can fill a faster WAN's gap. This adds latency, and every surviving WAN must carry the complete stream."
-                             : model.policy == "data-saver"
-                             ? "Data saver: uses unmetered links while they are healthy and never sends protection copies. A link failure is repaired, not masked."
-                             : model.policy == "performance"
-                             ? "Bonded speed: measures delivered UDP upload capacity and allocates outgoing packets proportionally across every healthy WAN. The gateway restores packet order and requests missing packets; continuous duplicate payload is disabled."
-                             : "Smart bonding: all links are combined for maximum throughput. Calls and live media still get a protection copy; other traffic is re-sent on the surviving link after a failure, which can pause briefly.")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("Avoid metered links", isOn: $model.avoidMeteredLinks)
+                            .toggleStyle(.switch).controlSize(.small)
+                        Text("While an unmetered WAN is usable, links marked Metered stay idle. They become available automatically if no unmetered WAN remains.")
                             .font(.system(size: 10)).foregroundStyle(muted)
                     }.padding(.top, 8)
                 }
@@ -202,8 +179,10 @@ struct ContentView: View {
                             .foregroundStyle(model.busy ? mint : Color.black)
                             .background(model.busy ? mint.opacity(0.12) : mint, in: RoundedRectangle(cornerRadius: 9))
                     }.buttonStyle(.plain).disabled(model.state == .disconnecting || (!model.busy && !model.hasReadyInterface))
-                    Text(model.state == .connected ? "UPTIME  \(uptime)" : "One-time macOS helper setup · normal connections need no password")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)
+                    if model.state == .connected {
+                        Text("UPTIME  \(uptime)")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)
+                    }
                     Spacer()
                 }
                 Divider().overlay(.white.opacity(0.03))
@@ -271,11 +250,14 @@ struct ContentView: View {
                     Spacer()
                     if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
-                            Text(path.state == "offline" ? "Offline" : path.uploadHeld == true
+                            Text(path.carrier == "tls-tcp" ? "Corporate fallback · TCP 443" : path.state == "offline" ? "Offline" : path.uploadHeld == true
                                  ? "Upload congested · new flows prefer another link" : (path.latencyExcluded == true || path.realtimePreferred == false)
                                  ? "Transfers · calls prefer another link" : "Web & transfers · \(path.state.capitalized)")
-                                .foregroundStyle(path.state == "healthy" ? mint : muted)
+                                .foregroundStyle(path.carrier == "tls-tcp" || path.state == "healthy" ? mint : muted)
                                 .lineLimit(1)
+                                .help(path.carrier == "tls-tcp"
+                                      ? "This network blocks sustained UDP, so VERZ keeps it as an isolated TCP 443 fallback. It does not share traffic while a native UDP WAN is healthy."
+                                      : "VERZ native UDP carrier status")
                             Text(path.rttMs.map { String(format: "%.1f ms RTT", $0) } ?? "Measuring…").foregroundStyle(muted)
                             let rate = model.pathRates[path.name] ?? (upMbps: 0, downMbps: 0)
                             Text(String(format: "↑ %.2f  ↓ %.2f Mbps", rate.upMbps, rate.downMbps))
@@ -294,17 +276,31 @@ struct ContentView: View {
                         }.font(.system(size: 10)).frame(width: 180, alignment: .trailing)
                     }
                     if let udp = model.udpPaths[interface.name], model.busy {
+                        let corporateFallback = model.bondTelemetry?.paths.first(where: { $0.name == interface.name })?.carrier == "tls-tcp"
                         VStack(alignment: .trailing, spacing: 4) {
-                            Text(udp.healthy ? "Streams & calls ready" : "Streams & calls waiting").foregroundStyle(udp.healthy ? mint : muted)
+                            Text(udp.healthy ? "Streams & calls ready"
+                                 : corporateFallback ? "Streams & calls · TCP fallback"
+                                 : "Streams & calls waiting")
+                                .foregroundStyle(udp.healthy || corporateFallback ? mint : muted)
                             Text(String(format: "%.1f ms RTT", udp.rtt))
                             Text(String(format: "↑ %.2f  ↓ %.2f Mbps", udp.uploadMbps, udp.downloadMbps))
                                 .font(.system(size: 12, weight: .semibold)).monospacedDigit()
-                                .foregroundStyle(udp.healthy ? Color.primary : muted)
-                                .help(model.policy == "performance"
-                                      ? "Live Bonded Speed traffic carried on this WAN."
+                                .foregroundStyle(udp.healthy || corporateFallback ? Color.primary : muted)
+                                .help(model.policy == "performance" || model.policy == "smart-repair"
+                                      ? corporateFallback
+                                        ? "This WAN blocks native UDP. UDP applications use the encrypted main tunnel over TCP 443 until native UDP recovers."
+                                        : model.policy == "smart-repair"
+                                            ? "Live Smart Repair traffic carried on this WAN: every packet once, plus repair packets."
+                                            : "Live Bonded Speed traffic carried on this WAN."
                                       : "Live traffic of the streams-and-calls lane on this link (SRT, RTP, WebRTC, QUIC over UDP), including protection copies.")
-                            if model.policy == "performance", let capacity = udp.capacityMbps {
-                                Text(String(format: "Bonded estimate %.1f Mbps", capacity))
+                            if model.policy == "performance" || model.policy == "smart-repair" {
+                                if corporateFallback {
+                                    Text("Compatibility mode · head-of-line delay possible")
+                                } else if let capacity = udp.capacityMbps {
+                                    Text(String(format: "Bonded estimate %.1f Mbps", capacity))
+                                } else {
+                                    Text("UDP lane · measuring capacity")
+                                }
                             } else {
                                 Text("UDP lane · includes copies")
                             }
@@ -418,12 +414,18 @@ struct ContentView: View {
             }.padding(24).card()
             VStack(alignment: .leading, spacing: 16) {
                 eyebrow("PROTECTION")
-                settingRow("Connection", model.preset == .custom ? "Custom" : model.preset.title)
+                settingRow("Connection", model.preset.title)
                 settingRow("Encryption", model.mode == .secure ? "All traffic encrypted to the VERZ server"
                            : model.mode == .hybrid ? "Calls, streams and listed sites encrypted" : "Application encryption only")
                 settingRow("Public IP", model.mode == .secure ? "Stable" : model.mode == .hybrid ? "Stable for encrypted traffic" : "Changes with the active link")
                 settingRow("Link failure", model.policy == "continuity" && model.mode != .direct ? "No drop"
+                           : model.policy == "smart-repair" && model.mode != .direct ? "Lost packets rebuilt from repairs"
                            : model.mode == .direct ? "Connections on the failed link end" : "Brief pause, connections continue")
+                if model.policy == "smart-repair" && model.mode != .direct {
+                    settingRow("Smart Repair", model.smartRepairSupported == true ? "Active · \(model.smartRepairsSent) repairs sent"
+                               : model.smartRepairSupported == false ? "Server update needed · running as Maximum Continuity"
+                               : "Waiting for the server")
+                }
                 Text("HTTPS and other application encryption always remain in place. VERZ never inspects your content.")
                     .font(.system(size: 11)).foregroundStyle(muted)
             }.padding(24).card()
@@ -442,7 +444,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityValue(showSettingsAdvanced ? "Expanded" : "Collapsed")
-                .onAppear { if model.preset == .custom { showSettingsAdvanced = true } }
                 if showSettingsAdvanced {
                     VStack(alignment: .leading, spacing: 16) {
                         if model.mode != .direct {
@@ -471,7 +472,7 @@ struct ContentView: View {
                                 .font(.system(size: 11)).foregroundStyle(muted)
                         }
                         Divider()
-                        Text("Route and link options are under Advanced on the Connection page.")
+                        Text("Metered-link handling is under Advanced on the Connection page.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }.padding(.top, 10)
                 }

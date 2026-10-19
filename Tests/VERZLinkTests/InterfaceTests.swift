@@ -3,6 +3,55 @@ import Darwin
 @testable import VERZLink
 
 final class InterfaceTests: XCTestCase {
+    func testCustomerConnectionPresetsExposeOnlySupportedOutcomes() {
+        XCTAssertEqual(ConnectionPreset.allCases, [.bonded, .smart, .continuity, .direct])
+        XCTAssertEqual(ConnectionPreset.bonded.settings.mode, .secure)
+        XCTAssertEqual(ConnectionPreset.bonded.settings.policy, "performance")
+        XCTAssertEqual(ConnectionPreset.smart.settings.mode, .secure)
+        XCTAssertEqual(ConnectionPreset.smart.settings.policy, "smart-repair")
+        XCTAssertEqual(ConnectionPreset.continuity.settings.policy, "continuity")
+        XCTAssertEqual(ConnectionPreset.direct.settings.mode, .direct)
+        XCTAssertEqual(ConnectionPreset.matching(mode: .secure, policy: "smart-repair"), .smart)
+        XCTAssertEqual(ConnectionPreset.matching(mode: .direct, policy: "smart-repair"), .direct)
+    }
+
+    func testEveryPresetHandsTheHelperAPolicyItAccepts() {
+        // Mirrors the list in HelperService/main.swift.
+        let accepted: Set<String> = ["smart", "performance", "continuity", "data-saver"]
+        for preset in ConnectionPreset.allCases {
+            XCTAssertTrue(accepted.contains(mainTunnelPolicy(preset.settings.policy)), "\(preset) hands the helper \(preset.settings.policy)")
+        }
+        XCTAssertEqual(mainTunnelPolicy("smart-repair"), "performance")
+        XCTAssertEqual(mainTunnelPolicy("continuity"), "continuity")
+    }
+
+    func testSmartRepairSettingsSurviveNormalization() {
+        XCTAssertEqual(normalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false),
+                       NormalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false))
+        XCTAssertEqual(normalizedConnectionSettings(mode: .direct, policy: "smart-repair", avoidMeteredLinks: true),
+                       NormalizedConnectionSettings(mode: .direct, policy: "smart", avoidMeteredLinks: true))
+    }
+
+    func testLegacyConnectionSettingsMigrateWithoutAdaptiveDuplication() {
+        XCTAssertEqual(normalizedConnectionSettings(mode: .secure, policy: "adaptive-protection", avoidMeteredLinks: false),
+                       NormalizedConnectionSettings(mode: .secure, policy: "performance", avoidMeteredLinks: false))
+        XCTAssertEqual(normalizedConnectionSettings(mode: .hybrid, policy: "data-saver", avoidMeteredLinks: false),
+                       NormalizedConnectionSettings(mode: .secure, policy: "performance", avoidMeteredLinks: true))
+        XCTAssertEqual(normalizedConnectionSettings(mode: .direct, policy: "continuity", avoidMeteredLinks: false),
+                       NormalizedConnectionSettings(mode: .direct, policy: "smart", avoidMeteredLinks: false))
+    }
+
+    func testAvoidMeteredUsesMeteredPathOnlyWhenNoUnmeteredPathIsUsable() {
+        let lan = ethernet("en7")
+        let cellular = ethernet("en8")
+        XCTAssertEqual(avoidedMeteredInterfaces([lan, cellular], explicitlyDisabled: [],
+                                                metered: ["en8"], enabled: true), ["en8"])
+        XCTAssertEqual(avoidedMeteredInterfaces([lan, cellular], explicitlyDisabled: ["en7"],
+                                                metered: ["en8"], enabled: true), [])
+        XCTAssertEqual(avoidedMeteredInterfaces([cellular], explicitlyDisabled: [],
+                                                metered: ["en8"], enabled: true), [])
+    }
+
     func testAdaptiveTelemetryAcceptsLiveRatesAndLegacyReports() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -11,8 +60,11 @@ final class InterfaceTests: XCTestCase {
         XCTAssertNil(path.realtimePreferred)
         XCTAssertNil(path.downloadBps)
         XCTAssertNil(path.uploadHeld)
-        let current = String(legacy.dropLast()) + #", "realtime_preferred":false,"download_bps":8000000,"upload_bps":2000000,"active_flows":3,"upload_held":true,"tcp_observed":true}"#
+        XCTAssertNil(path.carrier)
+        let current = String(legacy.dropLast()) + #", "carrier":"tls-tcp","standby":true,"realtime_preferred":false,"download_bps":8000000,"upload_bps":2000000,"active_flows":3,"upload_held":true,"tcp_observed":true}"#
         let updated = try decoder.decode(PathTelemetry.self, from: Data(current.utf8))
+        XCTAssertEqual(updated.carrier, "tls-tcp")
+        XCTAssertEqual(updated.standby, true)
         XCTAssertEqual(updated.realtimePreferred, false)
         XCTAssertEqual(updated.downloadBps, 8_000_000)
         XCTAssertEqual(updated.activeFlows, 3)

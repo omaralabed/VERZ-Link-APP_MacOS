@@ -135,8 +135,8 @@ impl Cipher {
 
 #[derive(Default, serde::Serialize)]
 pub struct WireBytes {
-    sent: u64,
-    received: u64,
+    pub(crate) sent: u64,
+    pub(crate) received: u64,
 }
 pub struct SecureSockets {
     sockets: Sockets,

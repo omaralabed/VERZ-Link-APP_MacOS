@@ -142,7 +142,7 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
     private func mode(_ policy: String) -> Int {
         policy == "performance" ? 1
             : policy == "data-saver" ? 3
-            : policy == "adaptive-protection" ? 4
+            : policy == "smart-repair" ? 5
             : 2
     }
     func update(disabled: [String], policy: String) {

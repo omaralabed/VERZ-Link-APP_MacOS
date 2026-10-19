@@ -1,5 +1,6 @@
 //! Non-TUN UDP egress: stable socket per (session, local port, remote IP/port).
 //! Removing a WAN return path does not replace that socket or the reassembly stream.
+use crate::coded::{CODED_CLASS, CodedStats, CodedStream, CodedStreams};
 use crate::reassembly::{Output, Stream};
 use std::{
     collections::{HashMap, VecDeque},
@@ -8,7 +9,7 @@ use std::{
     os::fd::AsRawFd,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use verz_link_core::{ACK, DOWNLINK, HEARTBEAT, NACK, Packet, TUN, encode_nack, recovery::Deduper};
+use verz_link_core::{ACK, DOWNLINK, FEC, HEARTBEAT, NACK, Packet, TUN, encode_nack, recovery::Deduper};
 
 fn stamp() -> i64 {
     SystemTime::now()
@@ -19,6 +20,13 @@ fn stamp() -> i64 {
 type FlowKey = (u32, u16, [u8; 4], u16);
 const MAX_FLOWS: usize = 1024;
 const MAX_STREAMS: usize = 1024;
+/// Coded streams are admitted by the memory they would compete for, not by
+/// count: every UDP flow of a client may become one, and most hold almost
+/// nothing. An idle one is dropped after a short while; a client that
+/// continues it later simply starts a new one mid-stream.
+const MAX_CODED_STREAMS: usize = 1024;
+const MAX_CODED_BYTES: usize = 48 * 1024 * 1024;
+const CODED_IDLE_US: u64 = 30_000_000;
 const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
 const UDP_IDLE_US: u64 = 300_000_000;
 const DNS_PENDING_IDLE_US: u64 = 30_000_000;
@@ -261,12 +269,16 @@ pub struct Counters {
     pub peak_flows: usize,
     pub adaptive_hold_us: u64,
     pub adaptive_skew_samples: usize,
+    pub coded_rebuilt: u64,
+    pub coded_abandoned: u64,
+    pub coded_repairs: u64,
 }
 pub struct Gateway {
     socket: UdpSocket,
     peers: HashMap<u32, Peer>,
     flows: HashMap<FlowKey, Flow>,
     streams: HashMap<(u32, u16), Ordered>,
+    coded: CodedStreams,
     sip: Deduper,
     start: Instant,
     last_sweep: u64,
@@ -304,6 +316,7 @@ impl Gateway {
             peers,
             flows: HashMap::new(),
             streams: HashMap::new(),
+            coded: CodedStreams::new(),
             sip: Deduper::new(8192, 10_000_000),
             start: Instant::now(),
             last_sweep: 0,
@@ -337,6 +350,7 @@ impl Gateway {
         self.peers.remove(&id);
         self.flows.retain(|key, _| key.0 != id);
         self.streams.retain(|key, _| key.0 != id);
+        self.coded.retain(|key, _| key.0 != id);
         self.buffered_bytes = self
             .streams
             .values()
@@ -349,7 +363,10 @@ impl Gateway {
     pub fn limits(&self) -> serde_json::Value {
         serde_json::json!({"max_flows":MAX_FLOWS,"streams":self.streams.len(),
             "max_streams":MAX_STREAMS,"buffered_bytes":self.buffered_bytes,
-            "max_buffered_bytes":MAX_BUFFERED_BYTES})
+            "max_buffered_bytes":MAX_BUFFERED_BYTES,
+            "coded_streams":self.coded.len(),"max_coded_streams":MAX_CODED_STREAMS,
+            "coded_bytes":self.coded.values().map(CodedStream::memory_bytes).sum::<usize>(),
+            "coded_detail":self.coded.values().take(4).map(CodedStream::debug).collect::<Vec<_>>()})
     }
     fn expire(&mut self, now: u64) {
         // Reclaim before admission as well as during maintenance. Never evict an
@@ -369,6 +386,10 @@ impl Gateway {
             // timed reorder state from uplink alone, independently of egress.
             active.contains(key) || now.saturating_sub(ordered.last) < UDP_IDLE_US
         });
+        // Coded stream state expires on its own silence, whether or not the
+        // egress socket is still mapped; a client that continues the stream
+        // later starts a new one mid-way.
+        self.coded.retain(|_, stream| now.saturating_sub(stream.last) < CODED_IDLE_US);
         self.buffered_bytes = self
             .streams
             .values()
@@ -508,7 +529,8 @@ impl Gateway {
                 protocol: p.protocol,
                 payload: serde_json::to_vec(&serde_json::json!({
                     "adaptive_protection": 1,
-                    "protection_hold_us": adaptive_hold_us
+                    "protection_hold_us": adaptive_hold_us,
+                    "coded": 1
                 }))
                 .unwrap_or_default(),
                 ..Default::default()
@@ -516,6 +538,13 @@ impl Gateway {
             if let Ok(wire) = reply.encode(&peer.key) {
                 let _ = self.socket.send_to(&wire, remote);
             }
+            return;
+        }
+        // Repairs and probes name no destination, so they are taken before
+        // the destination checks; originals go through them like any packet.
+        if p.class == CODED_CLASS && p.is_data() && p.flags & TUN == 0 && p.flags & FEC != 0 {
+            peer.paths.insert(p.link, (remote, now));
+            self.coded_ingress(session, p, now);
             return;
         }
         if !p.is_data()
@@ -551,6 +580,10 @@ impl Gateway {
                 result.ready.push(p);
             }
             self.output(session, port, result, now);
+            return;
+        }
+        if class == CODED_CLASS {
+            self.coded_ingress(session, p, now);
             return;
         }
         let new_stream = !self.streams.contains_key(&(session, port));
@@ -624,6 +657,68 @@ impl Gateway {
             Err(_) => self.counters.rejected += 1,
         }
     }
+    fn coded_ingress(&mut self, session: u32, p: Packet, now: u64) {
+        // A repair names no destination; a rebuilt original is checked at egress.
+        if p.flags & FEC == 0
+            && (p.destination_port == 0 || !destination_allowed(p.destination, self.allow_private))
+        {
+            self.counters.rejected += 1;
+            return;
+        }
+        let key = (session, p.local_port);
+        if !self.coded.contains_key(&key) {
+            let full = |coded: &CodedStreams| {
+                coded.len() >= MAX_CODED_STREAMS
+                    || coded.values().map(CodedStream::memory_bytes).sum::<usize>() >= MAX_CODED_BYTES
+            };
+            if full(&self.coded) {
+                self.expire(now);
+            }
+            if full(&self.coded) {
+                self.reject_capacity();
+                return;
+            }
+            self.coded.insert(key, CodedStream::new(session, p.local_port, now));
+        }
+        let mut stats = CodedStats::default();
+        let accepted = self.coded.get_mut(&key).expect("inserted").ingest(&p, now, &mut stats);
+        self.counters.coded_repairs += stats.repairs;
+        if !accepted {
+            self.counters.rejected += 1;
+        }
+        self.coded_flush(key, now);
+    }
+
+    /// Send out what a coded stream has released, and its reports, each
+    /// down the link it describes.
+    fn coded_flush(&mut self, key: (u32, u16), now: u64) {
+        let Some(stream) = self.coded.get_mut(&key) else {
+            return;
+        };
+        let mut stats = CodedStats::default();
+        let (egress, reports) = stream.poll(now, &mut stats);
+        self.counters.coded_rebuilt += stats.rebuilt;
+        self.counters.coded_abandoned += stats.abandoned;
+        for p in &egress {
+            if p.destination_port == 0 || !destination_allowed(p.destination, self.allow_private) {
+                self.counters.rejected += 1;
+            } else if self.egress(p, now).is_err() {
+                self.counters.send_errors += 1;
+            }
+        }
+        let Some(peer) = self.peers.get(&key.0) else {
+            return;
+        };
+        for report in &reports {
+            if let Some(&(address, at)) = peer.paths.get(&report.link)
+                && now.saturating_sub(at) < 30_000_000
+                && let Ok(wire) = report.encode(&peer.key)
+            {
+                let _ = self.socket.send_to(&wire, address);
+            }
+        }
+    }
+
     /// One bounded poll iteration, also used by the integration tests.
     pub fn step(&mut self, timeout_ms: i32) -> io::Result<()> {
         let mut polls = vec![libc::pollfd {
@@ -703,6 +798,12 @@ impl Gateway {
         }
         for p in replies {
             self.fanout(p.session, &p, now);
+        }
+        // Coded streams report every few milliseconds, so they are polled
+        // every step; the receiver itself paces the reports.
+        let coded: Vec<_> = self.coded.keys().copied().collect();
+        for key in coded {
+            self.coded_flush(key, now);
         }
         if now.saturating_sub(self.last_sweep) >= 10_000 {
             if now.saturating_sub(self.last_expire) >= 250_000 {
@@ -1054,6 +1155,165 @@ mod lifecycle_tests {
         g.expire(2 * UDP_IDLE_US);
         assert!(g.flows.is_empty());
         assert!(g.streams.is_empty());
+    }
+
+    fn coded_packet(port: u16, destination: u16, seq: u32, payload: Vec<u8>) -> Packet {
+        Packet {
+            class: CODED_CLASS,
+            sequence: seq,
+            timestamp_us: 1_000_000 + i64::from(seq) * 1_500,
+            payload,
+            ..packet(port, destination, seq)
+        }
+    }
+
+    fn repair_for(originals: &[Packet], header: verz_bonding_core::coding::RepairHeader, link: u8) -> Packet {
+        let blocks: Vec<Vec<u8>> = originals.iter().map(|p| crate::coded::pack(p).unwrap()).collect();
+        let coded = verz_bonding_core::coding::encode(
+            header,
+            |seq| &blocks[(seq - originals[0].sequence) as usize],
+            crate::coded::BLOCK,
+        );
+        let mut payload = header.to_bytes().to_vec();
+        payload.extend_from_slice(&coded);
+        Packet {
+            flags: FEC,
+            link,
+            timestamp_us: 1_000_000 + i64::from(header.last()) * 1_500 + 500,
+            payload,
+            ..coded_packet(originals[0].local_port, 0, header.first, Vec::new())
+        }
+    }
+
+    #[test]
+    fn coded_stream_rebuilds_a_lost_original_from_a_repair_and_keeps_order() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        let originals: Vec<Packet> =
+            (0..4).map(|seq| coded_packet(10000, destination, seq, vec![seq as u8; 300 + seq as usize])).collect();
+        // Sequence 2 is lost on the way; the others take two links.
+        for (i, p) in originals.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            let mut p = p.clone();
+            p.link = 1 + (i % 2) as u8;
+            ingest(&mut g, &p, 10_000 + i as u64 * 1_500);
+        }
+        assert_eq!(g.counters.uplink_bytes, 300 + 301, "0 and 1 go out; 3 waits for 2");
+        let header = verz_bonding_core::coding::RepairHeader { first: 0, count: 4, seed: 9 };
+        ingest(&mut g, &repair_for(&originals, header, 2), 20_000);
+        assert_eq!(g.counters.coded_rebuilt, 1);
+        assert_eq!(g.counters.coded_repairs, 1);
+        let mut buf = [0u8; 2048];
+        for p in &originals {
+            let (n, _) = sink.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &p.payload[..], "sequence {} out of order or corrupted", p.sequence);
+        }
+    }
+
+    #[test]
+    fn coded_reports_go_down_the_link_they_describe() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        other.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let first = coded_packet(10000, destination, 0, vec![1; 100]);
+        g.ingress(&first.encode(&KEY).unwrap(), client.local_addr().unwrap(), 0);
+        let mut second = coded_packet(10000, destination, 1, vec![2; 100]);
+        second.link = 2;
+        g.ingress(&second.encode(&KEY).unwrap(), other.local_addr().unwrap(), 10_000);
+        let mut buf = [0u8; 2048];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        let report = Packet::decode(&buf[..n], &KEY).unwrap();
+        assert_eq!((report.flags, report.class, report.link, report.local_port), (ACK, CODED_CLASS, 1, 10000));
+        let report = crate::coded::report_of(&report).unwrap();
+        assert_eq!(report.decoded_through, Some(1));
+        assert_eq!(report.echo_us, first.timestamp_us as u64, "link 1's report echoes link 1's newest send");
+        assert_eq!(report.links.len(), 2);
+        assert_eq!(report.links.iter().map(|l| l.originals).sum::<u64>(), 2);
+        let (n, _) = other.recv_from(&mut buf).unwrap();
+        let report = Packet::decode(&buf[..n], &KEY).unwrap();
+        assert_eq!(report.link, 2);
+    }
+
+    #[test]
+    fn coded_oversize_datagram_is_split_into_pieces_and_reassembled() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        let datagram: Vec<u8> = (0..2_000).map(|i| (i * 7) as u8).collect();
+        let (head, tail) = datagram.split_at(crate::coded::MAX_PIECE);
+        let mut first = coded_packet(10000, destination, 0, head.to_vec());
+        first.flags = crate::coded::MORE;
+        let second = coded_packet(10000, destination, 1, tail.to_vec());
+        ingest(&mut g, &first, 1_000);
+        assert_eq!(g.counters.uplink_bytes, 0, "half a datagram must not go out");
+        ingest(&mut g, &second, 2_000);
+        let mut buf = [0u8; 4096];
+        let (n, _) = sink.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &datagram[..]);
+    }
+
+    #[test]
+    fn coded_rebuilt_packet_cannot_reach_a_forbidden_destination() {
+        let mut g = Gateway::bind("127.0.0.1:0".parse().unwrap(), vec![(1, KEY.to_vec())], false).unwrap();
+        let mut originals: Vec<Packet> = (0..2).map(|seq| coded_packet(10000, 9, seq, vec![seq as u8; 50])).collect();
+        for p in &mut originals {
+            p.destination = [10, 0, 0, 1];
+        }
+        // Only the repair arrives, so the private destination is seen at egress.
+        let header = verz_bonding_core::coding::RepairHeader { first: 0, count: 2, seed: 3 };
+        ingest(&mut g, &repair_for(&originals, header, 1), 1_000);
+        ingest(&mut g, &repair_for(&originals, verz_bonding_core::coding::RepairHeader { seed: 4, ..header }, 1), 2_000);
+        assert_eq!(g.counters.coded_rebuilt, 2);
+        assert_eq!(g.counters.rejected, 2);
+        assert_eq!(g.counters.uplink_bytes, 0);
+    }
+
+    #[test]
+    fn many_short_coded_flows_do_not_crowd_out_a_stream_and_idle_ones_expire() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        // Far more flows than the old fixed cap, each a single small packet.
+        for port in 0..200u16 {
+            ingest(&mut g, &coded_packet(20_000 + port, destination, 0, vec![1; 40]), u64::from(port) * 1_000);
+        }
+        assert_eq!(g.counters.capacity_rejections, 0);
+        assert_eq!(g.coded.len(), 200);
+        ingest(&mut g, &coded_packet(30_000, destination, 0, vec![2; 1_000]), 300_000);
+        assert_eq!(g.counters.uplink_bytes, 200 * 40 + 1_000, "the real stream was refused");
+        // Half a minute later the one-packet flows are gone; the stream that
+        // kept sending is not.
+        ingest(&mut g, &coded_packet(30_000, destination, 1, vec![3; 1_000]), CODED_IDLE_US + 250_000);
+        g.expire(CODED_IDLE_US + 300_000);
+        assert_eq!(g.coded.len(), 1);
+        assert!(g.coded.contains_key(&(1, 30_000)));
+    }
+
+    #[test]
+    fn coded_dns_takes_the_request_response_path_not_a_stream() {
+        let (mut g, _) = setup();
+        let mut p = coded_packet(10000, 53, 0, dns(1, false));
+        p.destination_port = 53;
+        ingest(&mut g, &p, 0);
+        assert!(g.coded.is_empty(), "a DNS query must not open a coded stream");
+        assert_eq!(g.flows.len(), 1);
+    }
+
+    #[test]
+    fn coded_stream_resets_when_the_client_restarts() {
+        let (mut g, sink) = setup();
+        let destination = sink.local_addr().unwrap().port();
+        for seq in 0..3 {
+            ingest(&mut g, &coded_packet(10000, destination, 5_000 + seq, vec![seq as u8; 10]), u64::from(seq) * 1_000);
+        }
+        assert_eq!(g.counters.uplink_bytes, 30);
+        let mut restarted = coded_packet(10000, destination, 0, vec![9; 10]);
+        restarted.timestamp_us = 1_000_000 + 5_003 * 1_500 + 2_000_000;
+        ingest(&mut g, &restarted, 5_000_000);
+        assert_eq!(g.counters.uplink_bytes, 40, "a restarted client's sequence 0 must flow");
     }
 
     #[test]

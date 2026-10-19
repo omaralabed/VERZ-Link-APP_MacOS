@@ -44,42 +44,78 @@ enum TransportMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// One user-facing choice that sets both the transport mode and the link
-/// preference. `custom` only appears when Advanced holds another combination.
+/// The supported customer outcomes. Internal transport and scheduling
+/// details are deliberately not exposed as a combinatorial settings matrix.
 enum ConnectionPreset: String, CaseIterable, Identifiable {
-    case neverDrop, fastest, direct, custom
+    case bonded, smart, continuity, direct
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .neverDrop: "Continuity"
-        case .fastest: "Fastest"
+        case .bonded: "Bonded"
+        case .smart: "Smart Repair"
+        case .continuity: "Maximum Continuity"
         case .direct: "Direct, no server"
-        case .custom: "Custom"
         }
     }
-    var settings: (mode: TransportMode, policy: String)? {
+    var settings: (mode: TransportMode, policy: String) {
         switch self {
-        case .neverDrop: (.secure, "continuity")
-        case .fastest: (.secure, "performance")
+        case .bonded: (.secure, "performance")
+        case .smart: (.secure, "smart-repair")
+        case .continuity: (.secure, "continuity")
         case .direct: (.direct, "smart")
-        case .custom: nil
         }
     }
     static func matching(mode: TransportMode, policy: String) -> ConnectionPreset {
-        allCases.first { $0.settings.map { $0.mode == mode && $0.policy == policy } ?? false } ?? .custom
+        if mode == .direct { return .direct }
+        return policy == "continuity" ? .continuity : policy == "smart-repair" ? .smart : .bonded
     }
     var description: String {
         switch self {
-        case .neverDrop:
-            "Recommended. All traffic goes through the encrypted VERZ server over every link, and calls, UDP and light TCP are carried on two links at once. Losing a cable, or loss on one ISP, causes no drop: the session and public IP stay the same."
-        case .fastest:
-            "All traffic goes through the encrypted VERZ server. TCP uses every responsive link, while UDP Bonded Speed measures delivered upload capacity and divides an outgoing stream proportionally across the available WANs. Missing packets are repaired, but unlike Continuity, payload is not continuously duplicated."
+        case .bonded:
+            "Recommended. The encrypted VERZ server combines every healthy WAN. UDP traffic is divided by measured delivered capacity, so faster links carry more; missing packets are repaired and traffic shifts when a link slows or fails."
+        case .smart:
+            "New. Every packet is sent once, and small repair packets replace the copies Maximum Continuity sends: a failed, slow or lossy link is covered with a fraction of the data, and failures are noticed in tens of milliseconds. Needs a server with the update; until then it runs as Maximum Continuity."
+        case .continuity:
+            "Maximum protection. The encrypted VERZ server sends additional copies on multiple WANs to mask a link failure. This uses more data, and every protection WAN must be able to carry the protected traffic."
         case .direct:
             "No server. Each connection is pinned to one adapter and ISP for its whole life, so loss, congestion or an outage on that ISP hits it directly and nothing can carry or repair it over the other link. Only new connections can pick a better adapter."
-        case .custom:
-            "A combination chosen in Advanced."
         }
     }
+}
+
+struct NormalizedConnectionSettings: Equatable {
+    let mode: TransportMode
+    let policy: String
+    let avoidMeteredLinks: Bool
+}
+
+/// Migrate legacy/internal combinations to one of the three supported customer
+/// outcomes. The removed adaptive mode becomes Bonded; the old Data Saver mode
+/// becomes Bonded plus the orthogonal metered-link preference.
+func normalizedConnectionSettings(mode: TransportMode, policy: String,
+                                  avoidMeteredLinks: Bool) -> NormalizedConnectionSettings {
+    if mode == .direct {
+        return NormalizedConnectionSettings(mode: .direct, policy: "smart",
+                                            avoidMeteredLinks: avoidMeteredLinks || policy == "data-saver")
+    }
+    return NormalizedConnectionSettings(mode: .secure,
+                                        policy: ["continuity", "smart-repair"].contains(policy) ? policy : "performance",
+                                        avoidMeteredLinks: avoidMeteredLinks || policy == "data-saver")
+}
+
+/// The policy the main encrypted tunnel (TCP and uncaptured UDP) runs under.
+/// Smart Repair changes only the UDP stream lane; the tunnel runs as Bonded,
+/// and the privileged helper accepts only its own policy names.
+func mainTunnelPolicy(_ policy: String) -> String {
+    policy == "smart-repair" ? "performance" : policy
+}
+
+func avoidedMeteredInterfaces(_ interfaces: [LinkInterface], explicitlyDisabled: Set<String>,
+                              metered: Set<String>, enabled: Bool) -> Set<String> {
+    guard enabled else { return [] }
+    let candidates = interfaces.filter { $0.canConnect && !explicitlyDisabled.contains($0.name) }
+    guard candidates.contains(where: { !metered.contains($0.name) }) else { return [] }
+    return Set(candidates.lazy.filter { metered.contains($0.name) }.map(\.name))
 }
 
 struct PathTelemetry: Decodable, Identifiable {
@@ -93,6 +129,8 @@ struct PathTelemetry: Decodable, Identifiable {
     let receivedBytes: UInt64
     let acknowledgedBytes: UInt64
     let deliveryBps: Double
+    var carrier: String?
+    var standby: Bool?
     var latencyExcluded: Bool?
     var realtimePreferred: Bool?
     var uploadBps: Double?
@@ -161,10 +199,11 @@ final class LinkModel: ObservableObject {
     @Published var selectedPage = "Connection"
     @Published var policy = "continuity" { didSet { configurationChanged() } }
     @Published var mode = TransportMode.secure { didSet { configurationChanged() } }
+    @Published var avoidMeteredLinks = false { didSet { configurationChanged() } }
     var preset: ConnectionPreset {
         get { ConnectionPreset.matching(mode: mode, policy: policy) }
         set {
-            guard let settings = newValue.settings else { return }
+            let settings = newValue.settings
             if mode != settings.mode { mode = settings.mode }
             if policy != settings.policy { policy = settings.policy }
         }
@@ -177,6 +216,9 @@ final class LinkModel: ObservableObject {
     @Published var pathRates: [String: (upMbps: Double, downMbps: Double)] = [:]
     private var pathRateSample: (at: Date, paths: [String: (sent: UInt64, received: UInt64)])?
     @Published var udpPaths: [String: UDPPathTelemetry] = [:]
+    /// Whether the connected server supports Smart Repair, once known.
+    @Published var smartRepairSupported: Bool?
+    @Published var smartRepairsSent: UInt64 = 0
     private var udpTelemetryTime: Date?
     private var udpPayloadMeter = PayloadRateTracker()
     private var interfaceReceivedMbps = 0.0
@@ -195,6 +237,7 @@ final class LinkModel: ObservableObject {
     private var interfaceMonitor: InterfaceMonitor?
     private var session: TunnelSession?
     private let udpConnection = UDPConnection()
+    private var udpAcceleratorStarted = false
     private var runner: NetworkTest?
     private var testTask: Task<Void, Never>?
     private var sessionID = UUID()
@@ -210,7 +253,15 @@ final class LinkModel: ObservableObject {
     private var lastTransportDiagnostic = Date.distantPast
     var busy: Bool { state != .disconnected }
     var canTest: Bool { state == .connected && mode != .direct && !testRunning }
-    var enabledInterfaces: [LinkInterface] { interfaces.filter { $0.canConnect && !disabledInterfaces.contains($0.name) } }
+    var effectiveDisabledInterfaces: Set<String> {
+        disabledInterfaces.union(avoidedMeteredInterfaces(interfaces,
+                                                          explicitlyDisabled: disabledInterfaces,
+                                                          metered: meteredInterfaces,
+                                                          enabled: avoidMeteredLinks))
+    }
+    var enabledInterfaces: [LinkInterface] {
+        interfaces.filter { $0.canConnect && !effectiveDisabledInterfaces.contains($0.name) }
+    }
     var visibleInterfaces: [LinkInterface] { interfaces.filter(\.isConnected) }
     var hasReadyInterface: Bool { !enabledInterfaces.isEmpty }
     var keyURL: URL { storage.appendingPathComponent("lab-secret") }
@@ -234,8 +285,18 @@ final class LinkModel: ObservableObject {
         if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
-        policy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "continuity"
-        mode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "secure") ?? .secure
+        let savedPolicy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "continuity"
+        let savedMode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "secure") ?? .secure
+        let normalized = normalizedConnectionSettings(
+            mode: savedMode,
+            policy: savedPolicy,
+            avoidMeteredLinks: UserDefaults.standard.bool(forKey: "avoidMeteredLinks"))
+        policy = normalized.policy
+        mode = normalized.mode
+        avoidMeteredLinks = normalized.avoidMeteredLinks
+        UserDefaults.standard.set(policy, forKey: "bondPolicy")
+        UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
+        UserDefaults.standard.set(avoidMeteredLinks, forKey: "avoidMeteredLinks")
         secureDomainsText = UserDefaults.standard.string(forKey: "secureDomains") ?? ""
         if let value = UserDefaults.standard.string(forKey: "interface") { selectedInterface = value }
         hasCredential = validSecret((try? Data(contentsOf: keyURL)) ?? Data())
@@ -252,7 +313,12 @@ final class LinkModel: ObservableObject {
         }
         initialized = true
         udpConnection.onMessage = { [weak self] text in self?.log(text) }
-        udpConnection.onFailure = { [weak self] text in self?.errorMessage = text; self?.log(text); self?.disconnect() }
+        udpConnection.onFailure = { [weak self] text in
+            guard let self else { return }
+            self.udpAcceleratorStarted = false
+            self.udpPaths = [:]
+            self.log("\(text) UDP traffic remains protected by the main encrypted tunnel.")
+        }
         udpConnection.onTelemetry = { [weak self] data in
             guard let self, let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
             let now = Date()
@@ -285,6 +351,14 @@ final class LinkModel: ObservableObject {
                     uploadMbps: up, downloadMbps: down)
             }
             self.udpPaths = paths; self.udpTelemetryTime = now
+            if let smart = object["smart"] as? [String: Any], let supported = smart["supported"] as? Bool {
+                if self.policy == "smart-repair", self.smartRepairSupported != supported {
+                    self.log(supported ? "Smart Repair active · lost packets are rebuilt from repair packets"
+                                       : "Smart Repair unavailable on this server · running as Maximum Continuity")
+                }
+                self.smartRepairSupported = supported
+                self.smartRepairsSent = ((smart["stats"] as? [String: Any])?["repairs"] as? NSNumber)?.uint64Value ?? 0
+            }
         }
     }
 
@@ -347,31 +421,20 @@ final class LinkModel: ObservableObject {
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
         interfaceReceivedMbps = 0; interfaceSentMbps = 0
         udpPaths = [:]; udpTelemetryTime = nil; udpPayloadMeter = PayloadRateTracker()
+        udpAcceleratorStarted = false
+        udpConnection.disconnect()
         brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
         directHealthyPaths = 0; secureHealthyPaths = 0
         sessionID = UUID()
         let identifier = sessionID
         let names = enabledInterfaces.map(\.name)
         log("Starting \(mode.title) using \(names.joined(separator: ", ")) · \(policy)")
-        if mode != .direct {
-            udpConnection.connect(host: String(relay.split(separator: ":")[0]),
-                                  key: String(decoding: secret, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
-                                  disabled: Array(disabledInterfaces), policy: policy) { [weak self] result in
-                guard let self, self.sessionID == identifier, self.state != .disconnecting else { return }
-                switch result {
-                case .success:
-                    self.log("Independent encrypted UDP datagram path authenticated; starting the unchanged TCP engine")
-                    self.startTunnel(secret: secret, names: names, identifier: identifier)
-                case .failure(let error):
-                    self.state = .disconnected; self.errorMessage = error.localizedDescription; self.log(error.localizedDescription)
-                }
-            }
-        } else { startTunnel(secret: secret, names: names, identifier: identifier) }
+        startTunnel(secret: secret, names: names, identifier: identifier)
     }
 
     private func startTunnel(secret: Data, names: [String], identifier: UUID) {
         do {
-            session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: tcpPolicy, configuration: configurationData()) { [weak self] event in
+            session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: mainTunnelPolicy(policy), configuration: configurationData()) { [weak self] event in
                 Task { @MainActor in
                     guard let self, self.sessionID == identifier else { return }
                     self.handle(event)
@@ -380,10 +443,30 @@ final class LinkModel: ObservableObject {
         } catch { udpConnection.disconnect(); state = .disconnected; errorMessage = error.localizedDescription; log(error.localizedDescription) }
     }
 
+    private func startUDPAccelerator(identifier: UUID) {
+        guard mode != .direct, !udpAcceleratorStarted,
+              let secret = try? Data(contentsOf: keyURL), validSecret(secret) else { return }
+        udpAcceleratorStarted = true
+        udpConnection.connect(host: String(relay.split(separator: ":")[0]),
+                              key: String(decoding: secret, as: UTF8.self)
+                                .trimmingCharacters(in: .whitespacesAndNewlines),
+                              disabled: Array(effectiveDisabledInterfaces), policy: policy) { [weak self] result in
+            guard let self, self.sessionID == identifier, self.state != .disconnecting else { return }
+            switch result {
+            case .success:
+                self.log("UDP accelerator active · native UDP when available, encrypted main-tunnel fallback otherwise")
+            case .failure(let error):
+                self.udpAcceleratorStarted = false
+                self.log("UDP accelerator unavailable: \(error.localizedDescription). UDP remains on the encrypted main tunnel.")
+            }
+        }
+    }
+
     func disconnect() {
         guard busy else { return }
         runner?.cancel(); testTask?.cancel(); testRunning = false
         state = .disconnecting
+        udpAcceleratorStarted = false
         log("Disconnect requested")
         udpConnection.disconnect()
         if let session { session.disconnect() } else { state = .disconnected }
@@ -411,6 +494,7 @@ final class LinkModel: ObservableObject {
                     log("Direct Smart connected · TCP flows go directly to their destinations")
                 }
             }
+            startUDPAccelerator(identifier: sessionID)
             let token = sessionID
             Task { [weak self] in
                 let ip = await Self.fetchPublicIP(proxy: self?.mode == .secure ? nil : self?.proxyEndpoint)
@@ -493,6 +577,7 @@ final class LinkModel: ObservableObject {
             errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
             log(errorMessage!)
         case "session_ended":
+            udpAcceleratorStarted = false
             udpConnection.disconnect()
             state = .disconnected; tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
             brainConnected = false; brainGeneration = 0; directHealthyPaths = 0; secureHealthyPaths = 0
@@ -526,7 +611,12 @@ final class LinkModel: ObservableObject {
             } catch {
                 testRunning = false
                 if Task.isCancelled || error is CancellationError { testStage = "Test cancelled" }
-                else { errorMessage = error.localizedDescription; testStage = "Test failed"; log("Diagnostics failed: \(error.localizedDescription)") }
+                else {
+                    let message = NetworkTest.userFacingMessage(for: error)
+                    errorMessage = message
+                    testStage = "Test failed"
+                    log("Diagnostics failed · \(message)")
+                }
             }
         }
     }
@@ -627,17 +717,11 @@ final class LinkModel: ObservableObject {
         configurationChanged()
     }
 
-    // Adaptive Protection is an isolated UDP policy. The TCP engine keeps its
-    // already-tested Continuity behavior while this UDP mode is selected.
-    private var tcpPolicy: String {
-        policy == "adaptive-protection" ? "continuity" : policy
-    }
-
     private func configurationData() -> Data {
         let paths: [[String: Any]] = enabledInterfaces.map { ["name": $0.name, "address": $0.address ?? "", "metered": meteredInterfaces.contains($0.name)] }
         return (try? JSONSerialization.data(withJSONObject: [
             "interfaces": paths,
-            "policy": tcpPolicy,
+            "policy": mainTunnelPolicy(policy),
             "mode": mode.rawValue,
             "secureDomains": secureDomains() ?? []
         ], options: [.sortedKeys])) ?? Data()
@@ -647,9 +731,10 @@ final class LinkModel: ObservableObject {
         guard initialized else { return }
         UserDefaults.standard.set(policy, forKey: "bondPolicy")
         UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
+        UserDefaults.standard.set(avoidMeteredLinks, forKey: "avoidMeteredLinks")
         UserDefaults.standard.set(secureDomainsText, forKey: "secureDomains")
         session?.updateConfiguration(configurationData())
-        if mode != .direct { udpConnection.update(disabled: Array(disabledInterfaces), policy: policy) }
+        if mode != .direct { udpConnection.update(disabled: Array(effectiveDisabledInterfaces), policy: policy) }
     }
 
     private func secureDomains() -> [String]? {

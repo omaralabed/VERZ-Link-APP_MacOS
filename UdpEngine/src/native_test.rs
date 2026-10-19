@@ -263,13 +263,19 @@ fn deployed_gateway_echo() {
     })
     .unwrap();
     e.adapters(adapters.clone()).unwrap();
-    unsafe { verz_mode(&mut e, 2) };
+    // VERZ_UDP_TEST_MODE=5 exercises Smart Repair against the deployed gateway.
+    let mode: i32 = std::env::var("VERZ_UDP_TEST_MODE").ok().and_then(|m| m.parse().ok()).unwrap_or(2);
+    unsafe { verz_mode(&mut e, mode) };
     let ready = Instant::now();
     while ready.elapsed() < Duration::from_secs(8)
-        && e.links().iter().filter(|p| p.status == 1).count() < adapters.len()
+        && (e.links().iter().filter(|p| p.status == 1).count() < adapters.len()
+            || (mode == MODE_CODED && !e.coded_supported))
     {
         e.tick();
         std::thread::sleep(Duration::from_millis(2));
+    }
+    if mode == MODE_CODED {
+        assert!(e.coded_supported, "deployed gateway did not announce Smart Repair");
     }
     assert_eq!(
         e.links().iter().filter(|p| p.status == 1).count(),
@@ -310,4 +316,15 @@ fn deployed_gateway_echo() {
         adapters.len(),
         adapters.len() > 1
     );
+    if mode == MODE_CODED {
+        println!(
+            "Smart Repair over the deployed gateway: {} originals, {} repairs, {} probes, {} reports, wire bytes {:?}",
+            e.coded_stats.originals,
+            e.coded_stats.repairs,
+            e.coded_stats.probes,
+            e.coded_stats.reports,
+            e.sockets.bytes.iter().map(|(id, b)| (*id, b.sent)).collect::<Vec<_>>()
+        );
+        assert!(e.coded_stats.reports > 0, "no reports came back from the deployed gateway");
+    }
 }
