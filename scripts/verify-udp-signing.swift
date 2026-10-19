@@ -30,9 +30,20 @@ func sourcePlist(_ name: String) -> [String: Any] {
 }
 let host = sourceCheck ? sourcePlist("UDP-App.entitlements") : entitlements(app)
 let provider = sourceCheck ? sourcePlist("UDP-Proxy.entitlements") : entitlements(ext)
+let hostInfoURL = sourceCheck ? app.appendingPathComponent("Resources/Info.plist") : app.appendingPathComponent("Contents/Info.plist")
 let infoURL = sourceCheck ? app.appendingPathComponent("Resources/UDP-Proxy-Info.plist") : ext.appendingPathComponent("Contents/Info.plist")
-guard let data = try? Data(contentsOf: infoURL),
-      let network = plist(data)["NetworkExtension"] as? [String: Any],
+guard let hostInfoData = try? Data(contentsOf: hostInfoURL),
+      let providerInfoData = try? Data(contentsOf: infoURL) else {
+    fail("cannot read host and provider Info.plist files")
+}
+let hostInfo = plist(hostInfoData)
+let providerInfo = plist(providerInfoData)
+guard let hostVersion = hostInfo["CFBundleVersion"] as? String,
+      let providerVersion = providerInfo["CFBundleVersion"] as? String,
+      hostVersion == providerVersion else {
+    fail("host and UDP provider build numbers must match so macOS installs the current provider")
+}
+guard let network = providerInfo["NetworkExtension"] as? [String: Any],
       let service = network["NEMachServiceName"] as? String,
       let hostGroups = host["com.apple.security.application-groups"] as? [String],
       let groups = provider["com.apple.security.application-groups"] as? [String],

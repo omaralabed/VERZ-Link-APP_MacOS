@@ -15,14 +15,21 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, UdpSocket},
+    sync::mpsc,
+    task::JoinHandle,
+    time,
+};
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use verz_link_core::{ACK as UDP_ACK, NACK as UDP_NACK, Packet as UdpPacket, transport::WanWriter};
 use verz_link_lab::{
     bind_interface_socket, bind_interface_std_socket,
     bond::{
-        AckBatcher, BOND_MTU, FEATURE_ACK_BATCH, FEATURE_PATH_FAILURE, FEATURE_UDP_LANE, Frame,
-        Kind, MAX_PATHS, Policy, Scheduler, handshake, transport as bond_transport,
+        AckBatcher, BOND_MTU, FEATURE_ACK_BATCH, FEATURE_CORPORATE_FALLBACK, FEATURE_PATH_FAILURE,
+        FEATURE_UDP_LANE, Frame, Kind, MAX_PATHS, Policy, Scheduler, handshake,
+        transport as bond_transport,
     },
     carrier_io::ReceiveBatch,
     egress::{Datagram, Egress},
@@ -40,6 +47,11 @@ use verz_link_lab::{
 const SERVER_IP: [u8; 4] = [10, 78, 0, 1];
 const DEFAULT_RELAY: &str = "69.164.213.57:443";
 const PACKET_WRITER_QUEUE: usize = 8192;
+const CORPORATE_FALLBACK_DELAY_MS: u64 = 1_000;
+const CORPORATE_FALLBACK_RETRY_MS: u64 = 5_000;
+const CORPORATE_UDP_RECOVERY_INTERVAL_MS: u64 = 30_000;
+const CORPORATE_UDP_RECOVERY_PROBES: u64 = 60;
+const CORPORATE_UDP_RECOVERY_MIN_REPLIES: usize = 54;
 
 fn single_path_tcp_fast_enabled() -> bool {
     std::env::var("VERZ_TCP_SINGLE_PATH_FAST")
@@ -61,6 +73,17 @@ fn carrier_receive_batch_enabled() -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+fn corporate_fallback_enabled() -> bool {
+    std::env::var("VERZ_CORPORATE_FALLBACK")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 struct PacketDelivery {
@@ -287,6 +310,10 @@ struct Server {
     secret_file: PathBuf,
     #[arg(long, default_value = "verzb0")]
     tun_name: String,
+    /// Disable only the TCP/TLS compatibility listener. Native UDP remains
+    /// byte-for-byte unchanged, providing an immediate rollback switch.
+    #[arg(long = "no-corporate-fallback", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    corporate_fallback: bool,
 }
 #[derive(Args)]
 struct Client {
@@ -380,6 +407,22 @@ fn number_policy(value: u64) -> Policy {
         _ => Policy::Smart,
     }
 }
+fn join_features(scheduler: &Scheduler, index: usize) -> u64 {
+    FEATURE_ACK_BATCH
+        | FEATURE_UDP_LANE
+        | FEATURE_PATH_FAILURE
+        | policy_number(scheduler.policy)
+        | if scheduler.paths[index].metered {
+            256
+        } else {
+            0
+        }
+        | if scheduler.paths[index].standby {
+            FEATURE_CORPORATE_FALLBACK
+        } else {
+            0
+        }
+}
 fn destination_allowed(ip: &[u8]) -> bool {
     ip.len() >= 20
         && (ip[16..20] == SERVER_IP
@@ -390,11 +433,18 @@ enum Incoming {
     Wire(usize, u64, Vec<u8>),
     Failed(usize, u64),
     Opened(usize, u64, std::result::Result<StdUdpSocket, String>),
+    CorporateOpened(usize, u64, u64, mpsc::Sender<Vec<u8>>),
+    CorporateFailed(usize, u64),
+    NativeRecovered(usize, u64, std::result::Result<StdUdpSocket, String>),
+}
+enum Carrier {
+    Udp(Arc<UdpSocket>),
+    Corporate(mpsc::Sender<Vec<u8>>),
 }
 struct Subflow {
     generation: u64,
-    socket: Arc<UdpSocket>,
-    reader: JoinHandle<()>,
+    carrier: Carrier,
+    reader: Option<JoinHandle<()>>,
     pending_join: Option<Vec<u8>>,
     ack_batching: bool,
     acks: AckBatcher,
@@ -402,7 +452,36 @@ struct Subflow {
 }
 impl Drop for Subflow {
     fn drop(&mut self) {
-        self.reader.abort();
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+    }
+}
+impl Subflow {
+    fn is_corporate(&self) -> bool {
+        matches!(self.carrier, Carrier::Corporate(_))
+    }
+    fn try_send(&self, packet: &[u8]) -> std::io::Result<usize> {
+        match &self.carrier {
+            Carrier::Udp(socket) => socket.try_send(packet),
+            Carrier::Corporate(sender) => sender
+                .try_send(packet.to_vec())
+                .map(|_| packet.len())
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        std::io::Error::from(std::io::ErrorKind::WouldBlock)
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        std::io::Error::from(std::io::ErrorKind::NotConnected)
+                    }
+                }),
+        }
+    }
+    fn udp_socket(&self) -> Option<&UdpSocket> {
+        match &self.carrier {
+            Carrier::Udp(socket) => Some(socket),
+            Carrier::Corporate(_) => None,
+        }
     }
 }
 fn open_subflow(
@@ -449,13 +528,210 @@ fn activate_subflow(
     });
     Subflow {
         generation,
-        socket,
-        reader,
+        carrier: Carrier::Udp(socket),
+        reader: Some(reader),
         pending_join: None,
         ack_batching: false,
         acks: AckBatcher::default(),
         udp_ready: false,
     }
+}
+
+fn begin_corporate_open(
+    name: String,
+    relay: SocketAddr,
+    index: usize,
+    attempt: u64,
+    sender: mpsc::Sender<Incoming>,
+) {
+    tokio::spawn(async move {
+        let generation = rand::random();
+        let result = verz_link_lab::corporate::connect(
+            &name,
+            relay,
+            verz_link_lab::corporate::client_config(),
+        )
+        .await;
+        let Ok(tls) = result else {
+            let _ = sender.send(Incoming::CorporateFailed(index, attempt)).await;
+            return;
+        };
+        let (outbound, mut outgoing) = mpsc::channel::<Vec<u8>>(4096);
+        if sender
+            .send(Incoming::CorporateOpened(
+                index, attempt, generation, outbound,
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let (mut reader, mut writer) = tokio::io::split(tls);
+        let inbound_sender = sender.clone();
+        let read_tls = async move {
+            while let Some(packet) = verz_link_lab::corporate::read_frame(&mut reader).await? {
+                if inbound_sender
+                    .send(Incoming::Wire(index, generation, packet))
+                    .await
+                    .is_err()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let write_tls = async move {
+            let mut batch = Vec::with_capacity(256 * 1024);
+            loop {
+                let Some(packet) = outgoing.recv().await else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                batch.clear();
+                verz_link_lab::corporate::append_frame(&mut batch, &packet)?;
+                let mut frames = 1;
+                while verz_link_lab::corporate::batch_has_room(&batch, frames) {
+                    match outgoing.try_recv() {
+                        Ok(packet) => {
+                            verz_link_lab::corporate::append_frame(&mut batch, &packet)?;
+                            frames += 1;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                writer.write_all(&batch).await?;
+                writer.flush().await?;
+            }
+        };
+        let _ = tokio::try_join!(read_tls, write_tls);
+        let _ = sender.send(Incoming::Failed(index, generation)).await;
+    });
+}
+
+/// Prove that native UDP is usable on a separate authenticated session before
+/// moving a live corporate path away from its TCP/TLS carrier. This avoids a
+/// periodic outage on the active path and rejects networks that pass only the
+/// initial UDP handshake but suppress sustained return traffic.
+fn native_udp_recovery_sustained(replies: &std::collections::BTreeSet<u64>) -> bool {
+    replies.len() >= CORPORATE_UDP_RECOVERY_MIN_REPLIES
+        && replies
+            .last()
+            .is_some_and(|last| *last >= CORPORATE_UDP_RECOVERY_PROBES - 5)
+}
+
+async fn prove_native_udp(name: &str, relay: SocketAddr, secret: [u8; 32]) -> Result<StdUdpSocket> {
+    let socket = bind_interface_socket(name, relay)?;
+    ensure!(
+        observed_carrier(&socket, name) != Some(false),
+        "adapter has no carrier"
+    );
+    let session = rand::random();
+    let mut noise = handshake(&secret, &session, true)?;
+    let mut wire = [0_u8; MAX_WIRE + 1];
+    let mut plain = [0_u8; MAX_WIRE];
+    let mut decrypted = [0_u8; MAX_PAYLOAD + 17];
+    let length = noise.write_message(&[], &mut plain)?;
+    let hello = Header {
+        kind: HELLO,
+        session,
+        counter: 0,
+    }
+    .wrap(&plain[..length]);
+    let handshake_deadline = time::Instant::now() + Duration::from_secs(4);
+    loop {
+        ensure!(
+            time::Instant::now() < handshake_deadline,
+            "native UDP recovery handshake timed out"
+        );
+        socket.send(&hello).await?;
+        let remaining = handshake_deadline.saturating_duration_since(time::Instant::now());
+        let wait = remaining.min(Duration::from_millis(250));
+        let Ok(received) = time::timeout(wait, socket.recv(&mut wire)).await else {
+            continue;
+        };
+        let received = received?;
+        let Ok(header) = Header::parse(&wire[..received]) else {
+            continue;
+        };
+        if header.kind != WELCOME || header.session != session {
+            continue;
+        }
+        let size = noise.read_message(&wire[HEADER..received], &mut plain)?;
+        ensure!(
+            size == 4 && plain[..3] == [10, 78, 0] && (2..=254).contains(&plain[3]),
+            "invalid native UDP recovery assignment"
+        );
+        break;
+    }
+
+    let mut transport = bond_transport(session, noise)?;
+    let joined = transport.seal(IP, &Frame::control(Kind::Join, 0, 0, 0).encode())?;
+    socket.send(&joined).await?;
+    let mut sent = 0_u64;
+    let mut replies = std::collections::BTreeSet::new();
+    let mut probe = time::interval(Duration::from_millis(20));
+    probe.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let deadline = time::Instant::now() + Duration::from_millis(2_200);
+    while time::Instant::now() < deadline
+        && (sent < CORPORATE_UDP_RECOVERY_PROBES
+            || replies.len() < CORPORATE_UDP_RECOVERY_MIN_REPLIES)
+    {
+        tokio::select! {
+            _ = probe.tick(), if sent < CORPORATE_UDP_RECOVERY_PROBES => {
+                sent += 1;
+                let packet = transport.seal(
+                    IP,
+                    &Frame::control(Kind::Probe, 0, sent, sent).encode(),
+                )?;
+                socket.send(&packet).await?;
+            }
+            received = socket.recv(&mut wire) => {
+                let received = received?;
+                let Ok((kind, body)) = transport.open_into(&wire[..received], &mut decrypted) else {
+                    continue;
+                };
+                if kind != IP { continue; }
+                let Ok(frame) = Frame::decode(body) else { continue; };
+                if frame.kind == Kind::Pong
+                    && frame.path == 0
+                    && (1..=CORPORATE_UDP_RECOVERY_PROBES).contains(&frame.id)
+                {
+                    replies.insert(frame.id);
+                }
+            }
+        }
+    }
+    let sustained = native_udp_recovery_sustained(&replies);
+    let close = transport.seal(
+        IP,
+        &Frame::control(Kind::Close, 0, 0, CORPORATE_UDP_RECOVERY_PROBES).encode(),
+    )?;
+    let _ = socket.send(&close).await;
+    ensure!(
+        sustained,
+        "native UDP recovery received only {}/{} sustained replies",
+        replies.len(),
+        CORPORATE_UDP_RECOVERY_PROBES
+    );
+    Ok(socket.into_std()?)
+}
+
+fn begin_native_recovery(
+    name: String,
+    relay: SocketAddr,
+    secret: [u8; 32],
+    index: usize,
+    attempt: u64,
+    sender: mpsc::Sender<Incoming>,
+) {
+    tokio::spawn(async move {
+        let recovered = prove_native_udp(&name, relay, secret)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender
+            .send(Incoming::NativeRecovered(index, attempt, recovered))
+            .await;
+    });
 }
 
 /// Adapter creation can wait in macOS while an unplugged interface loses its
@@ -487,8 +763,9 @@ fn begin_subflow_open(
 
 async fn establish(
     args: &Client,
-    sockets: &[Option<Subflow>],
+    sockets: &mut [Option<Subflow>],
     input: &mut mpsc::Receiver<Incoming>,
+    sender: &mpsc::Sender<Incoming>,
 ) -> Result<(Transport, [u8; 4])> {
     let session = rand::random();
     let mut noise = handshake(&load_secret(&args.secret_file)?, &session, true)?;
@@ -502,13 +779,40 @@ async fn establish(
     .wrap(&body[..length]);
     let deadline = time::sleep(Duration::from_secs(10));
     tokio::pin!(deadline);
+    let fallback_delay = time::sleep(Duration::from_millis(750));
+    tokio::pin!(fallback_delay);
+    let mut fallback_started = false;
     let mut repeat = time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             _ = &mut deadline => anyhow::bail!("none of the selected networks authenticated the VERZ Server"),
-            _ = repeat.tick() => { for path in sockets.iter().flatten() { let _ = path.socket.try_send(&hello); } }
+            _ = &mut fallback_delay, if !fallback_started && corporate_fallback_enabled() => {
+                fallback_started = true;
+                let mut fallback_names = args.interface.clone();
+                fallback_names.sort();
+                fallback_names.dedup();
+                for (index, name) in fallback_names.into_iter().enumerate() {
+                    begin_corporate_open(name.clone(), args.relay, index, rand::random(), sender.clone());
+                }
+            }
+            _ = repeat.tick() => { for path in sockets.iter().flatten() { let _ = path.try_send(&hello); } }
             message = input.recv() => {
-                let Some(Incoming::Wire(_, _, packet)) = message else { continue; };
+                let Some(message) = message else { continue; };
+                if let Incoming::CorporateOpened(index, _, generation, outbound) = message {
+                    if let Some(slot) = sockets.get_mut(index) {
+                        *slot = Some(Subflow {
+                            generation,
+                            carrier: Carrier::Corporate(outbound),
+                            reader: None,
+                            pending_join: None,
+                            ack_batching: false,
+                            acks: AckBatcher::default(),
+                            udp_ready: false,
+                        });
+                    }
+                    continue;
+                }
+                let Incoming::Wire(_, _, packet) = message else { continue; };
                 let Ok(header) = Header::parse(&packet) else { continue; };
                 if header.kind != WELCOME || header.session != session { continue; }
                 let size = noise.read_message(&packet[HEADER..], &mut body)?;
@@ -541,7 +845,7 @@ fn send_client(
         // A fresh Tokio UDP socket may not yet be writable. Losing Join here
         // strands all following probes at the relay's old NAT address.
         if let Some(join) = path.pending_join.as_ref() {
-            match path.socket.try_send(join) {
+            match path.try_send(join) {
                 Ok(_) => path.pending_join = None,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => {
@@ -552,7 +856,7 @@ fn send_client(
             }
         }
         let packet = transport.seal(IP, &frame.encode())?;
-        if let Err(error) = path.socket.try_send(&packet) {
+        if let Err(error) = path.try_send(&packet) {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 scheduler.counters.socket_backpressure += 1;
                 if frame.kind == Kind::Join {
@@ -640,6 +944,64 @@ impl WanWriter for UdpSocketWriter<'_> {
         }
     }
 }
+
+struct ClientCarrierWriter<'a> {
+    transport: &'a mut Transport,
+    scheduler: &'a mut Scheduler,
+    carriers: &'a [Option<Subflow>],
+}
+impl WanWriter for ClientCarrierWriter<'_> {
+    fn carrier(&self, id: u8) -> bool {
+        let index = usize::from(id);
+        self.carriers
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|carrier| {
+                carrier.udp_ready
+                    && carrier.pending_join.is_none()
+                    && self.scheduler.paths[index].enabled
+                    && (carrier.is_corporate()
+                        || carrier.udp_socket().and_then(|socket| {
+                            observed_carrier(socket, &self.scheduler.paths[index].name)
+                        }) != Some(false))
+            })
+    }
+    fn send(&mut self, id: u8, wire: &[u8]) -> std::io::Result<()> {
+        let index = usize::from(id);
+        let Some(carrier) = self.carriers.get(index).and_then(Option::as_ref) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
+        };
+        let frame = Frame {
+            kind: Kind::Udp,
+            path: id,
+            id: 0,
+            stamp: 0,
+            body: wire.to_vec(),
+        };
+        let sealed = self
+            .transport
+            .seal(IP, &frame.encode())
+            .map_err(std::io::Error::other)?;
+        match carrier.try_send(&sealed) {
+            Ok(size) if size == sealed.len() => {
+                self.scheduler.paths[index].sent_bytes += wire
+                    .len()
+                    .saturating_sub(verz_link_core::HEADER + verz_link_core::TAG)
+                    as u64;
+                Ok(())
+            }
+            Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    self.scheduler.counters.socket_backpressure += 1;
+                } else {
+                    self.scheduler.fail_path(index);
+                }
+                Err(error)
+            }
+        }
+    }
+}
 enum UdpAction {
     Send(Vec<u8>),
     Receive(UdpPacket, Vec<u8>),
@@ -686,21 +1048,23 @@ fn udp_client_action(
     scheduler: &mut Scheduler,
     moment: u64,
 ) {
-    let paths = udp_lane::links(scheduler, moment);
-    let policy = scheduler.policy;
-    let sockets = sockets
+    let mut paths = udp_lane::links(scheduler, moment);
+    let native_ready = scheduler
+        .paths
         .iter()
-        .map(|p| {
-            p.as_ref()
-                .filter(|p| p.udp_ready && p.pending_join.is_none())
-                .map(|p| (p.socket.as_ref(), None))
-        })
-        .collect();
-    let mut writer = UdpSocketWriter {
+        .any(|path| path.ready(moment) && !path.standby);
+    if native_ready {
+        for path in &mut paths {
+            if scheduler.paths[usize::from(path.id)].standby {
+                path.disabled = true;
+            }
+        }
+    }
+    let policy = scheduler.policy;
+    let mut writer = ClientCarrierWriter {
         transport,
         scheduler,
-        sockets,
-        physical: true,
+        carriers: sockets,
     };
     let _ = udp_action(lane, action, policy, moment, &paths, &mut writer);
 }
@@ -771,12 +1135,12 @@ async fn client_with_controls(
         sockets.iter().any(Option::is_some),
         "no selected network has a usable route to the VERZ Server"
     );
-    let (mut transport, assigned) = establish(&args, &sockets, &mut input).await?;
-    let mut udp = UdpLane::new(
-        &load_secret(&args.secret_file)?,
-        &transport.session,
-        args.policy,
-    )?;
+    let (mut transport, assigned) = establish(&args, &mut sockets, &mut input, &sender).await?;
+    for (index, socket) in sockets.iter().enumerate() {
+        scheduler.set_corporate_fallback(index, socket.as_ref().is_some_and(Subflow::is_corporate));
+    }
+    let recovery_secret = load_secret(&args.secret_file)?;
+    let mut udp = UdpLane::new(&recovery_secret, &transport.session, args.policy)?;
     let mut udp_negotiated = false;
     let mut path_failure_negotiated = false;
     let mut startup_udp = std::collections::VecDeque::new();
@@ -800,20 +1164,18 @@ async fn client_with_controls(
     // A dead adapter is reopened off the packet loop. The attempt token rejects
     // a completion made stale by a UI disable/address change in the meantime.
     let mut opening = vec![None::<u64>; sockets.len()];
+    let mut corporate_opening = vec![None::<u64>; sockets.len()];
+    let mut corporate_last_attempt = vec![0_u64; sockets.len()];
+    let mut native_recovery = vec![None::<u64>; sockets.len()];
+    let mut native_recovery_last_attempt = vec![0_u64; sockets.len()];
+    let mut unready_since = vec![None::<u64>; sockets.len()];
     let mut interface_addresses: HashMap<String, String> = HashMap::new();
     let joins: Vec<_> = scheduler
         .paths
         .iter()
-        .map(|path| {
-            Frame::control(
-                Kind::Join,
-                path.id,
-                FEATURE_ACK_BATCH
-                    | FEATURE_UDP_LANE
-                    | FEATURE_PATH_FAILURE
-                    | policy_number(scheduler.policy),
-                0,
-            )
+        .enumerate()
+        .map(|(index, path)| {
+            Frame::control(Kind::Join, path.id, join_features(&scheduler, index), 0)
         })
         .collect();
     send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
@@ -875,6 +1237,7 @@ async fn client_with_controls(
                 for (index, socket) in sockets.iter_mut().enumerate() {
                     if !control.interfaces.iter().any(|item| item.name == scheduler.paths[index].name) {
                         scheduler.remove_path(index); *socket = None; opening[index] = None;
+                        corporate_opening[index] = None; native_recovery[index] = None;
                     }
                 }
                 for item in control.interfaces {
@@ -882,14 +1245,21 @@ async fn client_with_controls(
                         println!("Additional adapter {} exceeds this session's path-ID limit; existing paths remain active", item.name);
                         continue;
                     };
-                    if index >= sockets.len() { sockets.push(None); last_reset.push(0); opening.push(None); }
+                    if index >= sockets.len() {
+                        sockets.push(None); last_reset.push(0); opening.push(None);
+                        corporate_opening.push(None); corporate_last_attempt.push(0); unready_since.push(None);
+                        native_recovery.push(None); native_recovery_last_attempt.push(0);
+                    }
                     if let Some(address) = item.address
                         && interface_addresses.insert(item.name, address.clone()).is_some_and(|previous| previous != address) {
-                        sockets[index] = None; scheduler.fail_path(index); last_reset[index] = 0; opening[index] = None;
+                        sockets[index] = None; scheduler.fail_path(index); scheduler.set_corporate_fallback(index, false);
+                        last_reset[index] = 0; opening[index] = None; corporate_opening[index] = None;
+                        native_recovery[index] = None; native_recovery_last_attempt[index] = 0;
+                        unready_since[index] = None;
                     }
                 }
-                let joins = scheduler.paths.iter().filter(|path| path.enabled).map(|path| Frame::control(Kind::Join, path.id,
-                    FEATURE_ACK_BATCH | FEATURE_UDP_LANE | FEATURE_PATH_FAILURE | policy_number(scheduler.policy) | if path.metered { 256 } else { 0 }, now(epoch))).collect();
+                let joins = scheduler.paths.iter().enumerate().filter(|(_, path)| path.enabled).map(|(index, path)| Frame::control(Kind::Join, path.id,
+                    join_features(&scheduler, index), now(epoch))).collect();
                 send_client(joins, &mut transport, &mut sockets, &mut scheduler)?;
             }
             _ = tick.tick() => {
@@ -906,7 +1276,53 @@ async fn client_with_controls(
                 let acknowledgements = sockets.iter_mut().flatten().flat_map(|path| path.acks.drain()).collect();
                 send_client(acknowledgements, &mut transport, &mut sockets, &mut scheduler)?;
                 for index in 0..sockets.len() {
-                    if !scheduler.paths[index].enabled || moment.saturating_sub(last_reset[index]) < 500 { continue; }
+                    if !scheduler.paths[index].enabled {
+                        unready_since[index] = None;
+                        corporate_opening[index] = None;
+                        native_recovery[index] = None;
+                        continue;
+                    }
+                    if sockets[index].as_ref().is_some_and(Subflow::is_corporate)
+                        && moment.saturating_sub(native_recovery_last_attempt[index])
+                            >= CORPORATE_UDP_RECOVERY_INTERVAL_MS
+                        && native_recovery[index].is_none()
+                    {
+                        let attempt = rand::random();
+                        native_recovery[index] = Some(attempt);
+                        native_recovery_last_attempt[index] = moment;
+                        begin_native_recovery(
+                            scheduler.paths[index].name.clone(),
+                            args.relay,
+                            recovery_secret,
+                            index,
+                            attempt,
+                            sender.clone(),
+                        );
+                    }
+                    if scheduler.paths[index].ready(moment) {
+                        unready_since[index] = None;
+                    } else {
+                        let since = *unready_since[index].get_or_insert(moment);
+                        let native = sockets[index].as_ref().is_none_or(|path| !path.is_corporate());
+                        if corporate_fallback_enabled()
+                            && native
+                            && moment.saturating_sub(since) >= CORPORATE_FALLBACK_DELAY_MS
+                            && moment.saturating_sub(corporate_last_attempt[index]) >= CORPORATE_FALLBACK_RETRY_MS
+                            && corporate_opening[index].is_none()
+                        {
+                            let attempt = rand::random();
+                            corporate_opening[index] = Some(attempt);
+                            corporate_last_attempt[index] = moment;
+                            begin_corporate_open(
+                                scheduler.paths[index].name.clone(),
+                                args.relay,
+                                index,
+                                attempt,
+                                sender.clone(),
+                            );
+                        }
+                    }
+                    if moment.saturating_sub(last_reset[index]) < 500 { continue; }
                     if sockets[index].is_none() || !scheduler.paths[index].ready(moment) {
                         last_reset[index] = moment;
                         // Keep the NAT mapping while probing a temporarily
@@ -918,7 +1334,7 @@ async fn client_with_controls(
                             begin_subflow_open(name, args.relay, index, attempt, sender.clone());
                         }
                         if sockets[index].is_some() {
-                            let id = FEATURE_ACK_BATCH | FEATURE_UDP_LANE | FEATURE_PATH_FAILURE | policy_number(scheduler.policy) | if scheduler.paths[index].metered { 256 } else { 0 };
+                            let id = join_features(&scheduler, index);
                             send_client(vec![Frame::control(Kind::Join, index as u8, id, moment)], &mut transport, &mut sockets, &mut scheduler)?;
                         }
                     }
@@ -948,8 +1364,56 @@ async fn client_with_controls(
                 match message {
                     Incoming::Failed(index, generation) => {
                         if sockets.get(index).and_then(Option::as_ref).is_some_and(|socket| socket.generation == generation) {
-                            scheduler.fail_path(index); sockets[index] = None;
+                            scheduler.fail_path(index); scheduler.set_corporate_fallback(index, false); sockets[index] = None;
                         }
+                    }
+                    Incoming::CorporateFailed(index, attempt) => {
+                        if corporate_opening.get(index).copied().flatten() == Some(attempt) {
+                            corporate_opening[index] = None;
+                        }
+                    }
+                    Incoming::CorporateOpened(index, attempt, generation, outbound) => {
+                        if corporate_opening.get(index).copied().flatten() != Some(attempt) { continue; }
+                        corporate_opening[index] = None;
+                        if !scheduler.paths.get(index).is_some_and(|path| path.enabled)
+                            || scheduler.paths[index].ready(now(epoch))
+                            || sockets.get(index).and_then(Option::as_ref).is_some_and(Subflow::is_corporate) { continue; }
+                        let metered = scheduler.paths[index].metered;
+                        scheduler.fail_path(index);
+                        scheduler.add_path(scheduler.paths[index].name.clone(), metered)?;
+                        scheduler.set_corporate_fallback(index, true);
+                        sockets[index] = Some(Subflow {
+                            generation,
+                            carrier: Carrier::Corporate(outbound),
+                            reader: None,
+                            pending_join: None,
+                            ack_batching: false,
+                            acks: AckBatcher::default(),
+                            udp_ready: false,
+                        });
+                        unready_since[index] = Some(now(epoch));
+                        println!("CORPORATE_FALLBACK {} TLS/TCP 443", scheduler.paths[index].name);
+                        let id = join_features(&scheduler, index);
+                        send_client(vec![Frame::control(Kind::Join, index as u8, id, now(epoch))], &mut transport, &mut sockets, &mut scheduler)?;
+                    }
+                    Incoming::NativeRecovered(index, attempt, recovered) => {
+                        if native_recovery.get(index).copied().flatten() != Some(attempt) { continue; }
+                        native_recovery[index] = None;
+                        if !scheduler.paths.get(index).is_some_and(|path| path.enabled)
+                            || !sockets.get(index).and_then(Option::as_ref).is_some_and(Subflow::is_corporate) { continue; }
+                        let Ok(socket) = recovered else { continue; };
+                        let Ok(socket) = UdpSocket::from_std(socket) else { continue; };
+                        let name = scheduler.paths[index].name.clone();
+                        let metered = scheduler.paths[index].metered;
+                        scheduler.fail_path(index);
+                        scheduler.add_path(name.clone(), metered)?;
+                        scheduler.set_corporate_fallback(index, false);
+                        sockets[index] = Some(activate_subflow(Arc::new(socket), index, sender.clone()));
+                        unready_since[index] = Some(now(epoch));
+                        println!("CORPORATE_RECOVERY {name} UDP 443");
+                        let moment = now(epoch);
+                        let id = join_features(&scheduler, index);
+                        send_client(vec![Frame::control(Kind::Join, index as u8, id, moment)], &mut transport, &mut sockets, &mut scheduler)?;
                     }
                     Incoming::Opened(index, attempt, opened) => {
                         if opening.get(index).copied().flatten() != Some(attempt) { continue; }
@@ -965,9 +1429,10 @@ async fn client_with_controls(
                         let name = scheduler.paths[index].name.clone();
                         let metered = scheduler.paths[index].metered;
                         scheduler.add_path(name, metered)?;
+                        scheduler.set_corporate_fallback(index, false);
                         sockets[index] = Some(activate_subflow(socket, index, sender.clone()));
                         let moment = now(epoch);
-                        let id = FEATURE_ACK_BATCH | FEATURE_UDP_LANE | FEATURE_PATH_FAILURE | policy_number(scheduler.policy) | if metered { 256 } else { 0 };
+                        let id = join_features(&scheduler, index);
                         send_client(vec![Frame::control(Kind::Join, index as u8, id, moment)], &mut transport, &mut sockets, &mut scheduler)?;
                     }
                     Incoming::Wire(index, generation, packet) => {
@@ -1181,6 +1646,19 @@ async fn server(args: Server) -> Result<()> {
     let secret = load_secret(&args.secret_file)?;
     let socket = UdpSocket::bind(args.listen).await?;
     verz_link_lab::configure_udp_buffers(&socket)?;
+    let corporate = if args.corporate_fallback {
+        let listener = TcpListener::bind(args.listen)
+            .await
+            .context("bind corporate fallback TCP listener")?;
+        let udp_relay = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), args.listen.port());
+        Some(verz_link_lab::corporate::spawn(
+            listener,
+            udp_relay,
+            usize::from(args.max_clients).saturating_mul(8),
+        ))
+    } else {
+        None
+    };
     let tun = Arc::new(
         DeviceBuilder::new()
             .name(&args.tun_name)
@@ -1216,9 +1694,14 @@ async fn server(args: Server) -> Result<()> {
     let stop = stop_signal();
     tokio::pin!(stop);
     println!(
-        "MULTIPATH SERVER ready: {} / 10.78.0.1 / {}",
+        "MULTIPATH SERVER ready: {} / 10.78.0.1 / {} / corporate fallback {}",
         tun.name()?,
-        args.listen
+        args.listen,
+        if corporate.is_some() {
+            "TLS/TCP"
+        } else {
+            "disabled"
+        }
     );
     loop {
         tokio::select! {
@@ -1286,6 +1769,10 @@ async fn server(args: Server) -> Result<()> {
                     }
                     if frame.stamp < peer.join_stamps[index] { continue; }
                     peer.scheduler.add_path(format!("path{index}"), frame.id & 256 != 0)?;
+                    peer.scheduler.set_corporate_fallback(
+                        index,
+                        frame.id & FEATURE_CORPORATE_FALLBACK != 0,
+                    );
                     peer.scheduler.policy = number_policy(frame.id);
                     peer.ack_batching = frame.id & FEATURE_ACK_BATCH != 0;
                     peer.udp_enabled |= frame.id & FEATURE_UDP_LANE != 0;
@@ -1380,6 +1867,71 @@ mod tests {
         assert!(stale_path_down(5_000, 5_000));
         assert!(!stale_path_down(5_001, 5_000));
         assert!(!stale_path_down(1, 0));
+    }
+
+    #[test]
+    fn corporate_recovery_requires_sustained_udp_not_only_early_replies() {
+        let early = (1..=CORPORATE_UDP_RECOVERY_MIN_REPLIES as u64).collect();
+        assert!(!native_udp_recovery_sustained(&early));
+        let sustained = (1..=CORPORATE_UDP_RECOVERY_PROBES).collect();
+        assert!(native_udp_recovery_sustained(&sustained));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_udp_recovery_uses_a_separate_authenticated_probe_session() -> Result<()> {
+        let secret = [0x5a; 32];
+        let server = UdpSocket::bind("127.0.0.1:0").await?;
+        let address = server.local_addr()?;
+        let responder = tokio::spawn(async move {
+            let mut wire = [0_u8; MAX_WIRE + 1];
+            let mut plain = [0_u8; MAX_WIRE];
+            let (received, peer) = server.recv_from(&mut wire).await.unwrap();
+            let header = Header::parse(&wire[..received]).unwrap();
+            assert_eq!(header.kind, HELLO);
+            let mut noise = handshake(&secret, &header.session, false).unwrap();
+            noise
+                .read_message(&wire[HEADER..received], &mut plain)
+                .unwrap();
+            let length = noise.write_message(&[10, 78, 0, 200], &mut plain).unwrap();
+            let welcome = Header {
+                kind: WELCOME,
+                session: header.session,
+                counter: 0,
+            }
+            .wrap(&plain[..length]);
+            server.send_to(&welcome, peer).await.unwrap();
+            let mut transport = bond_transport(header.session, noise).unwrap();
+            let mut decrypted = [0_u8; MAX_PAYLOAD + 17];
+            loop {
+                let (received, peer) = server.recv_from(&mut wire).await.unwrap();
+                let (kind, body) = transport
+                    .open_into(&wire[..received], &mut decrypted)
+                    .unwrap();
+                assert_eq!(kind, IP);
+                let frame = Frame::decode(body).unwrap();
+                if frame.kind == Kind::Close {
+                    break;
+                }
+                if matches!(frame.kind, Kind::Join | Kind::Probe) {
+                    let pong = transport
+                        .seal(
+                            IP,
+                            &Frame::control(Kind::Pong, frame.path, frame.id, frame.stamp).encode(),
+                        )
+                        .unwrap();
+                    server.send_to(&pong, peer).await.unwrap();
+                }
+            }
+        });
+        let recovered = time::timeout(
+            Duration::from_secs(3),
+            prove_native_udp("lo0", address, secret),
+        )
+        .await??;
+        assert_eq!(recovered.peer_addr()?, address);
+        responder.await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1498,7 +2050,7 @@ mod tests {
         let mut path = open_subflow(name, server.local_addr()?, 0, sender)?;
         // Model Join retained after WouldBlock on a newly opened socket.
         path.pending_join = Some(tx.seal(IP, &Frame::control(Kind::Join, 0, 0, 1).encode())?);
-        path.socket.writable().await?;
+        path.udp_socket().expect("UDP test path").writable().await?;
         let mut paths = vec![Some(path)];
         let mut scheduler = Scheduler::new(vec![(name.into(), false)], Policy::Smart)?;
         send_client(

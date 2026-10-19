@@ -19,7 +19,8 @@ final class TransparentProvider: NETransparentProxyProvider {
     private var gatewayHost = ""
     private var disabled = Set<String>()
     private var startup: ((Error?) -> Void)?
-    private var startTime = Date()
+    private let nativeStateLock = NSLock()
+    private var nativeUDPReady = false
     private var localDrops: UInt64 = 0
     private var lastPump: UInt64?
     private var maxPumpGapMS = 0.0
@@ -60,7 +61,11 @@ final class TransparentProvider: NETransparentProxyProvider {
                     timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(1))
                     timer.setEventHandler { [weak self] in self?.pump() }
                     self.timer = timer; timer.resume()
-                    self.startup = completionHandler; self.startTime = Date()
+                    // The main encrypted TUN is already active before this
+                    // optional accelerator starts. If no native UDP path can
+                    // authenticate, new UDP flows bypass this provider and are
+                    // carried by that TUN over the corporate TCP 443 carrier.
+                    completionHandler(nil)
                 }
             }
         }
@@ -73,6 +78,7 @@ final class TransparentProvider: NETransparentProxyProvider {
         timer?.cancel();timer=nil;monitor.cancel()
         scanner.cancel(); lastPump = nil
         for id in Array(flows.keys) {close(id)}
+        nativeStateLock.lock(); nativeUDPReady = false; nativeStateLock.unlock()
         if let engine {verz_destroy(engine)}
         engine=nil
     }
@@ -82,10 +88,36 @@ final class TransparentProvider: NETransparentProxyProvider {
         return endpoint.hostname != gatewayHost && inet_pton(AF_INET, endpoint.hostname, &address) == 1
             && UInt16(endpoint.port).map { $0 > 0 } == true
     }
+    private func nativeReadySnapshot() -> Bool {
+        nativeStateLock.lock(); defer { nativeStateLock.unlock() }
+        return nativeUDPReady
+    }
+    private func updateNativeReady(_ ready: Bool) {
+        nativeStateLock.lock()
+        let changed = nativeUDPReady != ready
+        nativeUDPReady = ready
+        nativeStateLock.unlock()
+        // An accepted transparent-proxy flow cannot be handed back to the
+        // network stack. Close it so the application opens a replacement;
+        // handleNewUDPFlow then declines it and macOS sends it through the
+        // already-established encrypted main tunnel.
+        if changed && !ready {
+            for id in Array(flows.keys) { close(id) }
+        }
+    }
+    private func refreshNativeReady(_ engine: UnsafeMutableRawPointer) {
+        var status = [UInt8](repeating: 0, count: 65536)
+        let count = verz_status(engine, &status, status.count)
+        let object = (try? JSONSerialization.jsonObject(with: Data(status.prefix(count)))) as? [String: Any]
+        let ready = (object?["paths"] as? [[String: Any]])?.contains {
+            ($0["status"] as? Int) == 1
+        } ?? false
+        updateNativeReady(ready)
+    }
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {false}
     override func handleNewUDPFlow(_ flow: NEAppProxyUDPFlow, initialRemoteEndpoint remoteEndpoint: NWEndpoint) -> Bool {
         guard let endpoint = remoteEndpoint as? NWHostEndpoint,
-              valid(endpoint) else {return false}
+              valid(endpoint), nativeReadySnapshot() else {return false}
         work.async {
             guard self.engine != nil, self.flows.count < 256, self.nextFlow <= UInt16.max else {
                 flow.closeReadWithError(self.failure("Streaming flow capacity reached"));flow.closeWriteWithError(nil);return
@@ -134,20 +166,7 @@ final class TransparentProvider: NETransparentProxyProvider {
         }
         lastPump = now
         verz_tick(engine); ticks += 1
-        if let callback = startup {
-            var status = [UInt8](repeating: 0, count: 65536)
-            let n = verz_status(engine, &status, status.count)
-            let object = (try? JSONSerialization.jsonObject(with: Data(status.prefix(n)))) as? [String: Any]
-            let pathReady = (object?["paths"] as? [[String: Any]])?.contains { ($0["status"] as? Int) == 1 } ?? false
-            let adaptiveReady = self.requestedMode != 4
-                || ((object?["adaptive_protection"] as? [String: Any])?["supported"] as? Bool == true)
-            let ready = pathReady && adaptiveReady
-            if ready { startup = nil; callback(nil) }
-            else if Date().timeIntervalSince(startTime) > 10 {
-                startup = nil; cleanup(); callback(failure("Encrypted UDP gateway did not authenticate on any adapter.")); return
-            }
-        }
-        if ticks % 40 == 0 {scan()}
+        if ticks % 40 == 0 { refreshNativeReady(engine); scan() }
         var buffer = [UInt8](repeating:0,count:16392)
         for _ in 0..<256 {
             let n = verz_receive(engine,&buffer,buffer.count)
@@ -209,6 +228,8 @@ final class TransparentProvider: NETransparentProxyProvider {
             let n=verz_status(engine,&buffer,buffer.count)
             var status = (try? JSONSerialization.jsonObject(with: Data(buffer.prefix(n)))) as? [String: Any] ?? [:]
             status["provider_drops"] = self.localDrops
+            status["native_udp_ready"] = self.nativeReadySnapshot()
+            status["fallback"] = self.nativeReadySnapshot() ? "native-udp" : "main-tunnel"
             status["pump_max_gap_ms"] = self.maxPumpGapMS
             status["inventory_max_ms"] = self.maxInventoryMS
             status["adapter_apply_max_ms"] = self.maxAdapterApplyMS

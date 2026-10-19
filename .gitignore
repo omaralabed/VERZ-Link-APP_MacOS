@@ -13,3 +13,5 @@ Engine/vendor/**/Cargo.lock
 *.verz
 build/
 __pycache__/
+Simulator/target/
+Simulator/recordings/

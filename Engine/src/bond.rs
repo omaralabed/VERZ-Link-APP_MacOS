@@ -25,6 +25,10 @@ pub const FEATURE_UDP_LANE: u64 = 1024;
 /// separate ready message instead of relying on JoinAck echoing an unknown bit,
 /// so a new client never mistakes an older relay for a capable peer.
 pub const FEATURE_PATH_FAILURE: u64 = 2048;
+/// Announces that a path is carried by the per-interface TLS/TCP compatibility
+/// transport. It remains standby while any native UDP path is healthy, so TCP
+/// stream head-of-line blocking on a restrictive WAN cannot slow the others.
+pub const FEATURE_CORPORATE_FALLBACK: u64 = 4096;
 pub const UDP_ENVELOPE: usize = verz_link_core::HEADER + verz_link_core::TAG;
 const PROBE_MS: u64 = 20;
 // Once another path is answering, stop placing new traffic on a silent path
@@ -83,6 +87,10 @@ const PAUSE_BUCKET_MS: u64 = 1000;
 const PAUSE_BUCKETS: usize = 4;
 const MAX_PAUSE_REPAIR_MS: u64 = 300;
 const FRAME_HEADER: usize = 18;
+// A corporate carrier is already reliable and congestion-controlled by the
+// kernel TCP stack. This bound is large enough for a fast LAN BDP while still
+// limiting queued encrypted data if the peer stops reading.
+const RELIABLE_CARRIER_WINDOW: usize = 4 * 1024 * 1024;
 
 pub fn handshake(
     secret: &[u8; 32],
@@ -297,6 +305,8 @@ pub struct Path {
     pub name: String,
     pub metered: bool,
     pub enabled: bool,
+    pub carrier: &'static str,
+    pub standby: bool,
     pub state: &'static str,
     pub rtt_ms: Option<f64>,
     pub jitter_ms: f64,
@@ -360,6 +370,8 @@ impl Path {
             name,
             metered,
             enabled: true,
+            carrier: "udp",
+            standby: false,
             state: "discovering",
             rtt_ms: None,
             jitter_ms: 0.0,
@@ -507,7 +519,8 @@ impl Path {
             self.elevated_since = None;
             self.queue_persistent = false;
         }
-        if self.queue_persistent
+        if !self.standby
+            && self.queue_persistent
             && self
                 .last_delay_adjust
                 .is_none_or(|last| now.saturating_sub(last) as f64 >= rtt)
@@ -556,6 +569,10 @@ impl Path {
         };
     }
     fn estimated_bytes_per_ms(&self) -> f64 {
+        if self.standby {
+            return (RELIABLE_CARRIER_WINDOW as f64 / self.rtt_ms.unwrap_or(30.0).max(1.0))
+                .max(1.0);
+        }
         // Congestion-window/RTT pacing allows discovery without treating a
         // previous quiet flow's delivery rate as a permanent capacity cap.
         (self.congestion_window as f64 / self.rtt_ms.unwrap_or(30.0).max(1.0)).max(1.0)
@@ -657,11 +674,17 @@ impl Path {
     }
 
     fn send_budget_allows(&self, bytes: usize, interactive: bool, now: u64) -> bool {
+        if self.standby {
+            return self.in_flight.saturating_add(bytes) <= RELIABLE_CARRIER_WINDOW;
+        }
         self.in_flight.saturating_add(bytes) <= self.send_window_limit(bytes, interactive)
             && self.next_send <= now as f64
     }
 
     fn send_window_limit(&self, bytes: usize, interactive: bool) -> usize {
+        if self.standby {
+            return RELIABLE_CARRIER_WINDOW;
+        }
         let reserve = if interactive {
             0
         } else {
@@ -696,6 +719,9 @@ impl Path {
     }
 
     fn repair_timeout(&mut self, now: u64, allow_window_backoff: bool) {
+        if self.standby {
+            return;
+        }
         if self
             .last_congestion
             .is_some_and(|last| now.saturating_sub(last) < self.repair_ms())
@@ -910,6 +936,18 @@ impl Scheduler {
     }
     pub fn set_single_path_tcp_fast(&mut self, enabled: bool) {
         self.single_path_tcp_fast = enabled;
+    }
+    pub fn set_corporate_fallback(&mut self, index: usize, enabled: bool) {
+        if let Some(path) = self.paths.get_mut(index) {
+            path.carrier = if enabled { "tls-tcp" } else { "udp" };
+            path.standby = enabled;
+            if enabled {
+                path.congestion_window = RELIABLE_CARRIER_WINDOW;
+                path.slow_start_threshold = RELIABLE_CARRIER_WINDOW;
+                path.next_send = 0.0;
+                path.queue_persistent = false;
+            }
+        }
     }
     pub fn single_path_tcp_fast(&self) -> bool {
         self.single_path_tcp_fast
@@ -1213,7 +1251,10 @@ impl Scheduler {
         }
         path.acknowledged_bytes += bytes as u64;
         path.rate_bytes += bytes as u64;
-        if path.capacity_recently_used(now) {
+        if path.standby {
+            // Kernel TCP owns congestion control for this reliable carrier.
+            // Tunnel ACKs release bounded memory and measure delivery only.
+        } else if path.capacity_recently_used(now) {
             path.acknowledge_capacity(bytes);
         } else {
             // Light traffic must neither grow an untested window nor shrink
@@ -1239,6 +1280,13 @@ impl Scheduler {
         acknowledged_stamp: u64,
         acknowledged_tcp_flow: Option<[u8; 12]>,
     ) {
+        if self
+            .paths
+            .get(path)
+            .is_some_and(|candidate| candidate.standby)
+        {
+            return;
+        }
         let Some(acknowledged_tcp_flow) = acknowledged_tcp_flow else {
             return;
         };
@@ -1295,6 +1343,12 @@ impl Scheduler {
             .any(|&index| self.paths[index].recently_responding(now))
         {
             ready.retain(|&index| self.paths[index].recently_responding(now));
+        }
+        // Never stripe an ordered flow across native UDP and an outer TCP
+        // carrier. The fallback becomes eligible immediately when every native
+        // path is unavailable, preserving failover without slowing survivors.
+        if ready.iter().any(|&index| !self.paths[index].standby) {
+            ready.retain(|&index| !self.paths[index].standby);
         }
         ready.sort_by(|&a, &b| {
             self.paths[a]
@@ -1452,10 +1506,7 @@ impl Scheduler {
     fn udp_protection_targets(&self, bytes: usize, now: u64) -> Vec<usize> {
         self.data_paths(now)
             .into_iter()
-            .filter(|&index| {
-                let path = &self.paths[index];
-                path.in_flight + bytes <= path.congestion_window && path.next_send <= now as f64
-            })
+            .filter(|&index| self.paths[index].send_budget_allows(bytes, true, now))
             .collect()
     }
 
@@ -1497,8 +1548,11 @@ impl Scheduler {
         self.paths[path].sent_bytes += packet.body.len() as u64;
         // Permit bounded catch-up between runtime ticks; otherwise a 2 ms
         // timer accidentally caps every path at one packet per 2 ms (~4.8 Mbps).
-        self.paths[path].next_send = (self.paths[path].next_send.max(now.saturating_sub(4) as f64))
-            + packet.body.len() as f64 / self.paths[path].estimated_bytes_per_ms();
+        if !self.paths[path].standby {
+            self.paths[path].next_send =
+                (self.paths[path].next_send.max(now.saturating_sub(4) as f64))
+                    + packet.body.len() as f64 / self.paths[path].estimated_bytes_per_ms();
+        }
         Frame {
             kind: Kind::Data,
             path: path as u8,
@@ -1584,7 +1638,9 @@ impl Scheduler {
             .iter()
             .filter_map(|(&id, packet)| packet.fast_repair_path.map(|path| (id, path)))
             .filter(|&(_, path)| {
-                data_paths.contains(&path) && self.paths[path].next_send <= now as f64
+                data_paths.contains(&path)
+                    && !self.paths[path].standby
+                    && self.paths[path].next_send <= now as f64
             })
             .take(64)
             .collect();
@@ -1670,6 +1726,18 @@ impl Scheduler {
             .pending
             .iter_mut()
             .filter_map(|(&id, packet)| {
+                // TLS/TCP already guarantees ordered, reliable delivery. Do
+                // not run datagram repair on top of a live corporate carrier;
+                // doing so manufactures loss and collapses nested TCP. A real
+                // socket failure changes readiness/generation and immediately
+                // returns this packet to normal failover handling.
+                if packet.attempts.iter().any(|(&index, attempt)| {
+                    self.paths.get(index).is_some_and(|path| {
+                        path.standby && path.generation == attempt.generation && path.ready(now)
+                    })
+                }) {
+                    return None;
+                }
                 let placement_due = now.saturating_sub(packet.last_repair) >= 2
                     && packet.attempts.iter().all(|(&index, attempt)| {
                         let current = self
@@ -4136,6 +4204,50 @@ mod tests {
                 .filter(|frame| frame.kind == Kind::Data)
                 .all(|frame| frame.path == 1)
         );
+    }
+
+    #[test]
+    fn corporate_fallback_is_standby_while_native_udp_is_healthy() {
+        let mut scheduler = scheduler(Policy::Performance);
+        scheduler.set_corporate_fallback(1, true);
+        assert_eq!(scheduler.paths[1].carrier, "tls-tcp");
+        assert_eq!(scheduler.data_paths(31), vec![0]);
+    }
+
+    #[test]
+    fn corporate_fallback_becomes_eligible_when_native_udp_fails() {
+        let mut scheduler = scheduler(Policy::Performance);
+        scheduler.set_corporate_fallback(1, true);
+        scheduler.fail_path(0);
+        assert_eq!(scheduler.data_paths(31), vec![1]);
+    }
+
+    #[test]
+    fn corporate_fallback_uses_reliable_window_without_datagram_repairs() {
+        let mut scheduler = scheduler(Policy::Performance);
+        scheduler.set_corporate_fallback(1, true);
+        scheduler.fail_path(0);
+        for _ in 0..512 {
+            scheduler.enqueue(bulk());
+        }
+        for now in 31..35 {
+            let sent = scheduler
+                .tick(now)
+                .into_iter()
+                .filter(|frame| frame.kind == Kind::Data)
+                .collect::<Vec<_>>();
+            assert_eq!(sent.len(), 128);
+            assert!(sent.iter().all(|frame| frame.path == 1));
+        }
+        assert!(scheduler.paths[1].in_flight > 32 * BOND_MTU);
+        let pending = scheduler.pending_packets();
+        for now in [100, 200, 300, 400, 500] {
+            scheduler.receive(&Frame::control(Kind::Pong, 1, now - 5, now - 5), now);
+            scheduler.tick(now);
+        }
+        assert_eq!(scheduler.pending_packets(), pending);
+        assert_eq!(scheduler.counters.repairs, 0);
+        assert_eq!(scheduler.paths[1].timeouts, 0);
     }
 
     #[test]

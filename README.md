@@ -52,6 +52,16 @@ Connected Wi-Fi and Ethernet links appear automatically. Unplugged ports are
 hidden; a cable-connected adapter waiting for DHCP remains visible. Each path
 has Use/Metered controls. Multiple Macs get separate tunnel sessions/IP leases.
 
+An experimental, default-disabled compatibility mode can isolate an interface
+that passes ordinary internet checks but blocks sustained UDP. It must not be
+enabled in production until its path-classification and live failover gates
+pass. See
+[corporate-network fallback](CORPORATE_NETWORK_FALLBACK.md) for recovery,
+rollback and relay firewall requirements. On a corporate-only connection, the
+main encrypted tunnel carries both TCP and UDP application packets over that
+TLS carrier; the separate native-UDP accelerator accepts flows only after a
+native UDP path is authenticated and healthy.
+
 In Direct Smart, the Rust engine probes every adapter independently, learns
 directional goodput from TCP delivery/read feedback, and assigns new flows by
 conservative two-way load and observed performance. Higher-ping links remain

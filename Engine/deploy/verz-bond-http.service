@@ -2,6 +2,7 @@
 Description=VERZ private multipath diagnostics endpoint
 Requires=verz-bond.service
 After=verz-bond.service
+PartOf=verz-bond.service
 
 [Service]
 Type=simple
