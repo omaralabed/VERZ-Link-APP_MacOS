@@ -1,0 +1,6 @@
+[workspace]
+members = ["sim"]
+resolver = "3"
+
+[profile.release]
+codegen-units = 1
