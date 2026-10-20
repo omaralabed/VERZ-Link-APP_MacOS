@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The Mac app's own tests, plus a build of every Rust client component the
+# app bundles (tunnel, helper, UDP engine library) for both architectures
+# from the pinned engine. The engine repository is private, so checking out
+# the Server/ submodule needs a token that can read it: a fine-grained
+# personal access token with "Contents: read" on
+# omaralabed/Gateway-VERZ-LINK-Deploy-APP, stored in this repository as the
+# secret ENGINE_REPO_TOKEN. Signing and notarization are not part of CI yet.
+
+jobs:
+  app:
+    name: Swift tests and client components
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.ENGINE_REPO_TOKEN || github.token }}
+      - name: Swift tests
+        run: swift test
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            Server/Engine -> target
+            Helper -> target
+            Server/UdpEngine -> target
+      - name: Tunnel, helper and session service (universal, ad-hoc signed)
+        run: bash scripts/build-native.sh
+      - name: UDP engine library (both architectures)
+        env:
+          SRCROOT: ${{ github.workspace }}
+          ARCHS: arm64 x86_64
+          DERIVED_FILE_DIR: ${{ github.workspace }}/.build/udp
+        run: bash scripts/build-udp-proxy.sh
