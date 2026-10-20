@@ -31,11 +31,24 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
     }
     deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
     private func failure(_ text: String) -> Error { NSError(domain: "VERZ UDP", code: 1, userInfo: [NSLocalizedDescriptionKey: text]) }
+    /// This install's identity on the UDP lane, chosen once and kept across
+    /// connects: the gateway then keeps this device's egress sockets through a
+    /// reconnect, a preset change or an app restart, so a running stream's
+    /// far end keeps seeing the same source port. (Per-device credentials
+    /// issued by the hub will replace the random number.)
+    static func flowSession() -> UInt32 {
+        let key = "udpFlowSession"
+        let saved = UInt32(truncatingIfNeeded: UserDefaults.standard.integer(forKey: key))
+        if saved != 0 { return saved }
+        let fresh = UInt32.random(in: 1...UInt32.max)
+        UserDefaults.standard.set(Int(fresh), forKey: key)
+        return fresh
+    }
     func connect(host: String, key: String, disabled: [String], policy: String, completion: @escaping (Result<Void, Error>) -> Void) {
         disconnect()
         generation = UUID(); stopping = false; starting = true
         self.key = key; self.completion = completion
-        configuration = ["gateway": "\(host):4443", "session": Int(UInt32.random(in: 1...UInt32.max)),
+        configuration = ["gateway": "\(host):4443", "session": Int(Self.flowSession()),
                          "disabled": disabled, "mode": mode(policy)]
         guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else {
             finish(.failure(failure("Install this build in /Applications before enabling the UDP extension."))); return

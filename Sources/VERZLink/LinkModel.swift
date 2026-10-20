@@ -85,9 +85,9 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
     var description: String {
         switch self {
         case .bonded:
-            "Recommended. The encrypted VERZ server combines every healthy WAN. UDP traffic is divided by measured delivered capacity, so faster links carry more; missing packets are repaired and traffic shifts when a link slows or fails."
+            "Speed. The encrypted VERZ server combines every healthy WAN. UDP traffic is divided by measured delivered capacity, so faster links carry more; missing packets are repaired on request and traffic shifts when a link slows or fails."
         case .smart:
-            "New. Every packet is sent once, and small repair packets replace the copies Maximum Continuity sends: a failed, slow or lossy link is covered with a fraction of the data, and failures are noticed in tens of milliseconds. Needs a server with the update; until then it runs as Maximum Continuity."
+            "Recommended. Every packet is sent once, and small repair packets replace the copies Maximum Continuity sends: a failed, slow or lossy link is covered with a fraction of the data, and failures are noticed in tens of milliseconds. Needs a server with the update; until then it runs as Maximum Continuity."
         case .continuity:
             "Maximum protection. The encrypted VERZ server sends additional copies on multiple WANs to mask a link failure. This uses more data, and every protection WAN must be able to carry the protected traffic."
         case .direct:
@@ -210,7 +210,7 @@ final class LinkModel: ObservableObject {
     @Published var sentMbps = 0.0
     @Published var uptime = 0
     @Published var selectedPage = "Connection"
-    @Published var policy = "continuity" { didSet { configurationChanged() } }
+    @Published var policy = "smart-repair" { didSet { configurationChanged() } }
     @Published var mode = TransportMode.secure { didSet { configurationChanged() } }
     @Published var avoidMeteredLinks = false { didSet { configurationChanged() } }
     var preset: ConnectionPreset {
@@ -303,7 +303,10 @@ final class LinkModel: ObservableObject {
         if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
         meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
-        let savedPolicy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "continuity"
+        // Smart Repair is the default since 2026-10-20: measured on the live
+        // relay it rebuilds a lossy link's packets and rides out a cable pull
+        // without a visible gap, at a fraction of Continuity's data.
+        let savedPolicy = UserDefaults.standard.string(forKey: "bondPolicy") ?? "smart-repair"
         let savedMode = TransportMode(rawValue: UserDefaults.standard.string(forKey: "transportMode") ?? "secure") ?? .secure
         let normalized = normalizedConnectionSettings(
             mode: savedMode,
