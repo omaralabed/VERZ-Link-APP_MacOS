@@ -64,6 +64,20 @@ fn single_path_tcp_fast_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Paced-flow priority and second-path copies for low-rate TCP (bond.rs,
+/// PACED_TCP_BYTES_PER_MS). `VERZ_TCP_PACED=0` restores the pre-2026-10-20
+/// behaviour where every TCP flow is bulk.
+fn paced_tcp_enabled() -> bool {
+    std::env::var("VERZ_TCP_PACED")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn carrier_receive_batch_enabled() -> bool {
     std::env::var("VERZ_TCP_CARRIER_BATCH")
         .map(|value| {
@@ -1125,6 +1139,7 @@ async fn client_with_controls(
         args.policy,
     )?;
     scheduler.set_single_path_tcp_fast(single_path_tcp_fast_enabled());
+    scheduler.set_paced_tcp(paced_tcp_enabled());
     let (sender, mut input) = mpsc::channel(1024);
     let mut sockets: Vec<Option<Subflow>> = names
         .iter()
@@ -1748,6 +1763,7 @@ async fn server(args: Server) -> Result<()> {
                     let _ = socket.try_send_to(&welcome, address);
                     let mut scheduler = Scheduler::new(vec![("path0".into(), false)], Policy::Smart)?;
                     scheduler.set_single_path_tcp_fast(single_path_tcp_fast_enabled());
+                    scheduler.set_paced_tcp(paced_tcp_enabled());
                     scheduler.remove_path(0);
                     peers.insert(header.session, Peer { transport: bond_transport(header.session, noise)?, assigned,
                         addresses: vec![None], join_stamps: vec![0], scheduler, hello: packet.to_vec(), welcome, last_seen: Instant::now(),

@@ -34,6 +34,10 @@ fn ready(rtts: &[u64]) -> Scheduler {
     for now in [200, 210, 220] {
         refresh(&mut s, now, rtts);
     }
+    // These tests describe bulk TCP: one copy, repaired on evidence or at the
+    // deadline. A paced flow (bond.rs, PACED_TCP_BYTES_PER_MS) is copied on
+    // a second live path up front and is covered by its own tests.
+    s.set_paced_tcp(false);
     for (p, &rtt) in s.paths.iter_mut().zip(rtts) {
         p.rtt_ms = Some(rtt as f64);
         p.minimum_rtt_ms = rtt as f64;

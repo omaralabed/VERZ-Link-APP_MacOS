@@ -1,6 +1,7 @@
 //! Multipath IP scheduling primitives. Time is monotonic milliseconds supplied
 //! by the runtime, allowing deterministic failure/recovery tests without sleeps.
 //! Path ACKs measure delivered tunnel bytes, not application-level TCP goodput.
+use verz_bonding_core::health::Health;
 use crate::ReplayWindow;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,20 @@ const FAST_ACK_SCAN: usize = 8;
 // high-rate TCP therefore keeps essentially all capacity for normal bonding.
 const TCP_CONTINUITY_BYTES_PER_MS: u64 = 256;
 const TCP_CONTINUITY_BURST_BYTES: u64 = (64 * BOND_MTU) as u64;
+// A TCP flow that stays within the continuity rate is "paced": a call, a
+// control channel, a screen share. Measured 2026-10-20: a speed test over a
+// lone Wi-Fi held a 100-400 ms queue in the radio and the ISP uplink, and a
+// 0.5 Mbit/s flow queued behind it in the tunnel too, because the tunnel
+// classed its 1 KB frames as bulk. A paced flow is served ahead of bulk in
+// the tunnel's own queue and, outside Data Saver, copied on a second live
+// path the way Continuity copies all TCP. Once a flow has overrun its bucket
+// it stays bulk until three quarters of the bucket has refilled (about
+// 240 ms under the rate), so a flow does not flap between classes mid-burst.
+const PACED_TCP_BYTES_PER_MS: u64 = TCP_CONTINUITY_BYTES_PER_MS;
+const PACED_TCP_BURST_BYTES: u64 = TCP_CONTINUITY_BURST_BYTES;
+// A new flow gets a handshake's worth, not a burst's: a speed test's first
+// 80 KB must not ride the priority lane.
+const PACED_TCP_INITIAL_BYTES: u64 = (4 * BOND_MTU) as u64;
 // A per-path TCP delivery sample is partly a measurement of how much work the
 // scheduler assigned to that path.  Treating it as a hard capacity estimate
 // creates a feedback loop: a lightly used path appears slow, receives still
@@ -357,6 +372,11 @@ pub struct Path {
     elevated_since: Option<u64>,
     #[serde(skip)]
     pauses: RecentPeak,
+    /// Failure probability from this path's own rhythm (unanswered sends and
+    /// silent feedback, judged against what it normally does). Shared with
+    /// the UDP lane's Smart Repair.
+    #[serde(skip)]
+    health: Health,
     // Every physical/socket re-admission is a new path incarnation. Pending
     // packets from an older incarnation must never release or train the new
     // incarnation's congestion state when their delayed ACKs arrive.
@@ -406,8 +426,15 @@ impl Path {
             probation_stable_since: None,
             elevated_since: None,
             pauses: RecentPeak::default(),
+            health: Health::default(),
             generation: 0,
         }
+    }
+    /// The path's own rhythm says it has probably gone quiet. On a wired link
+    /// that is tens of milliseconds after the last unanswered probe; on a link
+    /// with routine long stalls it waits for them, since its history says so.
+    pub fn suspect(&self, now: u64) -> bool {
+        self.health.p_dead(now * 1000, 1.0) >= 0.1
     }
     pub fn failure_ms(&self) -> u64 {
         // Probes are continuous: detect missing replies, not a high RTT.
@@ -463,6 +490,7 @@ impl Path {
         if stamp > now {
             return;
         }
+        self.health.on_echo(now * 1000, stamp * 1000);
         self.note_capacity_use(now);
         let pause = self.last_response.map(|last| now.saturating_sub(last));
         match self.probation_until {
@@ -786,11 +814,46 @@ struct TcpRate {
     sampled_at: Option<u64>,
 }
 
-#[derive(Default)]
 struct TcpFlowSchedule {
     waiting_since: Option<u64>,
     last_arrival: f64,
     touched: u64,
+    rate_tokens: u64,
+    rate_refilled_at: u64,
+    bulk: bool,
+}
+impl TcpFlowSchedule {
+    fn new(now: u64) -> Self {
+        Self {
+            waiting_since: None,
+            last_arrival: 0.0,
+            touched: now,
+            rate_tokens: PACED_TCP_INITIAL_BYTES,
+            rate_refilled_at: now,
+            bulk: false,
+        }
+    }
+    /// Charges `bytes` to the flow's rate bucket and says whether the flow is
+    /// still paced. See `PACED_TCP_BYTES_PER_MS`.
+    fn paced(&mut self, bytes: usize, now: u64) -> bool {
+        let elapsed = now.saturating_sub(self.rate_refilled_at);
+        self.rate_tokens = self
+            .rate_tokens
+            .saturating_add(elapsed.saturating_mul(PACED_TCP_BYTES_PER_MS))
+            .min(PACED_TCP_BURST_BYTES);
+        self.rate_refilled_at = now;
+        self.touched = now;
+        if self.bulk && self.rate_tokens >= PACED_TCP_BURST_BYTES / 4 * 3 {
+            self.bulk = false;
+        }
+        if self.rate_tokens >= bytes as u64 {
+            self.rate_tokens -= bytes as u64;
+        } else {
+            self.rate_tokens = 0;
+            self.bulk = true;
+        }
+        !self.bulk
+    }
 }
 
 struct Pending {
@@ -851,6 +914,8 @@ pub struct Counters {
     /// Single-path bulk TCP packets handed back to the native TCP recovery
     /// loop instead of being copied again on the same outer path.
     pub tcp_single_path_native_recoveries: u64,
+    /// TCP packets of flows within the paced rate, served ahead of bulk.
+    pub paced_tcp_packets: u64,
     /// New packets refused before acknowledgement; the sender may retry them.
     pub receive_backpressure: u64,
     pub socket_backpressure: u64,
@@ -897,6 +962,11 @@ pub struct Scheduler {
     tcp_continuity_refill_at: u64,
     last_flow_prune: u64,
     single_path_tcp_fast: bool,
+    /// Paced-flow priority and copies (see PACED_TCP_BYTES_PER_MS); off, every
+    /// TCP flow is bulk as before 2026-10-20.
+    paced_tcp: bool,
+    /// The last tick's time, for classification at enqueue.
+    clock: u64,
 }
 impl Scheduler {
     pub fn new(names: Vec<(String, bool)>, policy: Policy) -> Result<Self> {
@@ -932,7 +1002,12 @@ impl Scheduler {
             tcp_continuity_refill_at: 0,
             last_flow_prune: 0,
             single_path_tcp_fast: true,
+            paced_tcp: true,
+            clock: 0,
         })
+    }
+    pub fn set_paced_tcp(&mut self, enabled: bool) {
+        self.paced_tcp = enabled;
     }
     pub fn set_single_path_tcp_fast(&mut self, enabled: bool) {
         self.single_path_tcp_fast = enabled;
@@ -971,12 +1046,42 @@ impl Scheduler {
         } else {
             if interactive(&ip) {
                 self.urgent.push_back(ip);
-            } else if streaming(&ip) {
+            } else if streaming(&ip) || self.paced_tcp(&ip) {
                 self.streaming.push_back(ip);
             } else {
                 self.queued.push_back(ip);
             }
         }
+    }
+    /// Charges a TCP packet to its flow's rate bucket; true while the flow is
+    /// paced. Flow state is bounded by MAX_FLOW_PINS: beyond it, unknown flows
+    /// are bulk.
+    fn paced_tcp(&mut self, ip: &[u8]) -> bool {
+        if !self.paced_tcp {
+            return false;
+        }
+        let Some(key) = tcp_flow_key(ip) else {
+            return false;
+        };
+        if !self.tcp_flows.contains_key(&key) && self.tcp_flows.len() >= MAX_FLOW_PINS {
+            return false;
+        }
+        let now = self.clock;
+        let paced = self
+            .tcp_flows
+            .entry(key)
+            .or_insert_with(|| TcpFlowSchedule::new(now))
+            .paced(ip.len(), now);
+        if paced {
+            self.counters.paced_tcp_packets += 1;
+        }
+        paced
+    }
+    fn flow_is_paced(&self, ip: &[u8]) -> bool {
+        self.paced_tcp
+            && tcp_flow_key(ip)
+                .and_then(|key| self.tcp_flows.get(&key))
+                .is_some_and(|flow| !flow.bulk)
     }
     pub fn add_path(&mut self, name: String, metered: bool) -> Result<usize> {
         if let Some(index) = self.paths.iter().position(|path| path.name == name) {
@@ -998,6 +1103,7 @@ impl Scheduler {
                 path.congestion_window = 32 * BOND_MTU;
                 path.slow_start_threshold = 4 * 1024 * 1024;
                 path.last_response = None;
+                path.health = Health::default();
                 path.good_samples = 0;
                 path.next_send = 0.0;
                 path.rate_started = 0;
@@ -1072,6 +1178,7 @@ impl Scheduler {
         path.state = "failed";
         path.good_samples = 0;
         path.last_response = None;
+        path.health = Health::default();
         path.next_send = 0.0;
         // Drop pinned UDP flows on the failing path so the next packet re-picks.
         self.flow_paths.retain(|_, (index, _)| *index != failing);
@@ -1344,6 +1451,13 @@ impl Scheduler {
         {
             ready.retain(|&index| self.paths[index].recently_responding(now));
         }
+        // A path whose own rhythm says it has gone quiet is left out while
+        // another path is sound, so new traffic and the repairs of what it
+        // was carrying go to the survivor at once instead of after the
+        // pause-stretched repair deadline. Alone, it keeps being used.
+        if ready.iter().any(|&index| !self.paths[index].suspect(now)) {
+            ready.retain(|&index| !self.paths[index].suspect(now));
+        }
         // Never stripe an ordered flow across native UDP and an outer TCP
         // carrier. The fallback becomes eligible immediately when every native
         // path is unavailable, preserving failover without slowing survivors.
@@ -1432,7 +1546,10 @@ impl Scheduler {
         if !self.tcp_flows.contains_key(&key) && self.tcp_flows.len() >= MAX_FLOW_PINS {
             return Some(candidate);
         }
-        let flow = self.tcp_flows.entry(key).or_default();
+        let flow = self
+            .tcp_flows
+            .entry(key)
+            .or_insert_with(|| TcpFlowSchedule::new(now));
         flow.touched = now;
         // Compare the next segment on every path, including a temporarily
         // paced/window-full path. The previous implementation added the
@@ -1534,6 +1651,7 @@ impl Scheduler {
         if !current_attempt {
             self.paths[path].in_flight += packet.body.len();
         }
+        self.paths[path].health.on_sent(now * 1000);
         self.paths[path].note_capacity_use(now);
         if packet.body.len() >= 600 && tcp_flow_key(&packet.body).is_some() {
             self.paths[path].tcp_sent(now);
@@ -1591,6 +1709,7 @@ impl Scheduler {
 
     pub fn tick(&mut self, now: u64) -> Vec<Frame> {
         let mut output = Vec::new();
+        self.clock = self.clock.max(now);
         self.recent_attempts
             .retain(|_, attempt| now <= attempt.expires);
         for index in 0..self.paths.len() {
@@ -1624,7 +1743,8 @@ impl Scheduler {
             .is_none_or(|last| now.saturating_sub(last) >= PROBE_MS)
         {
             self.last_probe = Some(now);
-            for path in self.paths.iter().filter(|path| path.enabled) {
+            for path in self.paths.iter_mut().filter(|path| path.enabled) {
+                path.health.on_sent(now * 1000);
                 output.push(Frame::control(Kind::Probe, path.id, now, now));
             }
         }
@@ -1759,9 +1879,16 @@ impl Scheduler {
                 // Keep the repository UDP lane and legacy UDP policy unchanged.
                 if ipv4_tcp(&packet.body)
                     && packet.attempts.iter().any(|(&index, attempt)| {
+                        // A suspect path with a sound survivor does not get
+                        // the benefit of the doubt: what it carries is resent
+                        // on the survivor now. Alone, it keeps its deadline.
+                        let survivor = data_paths
+                            .iter()
+                            .any(|&other| other != index && !self.paths[other].suspect(now));
                         attempt.generation == self.paths[index].generation
                             && self.paths[index].ready(now)
                             && now.saturating_sub(attempt.stamp) < self.paths[index].repair_ms()
+                            && !(self.paths[index].suspect(now) && survivor)
                     })
                 {
                     if !packet.tcp_early_repair_deferred {
@@ -2071,8 +2198,13 @@ impl Scheduler {
             // packets pinned to the fastest interface; a cable pull then
             // stopped TCP's feedback loop until path failure was declared.
             // The existing token bucket retains the bounded overhead needed
-            // for high-rate TCP bonding.
-            let tcp_continuity_candidate = ipv4_tcp(&body) && self.policy == Policy::Continuity;
+            // for high-rate TCP bonding. Outside Continuity, a paced flow
+            // (see PACED_TCP_BYTES_PER_MS) earns the same copy: that is what
+            // keeps a call or a control channel whole through a link's
+            // 100-400 ms holes while another link is live.
+            let tcp_continuity_candidate = ipv4_tcp(&body)
+                && (self.policy == Policy::Continuity
+                    || (self.policy != Policy::DataSaver && self.flow_is_paced(&body)));
             let mut packet = Pending {
                 body,
                 born: now,
@@ -3980,6 +4112,293 @@ mod tests {
         p[3] = 100;
         p[9] = 17;
         p
+    }
+    fn tcp_segment(seq: u32, len: usize) -> Vec<u8> {
+        let total = 40 + len;
+        let mut p = vec![0; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        p[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        p[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        p[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        p[24..28].copy_from_slice(&seq.to_be_bytes());
+        p[32] = 5 << 4;
+        p[33] = 0x18;
+        p
+    }
+    /// Drives the scheduler with real probe/ACK timing every 2 ms: paths in
+    /// `answering` answer probes and data 5 ms later, the others never do.
+    fn drive(
+        s: &mut Scheduler,
+        from: u64,
+        to: u64,
+        answering: &[usize],
+        on_frame: &mut dyn FnMut(u64, &Frame),
+    ) {
+        let mut replies: VecDeque<(u64, Frame)> = VecDeque::new();
+        drive_with(s, from, to, answering, &mut replies, on_frame);
+    }
+    /// `drive` with the in-flight replies carried across calls, so a phase
+    /// change does not lose the answers to the last sends of the phase before.
+    fn drive_with(
+        s: &mut Scheduler,
+        from: u64,
+        to: u64,
+        answering: &[usize],
+        replies: &mut VecDeque<(u64, Frame)>,
+        on_frame: &mut dyn FnMut(u64, &Frame),
+    ) {
+        let mut now = from;
+        while now < to {
+            while replies.front().is_some_and(|(due, _)| *due <= now) {
+                let (_, reply) = replies.pop_front().unwrap();
+                s.receive(&reply, now);
+            }
+            for frame in s.tick(now) {
+                on_frame(now, &frame);
+                if !answering.contains(&usize::from(frame.path)) {
+                    continue;
+                }
+                let reply = match frame.kind {
+                    Kind::Probe => Frame::control(Kind::Pong, frame.path, frame.id, frame.stamp),
+                    Kind::Data => Frame::control(Kind::Ack, frame.path, frame.id, frame.stamp),
+                    _ => continue,
+                };
+                replies.push_back((now + 5, reply));
+            }
+            now += 2;
+        }
+    }
+    /// Sends one bulk TCP segment after both paths are well trained, then the
+    /// path that carried it falls silent. Returns (its path, repair deadline,
+    /// and when a copy first went out on the other path, if ever). A paced
+    /// flow would be copied on both paths up front; this is about bulk.
+    fn silent_path_resend(survivor_answers: bool) -> (usize, u64, Option<u64>) {
+        let mut s = scheduler(Policy::Smart);
+        let mut replies = VecDeque::new();
+        drive_with(&mut s, 100, 2_900, &[0, 1], &mut replies, &mut |_, _| {});
+        // A 120 KB burst makes the flow bulk; 100 ms later it still is (the
+        // bucket needs about 240 ms under the rate to make it paced again).
+        for i in 0..100_u32 {
+            s.enqueue(tcp_segment(1 + i * 1_200, 1_200));
+        }
+        drive_with(&mut s, 2_900, 3_000, &[0, 1], &mut replies, &mut |_, _| {});
+        s.enqueue(tcp_segment(1 + 100 * 1_200, 800));
+        let frames = s.tick(3_000);
+        let data: Vec<&Frame> = frames.iter().filter(|f| f.kind == Kind::Data).collect();
+        assert_eq!(data.len(), 1, "a bulk segment is placed once");
+        let silent = usize::from(data[0].path);
+        let other = 1 - silent;
+        let id = data[0].id;
+        let mut resent = None;
+        let answering: Vec<usize> = if survivor_answers { vec![other] } else { Vec::new() };
+        // Answers already on their way from the silent path are lost with it;
+        // the survivor answers this tick's probe like any other.
+        replies.retain(|(_, reply)| usize::from(reply.path) != silent);
+        if survivor_answers {
+            for frame in &frames {
+                if usize::from(frame.path) == other && frame.kind == Kind::Probe {
+                    replies.push_back((3_005, Frame::control(Kind::Pong, frame.path, frame.id, frame.stamp)));
+                }
+            }
+        }
+        drive_with(&mut s, 3_002, 3_400, &answering, &mut replies, &mut |now, frame| {
+            if frame.kind == Kind::Data && frame.id == id && usize::from(frame.path) == other && resent.is_none() {
+                resent = Some(now - 3_000);
+            }
+        });
+        (silent, s.paths[silent].repair_ms(), resent)
+    }
+    #[test]
+    fn tcp_in_flight_on_a_silent_path_is_resent_on_the_survivor_within_tens_of_ms() {
+        let (_, deadline, resent) = silent_path_resend(true);
+        let resent = resent.expect("no copy ever went out on the survivor");
+        eprintln!("silent path: copy resent on the survivor after {resent} ms (deadline alone would be {deadline} ms)");
+        assert!(deadline >= 70, "repair deadline {deadline} ms");
+        assert!(resent <= 60, "resent after {resent} ms, deadline was {deadline} ms");
+    }
+    #[test]
+    fn tcp_on_a_silent_path_keeps_its_patient_deadline_when_nothing_else_answers() {
+        let (_, deadline, resent) = silent_path_resend(false);
+        if let Some(resent) = resent {
+            assert!(resent >= deadline, "resent after {resent} ms before the {deadline} ms deadline");
+        }
+    }
+    /// One path left, a paced 1,022-byte flow (a frame every 20 ms, like a
+    /// voice or control stream) and, with `bulk_load`, a second flow that
+    /// keeps the path's window full. The path drops exactly one frame of the
+    /// paced flow. Returns how long after the drop the tunnel re-sent that
+    /// frame, if it ever did, plus the native-recovery and fast-ACK counters.
+    fn lone_path_loss_resend(bulk_load: bool) -> (Option<u64>, u64, u64) {
+        let mut s = scheduler(Policy::Smart);
+        s.fail_path(1);
+        drive(&mut s, 100, 3_000, &[0], &mut |_, _| {});
+        let mut replies: VecDeque<(u64, Frame)> = VecDeque::new();
+        let mut now = 3_000;
+        let mut next_frame = 3_000;
+        let mut seq = 1_u32;
+        let mut bulk_seq = 1_u32;
+        let lost_seq = 1 + 20 * 1_022;
+        let mut lost: Option<(u64, u64)> = None;
+        let mut resent = None;
+        while now < 4_400 {
+            while replies.front().is_some_and(|(due, _)| *due <= now) {
+                let (_, reply) = replies.pop_front().unwrap();
+                s.receive(&reply, now);
+            }
+            if now >= next_frame {
+                next_frame += 20;
+                s.enqueue(tcp_segment(seq, 1_022));
+                seq += 1_022;
+            }
+            if bulk_load {
+                for _ in 0..8 {
+                    if s.queued.len() >= 48 {
+                        break;
+                    }
+                    let mut segment = tcp_segment(bulk_seq, 1_200);
+                    segment[20..22].copy_from_slice(&40_001_u16.to_be_bytes());
+                    s.enqueue(segment);
+                    bulk_seq = bulk_seq.wrapping_add(1_200);
+                }
+            }
+            for frame in s.tick(now) {
+                if usize::from(frame.path) != 0 {
+                    continue;
+                }
+                let reply = match frame.kind {
+                    Kind::Probe => Frame::control(Kind::Pong, frame.path, frame.id, frame.stamp),
+                    Kind::Data => {
+                        let port = u16::from_be_bytes([frame.body[20], frame.body[21]]);
+                        let this_seq = u32::from_be_bytes(frame.body[24..28].try_into().unwrap());
+                        if port == 40_000 && this_seq == lost_seq {
+                            match lost {
+                                None => {
+                                    lost = Some((now, frame.id));
+                                    continue;
+                                }
+                                Some((at, id)) if id == frame.id && resent.is_none() => {
+                                    resent = Some(now - at);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Frame::control(Kind::Ack, frame.path, frame.id, frame.stamp)
+                    }
+                    _ => continue,
+                };
+                replies.push_back((now + 5, reply));
+            }
+            now += 2;
+        }
+        assert!(lost.is_some(), "the paced flow's 21st frame was never sent");
+        (resent, s.counters.tcp_single_path_native_recoveries, s.counters.tcp_fast_ack_repairs)
+    }
+    #[test]
+    fn lone_path_repairs_a_paced_flows_lost_frame_within_tens_of_ms() {
+        let (resent, native, fast) = lone_path_loss_resend(false);
+        eprintln!("lone path, no load: resent after {resent:?} ms; native recoveries {native}, fast-ACK repairs {fast}");
+        let resent = resent.expect("the lost frame was never re-sent by the tunnel");
+        assert!(resent <= 60, "resent after {resent} ms");
+    }
+    #[test]
+    fn lone_path_repairs_a_paced_flows_lost_frame_within_tens_of_ms_under_bulk_load() {
+        let (resent, native, fast) = lone_path_loss_resend(true);
+        eprintln!("lone path, bulk load: resent after {resent:?} ms; native recoveries {native}, fast-ACK repairs {fast}");
+        let resent = resent.expect("the lost frame was never re-sent by the tunnel");
+        assert!(resent <= 60, "resent after {resent} ms");
+    }
+    fn tcp_segment_on_port(port: u16, seq: u32, len: usize) -> Vec<u8> {
+        let mut segment = tcp_segment(seq, len);
+        segment[20..22].copy_from_slice(&port.to_be_bytes());
+        segment
+    }
+    fn tcp_seq_and_port(frame: &Frame) -> (u32, u16) {
+        (
+            u32::from_be_bytes(frame.body[24..28].try_into().unwrap()),
+            u16::from_be_bytes([frame.body[20], frame.body[21]]),
+        )
+    }
+    #[test]
+    fn paced_tcp_flow_is_served_ahead_of_a_bulk_backlog() {
+        let mut s = scheduler(Policy::Performance);
+        drive(&mut s, 100, 2_000, &[0, 1], &mut |_, _| {});
+        // A speed test's backlog, then one frame of a 0.5 Mbit/s flow.
+        for i in 0..200_u32 {
+            s.enqueue(tcp_segment_on_port(40_001, 1 + i * 1_200, 1_200));
+        }
+        s.enqueue(tcp_segment_on_port(40_000, 1, 1_022));
+        let frames = s.tick(2_000);
+        let order: Vec<u16> = frames
+            .iter()
+            .filter(|frame| frame.kind == Kind::Data)
+            .map(|frame| tcp_seq_and_port(frame).1)
+            .collect();
+        // Only the bulk flow's handshake allowance (4 packets) may precede it.
+        let first = order.iter().position(|&port| port == 40_000);
+        assert!(first.is_some_and(|at| at <= 4), "paced frame should leave ahead of the backlog; order {order:?}");
+        assert!(order.len() > 10, "bulk backlog should still flow: {}", order.len());
+        assert!(
+            s.counters.paced_tcp_packets <= 1 + 4,
+            "a new bulk flow is paced for a handshake's worth only, got {}",
+            s.counters.paced_tcp_packets
+        );
+    }
+    #[test]
+    fn paced_tcp_flow_gets_a_copy_on_the_second_link_in_performance_and_smart() {
+        for policy in [Policy::Performance, Policy::Smart] {
+            let mut s = scheduler(policy);
+            drive(&mut s, 100, 2_000, &[0, 1], &mut |_, _| {});
+            s.enqueue(tcp_segment(1, 1_022));
+            let frames: Vec<Frame> = s.tick(2_000).into_iter().filter(|f| f.kind == Kind::Data).collect();
+            assert_eq!(frames.len(), 2, "{policy:?}: one copy per live path, got {}", frames.len());
+            assert_eq!(frames[0].id, frames[1].id);
+            assert_ne!(frames[0].path, frames[1].path);
+            assert_eq!(s.counters.protection_copies, 1);
+        }
+    }
+    #[test]
+    fn bulk_tcp_and_udp_are_not_copied_in_performance() {
+        let mut s = scheduler(Policy::Performance);
+        drive(&mut s, 100, 2_000, &[0, 1], &mut |_, _| {});
+        // Bulk UDP: placed once, never a paced-TCP candidate.
+        let mut udp = bulk();
+        udp[9] = 17;
+        s.enqueue(udp.clone());
+        let frames: Vec<Frame> = s.tick(2_000).into_iter().filter(|f| f.kind == Kind::Data).collect();
+        assert_eq!(frames.iter().filter(|f| f.body == udp).count(), 1, "bulk UDP is placed once, never copied");
+        assert!(!s.flow_is_paced(&udp));
+        assert_eq!(s.counters.paced_tcp_packets, 0);
+        // A speed test: paced for a handshake's worth, bulk from then on.
+        let before = s.counters.protection_copies;
+        for i in 0..200_u32 {
+            s.enqueue(tcp_segment_on_port(40_001, 1 + i * 1_200, 1_200));
+        }
+        s.tick(2_002);
+        assert!(s.counters.protection_copies - before <= 4, "copies {}", s.counters.protection_copies - before);
+        assert!(!s.flow_is_paced(&tcp_segment_on_port(40_001, 1, 1_200)));
+        // Still pumping 20 ms later: no copies. (A flow quiet for a quarter
+        // second is paced again, by design: see a_flow_returns_to_paced_...)
+        drive(&mut s, 2_004, 2_024, &[0, 1], &mut |_, _| {});
+        let before = s.counters.protection_copies;
+        for i in 200..260_u32 {
+            s.enqueue(tcp_segment_on_port(40_001, 1 + i * 1_200, 1_200));
+        }
+        s.tick(2_024);
+        assert_eq!(s.counters.protection_copies, before, "a flow that keeps overrunning stays bulk");
+    }
+    #[test]
+    fn a_flow_returns_to_paced_after_a_quiet_quarter_second() {
+        let mut flow = TcpFlowSchedule::new(0);
+        for _ in 0..100 {
+            flow.paced(1_200, 0);
+        }
+        assert!(flow.bulk);
+        assert!(!flow.paced(1_200, 100));
+        assert!(flow.paced(1_200, 100 + 300));
     }
     #[test]
     fn frame_bounds_and_control_shape() {

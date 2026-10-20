@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 verz-link-core = { path = "vendor/verz-link-core" }
+verz-bonding-core = { path = "vendor/verz-bonding-core" }
 anyhow = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
