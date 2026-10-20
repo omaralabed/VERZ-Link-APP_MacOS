@@ -96,6 +96,31 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
     }
 }
 
+/// When the tunnel ends on its own (a crash, a server restart, a network
+/// change it could not ride out), the app brings it back by itself: quickly
+/// at first, then at a steady pace, for up to ten minutes before it gives up
+/// and tells the user. The stream lane keeps running throughout, so a video
+/// stream never notices (measured 2026-10-20: the lane carried a stream at
+/// full rate through 15 s of a frozen tunnel).
+struct RecoveryPolicy {
+    static let delays: [TimeInterval] = [1, 2, 4, 8, 16, 30]
+    static let giveUpAfter: TimeInterval = 600
+    private(set) var attempts = 0
+    private(set) var startedAt: Date?
+    var active: Bool { startedAt != nil }
+    /// Seconds to wait before the next attempt, or nil once it is time to stop.
+    mutating func nextDelay(now: Date = Date()) -> TimeInterval? {
+        let started = startedAt ?? now
+        startedAt = started
+        if now.timeIntervalSince(started) > Self.giveUpAfter { return nil }
+        let delay = Self.delays[min(attempts, Self.delays.count - 1)]
+        attempts += 1
+        return delay
+    }
+    mutating func reset() { attempts = 0; startedAt = nil }
+    func elapsed(now: Date = Date()) -> TimeInterval { startedAt.map { now.timeIntervalSince($0) } ?? 0 }
+}
+
 struct NormalizedConnectionSettings: Equatable {
     let mode: TransportMode
     let policy: String
@@ -213,6 +238,15 @@ final class LinkModel: ObservableObject {
     @Published var policy = "smart-repair" { didSet { configurationChanged() } }
     @Published var mode = TransportMode.secure { didSet { configurationChanged() } }
     @Published var avoidMeteredLinks = false { didSet { configurationChanged() } }
+    /// Automatic tunnel recovery (RecoveryPolicy): non-empty while the tunnel
+    /// ended on its own and the app is bringing it back, stream lane kept up.
+    @Published var recoveryDetail = ""
+    private var recovery = RecoveryPolicy()
+    private var recoveryTask: Task<Void, Never>?
+    /// The user pressed Disconnect: an ending session is a stop, not a fault.
+    private var userStopped = false
+    private var lastEngineError: String?
+    private var pathsLostAt: Date?
     var preset: ConnectionPreset {
         get { ConnectionPreset.matching(mode: mode, policy: policy) }
         set {
@@ -410,9 +444,21 @@ final class LinkModel: ObservableObject {
 
     func connect() {
         guard !busy else { return }
+        userStopped = false
+        recoveryTask?.cancel(); recoveryTask = nil
+        recovery.reset(); recoveryDetail = ""
+        start(recovering: false)
+    }
+
+    /// Brings the tunnel up. While recovering, the UDP stream lane is left
+    /// running and a failed attempt schedules the next one instead of
+    /// surfacing an error.
+    private func start(recovering: Bool) {
+        if recovering { guard !userStopped else { return } } else { guard !busy else { return } }
         errorMessage = nil
         refreshInterfaces()
         guard hasReadyInterface else {
+            if recovering, scheduleRecovery(reason: "no usable uplink yet") { return }
             errorMessage = "No usable uplink. Connect Wi-Fi or Ethernet and wait for an IPv4 address."; return
         }
         var secret = Data()
@@ -435,25 +481,33 @@ final class LinkModel: ObservableObject {
         }
         UserDefaults.standard.set(relay, forKey: "relay")
         UserDefaults.standard.set(selectedInterface, forKey: "interface")
-        state = .authorizing
+        state = recovering ? .reconnecting : .authorizing
         restorationFailed = false
         publicIP = nil; proxyEndpoint = nil; samples = []; lastInterfaceCounters = [:]; lastSampleAt = nil; bondTelemetry = nil
         pathRates = [:]; pathRateSample = nil
         sentBytes = 0; receivedBytes = 0; sentMbps = 0; receivedMbps = 0
         interfaceReceivedMbps = 0; interfaceSentMbps = 0
-        udpPaths = [:]; udpTelemetryTime = nil; udpPayloadMeter = PayloadRateTracker()
-        udpAcceleratorStarted = false
-        udpConnection.disconnect()
+        if !recovering {
+            // A fresh connection starts the stream lane over; a recovery keeps
+            // it running, so a stream in flight never notices the tunnel.
+            udpPaths = [:]; udpTelemetryTime = nil; udpPayloadMeter = PayloadRateTracker()
+            udpAcceleratorStarted = false
+            udpConnection.disconnect()
+        }
         brainConnected = false; brainGeneration = 0; brainStrategy = "local-fallback"
         directHealthyPaths = 0; secureHealthyPaths = 0
         sessionID = UUID()
         let identifier = sessionID
         let names = enabledInterfaces.map(\.name)
-        log("Starting \(mode.title) using \(names.joined(separator: ", ")) · \(policy)")
-        startTunnel(secret: secret, names: names, identifier: identifier)
+        if recovering {
+            log("Reconnecting the tunnel (attempt \(recovery.attempts)) using \(names.joined(separator: ", ")) · stream lane stays up")
+        } else {
+            log("Starting \(mode.title) using \(names.joined(separator: ", ")) · \(policy)")
+        }
+        startTunnel(secret: secret, names: names, identifier: identifier, recovering: recovering)
     }
 
-    private func startTunnel(secret: Data, names: [String], identifier: UUID) {
+    private func startTunnel(secret: Data, names: [String], identifier: UUID, recovering: Bool) {
         do {
             session = try TunnelSession(secret: secret, relay: relay, interfaces: names, policy: mainTunnelPolicy(policy), configuration: configurationData()) { [weak self] event in
                 Task { @MainActor in
@@ -461,7 +515,33 @@ final class LinkModel: ObservableObject {
                     self.handle(event)
                 }
             }
-        } catch { udpConnection.disconnect(); state = .disconnected; errorMessage = error.localizedDescription; log(error.localizedDescription) }
+        } catch {
+            log(error.localizedDescription)
+            if recovering, scheduleRecovery(reason: error.localizedDescription) { return }
+            udpConnection.disconnect(); state = .disconnected; errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Plans the next recovery attempt. Returns false once the policy says to
+    /// stop, leaving the caller to disconnect for good.
+    @discardableResult
+    private func scheduleRecovery(reason: String) -> Bool {
+        guard !userStopped, let delay = recovery.nextDelay() else { return false }
+        state = .reconnecting
+        session = nil
+        let attempt = recovery.attempts
+        recoveryDetail = "Reconnecting · attempt \(attempt) in \(Int(delay)) s · \(reason) · stream lane active"
+        log("Tunnel ended: \(reason) · reconnecting in \(Int(delay)) s (attempt \(attempt)); the UDP stream lane stays up")
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, !self.userStopped, self.session == nil else { return }
+                self.start(recovering: true)
+            }
+        }
+        return true
     }
 
     private func startUDPAccelerator(identifier: UUID) {
@@ -485,6 +565,9 @@ final class LinkModel: ObservableObject {
 
     func disconnect() {
         guard busy else { return }
+        userStopped = true
+        recoveryTask?.cancel(); recoveryTask = nil
+        recovery.reset(); recoveryDetail = ""
         runner?.cancel(); testTask?.cancel(); testRunning = false
         state = .disconnecting
         udpAcceleratorStarted = false
@@ -501,6 +584,11 @@ final class LinkModel: ObservableObject {
             log(event.line ?? "Configuring network")
         case "connected":
             guard state != .disconnecting else { session?.disconnect(); return }
+            if recovery.active {
+                log("Tunnel recovered after \(Int(recovery.elapsed())) s and \(recovery.attempts) attempt(s)")
+                recovery.reset(); recoveryDetail = ""; lastEngineError = nil
+            }
+            pathsLostAt = nil
             state = .connected; connectedAt = Date(); uptime = 0
             let endpoint = event.line?.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
             if mode == .secure {
@@ -559,6 +647,20 @@ final class LinkModel: ObservableObject {
                     } else if state == .reconnecting && report.healthyPaths > 0 {
                         state = .connected; log("Delivery restored over \(report.healthyPaths) healthy path(s)")
                     }
+                    if report.healthyPaths == 0 {
+                        // A server that restarted has forgotten this session:
+                        // the tunnel stays silent although an uplink is fine.
+                        // Thirty seconds of that is a restart, not a wait.
+                        let lost = pathsLostAt ?? Date()
+                        pathsLostAt = lost
+                        if Date().timeIntervalSince(lost) > 30, hasReadyInterface, let session {
+                            pathsLostAt = nil
+                            log("No path has answered for 30 s while an uplink is ready · restarting the tunnel")
+                            session.disconnect()
+                        }
+                    } else {
+                        pathsLostAt = nil
+                    }
                 }
             }
         case "direct_telemetry":
@@ -590,26 +692,42 @@ final class LinkModel: ObservableObject {
             }
         case "engine_error", "cleanup_error":
             if event.event == "cleanup_error" { restorationFailed = true }
-            if let line = event.line { log(line); errorMessage = line }
+            if let line = event.line { log(line); errorMessage = line; lastEngineError = line }
         case "flow":
             if let line = event.line { recordFlow(line) }
         case "launch_error":
             let text = event.line ?? "Unable to start the connection engine."
-            errorMessage = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
-            log(errorMessage!)
+            let shown = text.contains("-128") ? "Connection cancelled at the macOS permission prompt." : text
+            log(shown)
+            // A permission refusal is the user's decision; anything else during
+            // a recovery is one more failed attempt.
+            if recovery.active, !text.contains("-128"), scheduleRecovery(reason: shown) { return }
+            errorMessage = shown
         case "session_ended":
-            udpAcceleratorStarted = false
-            udpConnection.disconnect()
-            state = .disconnected; tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
+            tunnelInterface = ""; proxyEndpoint = nil; connectedAt = nil; uptime = 0
             brainConnected = false; brainGeneration = 0; directHealthyPaths = 0; secureHealthyPaths = 0
             runner?.cancel(); testTask?.cancel(); testRunning = false
             session = nil; receivedMbps = 0; sentMbps = 0; publicIP = nil
-            interfaceReceivedMbps = 0; interfaceSentMbps = 0; udpPayloadMeter = PayloadRateTracker()
+            interfaceReceivedMbps = 0; interfaceSentMbps = 0
+            let unexpected = !userStopped && state != .disconnecting
+            if unexpected {
+                let reason = lastEngineError ?? (event.code.map { "the tunnel ended (code \($0))" } ?? "the tunnel ended")
+                if scheduleRecovery(reason: reason) { return }
+                errorMessage = "The tunnel could not be restored for ten minutes. Disconnected."
+                log(errorMessage!)
+            }
+            recovery.reset(); recoveryDetail = ""
+            udpAcceleratorStarted = false
+            udpConnection.disconnect()
+            state = .disconnected; udpPayloadMeter = PayloadRateTracker()
             refreshInterfaces()
             log(restorationFailed ? "Disconnected · check Activity for network restoration errors" : "Disconnected · network restoration finished")
             whenDisconnected?(); whenDisconnected = nil
         case "log": if let line = event.line { log(line) }
-        case "exited": if event.code != 0 && errorMessage == nil { errorMessage = "The tunnel ended unexpectedly. See Activity for details." }
+        case "exited":
+            // The decision whether this is a fault to recover from or a stop
+            // is taken at session_ended; here only the reason is kept.
+            if let code = event.code, code != 0, lastEngineError == nil { lastEngineError = "the tunnel ended unexpectedly (code \(code))" }
         default: break
         }
     }

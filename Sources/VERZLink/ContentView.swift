@@ -158,7 +158,8 @@ struct ContentView: View {
                                 : model.mode == .hybrid ? "Direct and protected paths are active and optimised automatically."
                                 : "Supported TCP applications use direct flows across your enabled networks.")
                              : model.state == .reconnecting
-                             ? (model.mode == .secure ? "Waiting for a usable path. Your secure tunnel stays in place." : "No direct path is healthy; adapters continue probing.")
+                             ? (!model.recoveryDetail.isEmpty ? model.recoveryDetail
+                                : model.mode == .secure ? "Waiting for a usable path. Your secure tunnel stays in place." : "No direct path is healthy; adapters continue probing.")
                              : (model.mode == .secure ? "Connect Wi-Fi or Ethernet to Secure Continuity."
                                 : model.mode == .hybrid ? "Connect Wi-Fi or Ethernet to start Automatic Hybrid."
                                 : "Connect Wi-Fi or Ethernet to start Direct Smart."))

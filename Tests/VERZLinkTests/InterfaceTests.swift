@@ -37,6 +37,25 @@ final class InterfaceTests: XCTestCase {
         XCTAssertEqual(ConnectionPreset.selectable(connected: false, current: .direct), ConnectionPreset.allCases)
     }
 
+    func testRecoveryBacksOffThenGivesUpAfterTenMinutes() {
+        var policy = RecoveryPolicy()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertFalse(policy.active)
+        var delays: [TimeInterval] = []
+        var now = start
+        for _ in 0..<8 {
+            guard let delay = policy.nextDelay(now: now) else { XCTFail("gave up too early"); return }
+            delays.append(delay); now = now.addingTimeInterval(delay)
+        }
+        XCTAssertEqual(delays, [1, 2, 4, 8, 16, 30, 30, 30])
+        XCTAssertTrue(policy.active)
+        XCTAssertEqual(policy.attempts, 8)
+        XCTAssertNil(policy.nextDelay(now: start.addingTimeInterval(601)), "stops after ten minutes")
+        policy.reset()
+        XCTAssertEqual(policy.nextDelay(now: now), 1, "a fresh outage starts quickly again")
+        XCTAssertEqual(policy.attempts, 1)
+    }
+
     func testSmartRepairSettingsSurviveNormalization() {
         XCTAssertEqual(normalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false),
                        NormalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false))
