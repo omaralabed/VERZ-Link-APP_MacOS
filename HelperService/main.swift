@@ -41,10 +41,16 @@ func verifyExecutable(_ url: URL, identifier: String, team: String) throws {
     }
 }
 
+/// One tunnel per user. The service stays resident while a tunnel runs or an
+/// app keeps its connection open, and leaves a few seconds after both end.
 final class Sessions {
     static let shared = Sessions()
+    /// Longer than the app's first reconnect delay (1 s), so an automatic
+    /// recovery never reaches an instance that is in the middle of exiting.
+    static let idleGrace: TimeInterval = 5
     private let lock = NSLock()
     private var users = Set<uid_t>()
+    private var connections = 0
     func claim(_ uid: uid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard users.count < 16 else { return false }
@@ -53,17 +59,33 @@ final class Sessions {
     func release(_ uid: uid_t) {
         lock.lock()
         users.remove(uid)
-        let idle = users.isEmpty
+        lock.unlock()
+        exitWhenIdle()
+    }
+    func connectionOpened() {
+        lock.lock(); connections += 1; lock.unlock()
+    }
+    func connectionClosed() {
+        lock.lock(); connections -= 1; lock.unlock()
+        exitWhenIdle()
+    }
+    /// Callers hold `lock`.
+    private var idle: Bool { users.isEmpty && connections == 0 }
+    private func exitWhenIdle() {
+        lock.lock()
+        let idle = self.idle
         lock.unlock()
         guard idle else { return }
         // A launchd Mach service does not need to remain resident between VERZ
-        // sessions. Exiting after the reply prevents an in-place Xcode rebuild
+        // sessions. Exiting once idle prevents an in-place rebuild or update
         // from leaving a stale signed process behind; launchd starts the
-        // current bundled executable on the next connection.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+        // current bundled executable on the next connection. An open app
+        // connection counts as busy and the grace period outlasts the app's
+        // reconnect delay, so a request cannot land on an exiting instance.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleGrace) { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            let stillIdle = self.users.isEmpty
+            let stillIdle = self.idle
             self.lock.unlock()
             if stillIdle { exit(0) }
         }
@@ -134,6 +156,8 @@ final class Delegate: NSObject, NSXPCListenerDelegate {
         connection.setCodeSigningRequirement(requirement)
         connection.exportedInterface = NSXPCInterface(with: VERZSessionServiceProtocol.self)
         connection.exportedObject = Controller(uid: connection.effectiveUserIdentifier, team: team)
+        Sessions.shared.connectionOpened()
+        connection.invalidationHandler = { Sessions.shared.connectionClosed() }
         connection.resume()
         return true
     }
