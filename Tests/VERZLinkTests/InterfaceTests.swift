@@ -25,6 +25,18 @@ final class InterfaceTests: XCTestCase {
         XCTAssertEqual(mainTunnelPolicy("continuity"), "continuity")
     }
 
+    func testServerPresetsSwitchLiveAndDirectNeedsAReconnect() {
+        let server: [ConnectionPreset] = [.bonded, .smart, .continuity]
+        for from in server {
+            for to in server { XCTAssertTrue(from.canSwitchLive(to: to), "\(from) -> \(to)") }
+            XCTAssertFalse(from.canSwitchLive(to: .direct))
+            XCTAssertFalse(ConnectionPreset.direct.canSwitchLive(to: from))
+        }
+        XCTAssertEqual(ConnectionPreset.selectable(connected: true, current: .smart), server)
+        XCTAssertEqual(ConnectionPreset.selectable(connected: true, current: .direct), [.direct])
+        XCTAssertEqual(ConnectionPreset.selectable(connected: false, current: .direct), ConnectionPreset.allCases)
+    }
+
     func testSmartRepairSettingsSurviveNormalization() {
         XCTAssertEqual(normalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false),
                        NormalizedConnectionSettings(mode: .secure, policy: "smart-repair", avoidMeteredLinks: false))

@@ -69,6 +69,19 @@ enum ConnectionPreset: String, CaseIterable, Identifiable {
         if mode == .direct { return .direct }
         return policy == "continuity" ? .continuity : policy == "smart-repair" ? .smart : .bonded
     }
+    /// Presets on the same transport switch while connected: the tunnel takes
+    /// its new policy over the control channel and the UDP engine its new
+    /// mode in place, so a running stream never sees a reconnect. Direct is a
+    /// different transport and needs one. (Measured 2026-10-20: every
+    /// disconnect/reconnect broke OBS's SRT connection for about 2 s.)
+    func canSwitchLive(to other: ConnectionPreset) -> Bool {
+        settings.mode == other.settings.mode
+    }
+    /// What the picker offers: everything when disconnected, only the presets
+    /// reachable without a reconnect while connected.
+    static func selectable(connected: Bool, current: ConnectionPreset) -> [ConnectionPreset] {
+        connected ? allCases.filter { current.canSwitchLive(to: $0) } : allCases
+    }
     var description: String {
         switch self {
         case .bonded:
@@ -204,8 +217,13 @@ final class LinkModel: ObservableObject {
         get { ConnectionPreset.matching(mode: mode, policy: policy) }
         set {
             let settings = newValue.settings
+            // While connected only a same-transport switch is applied; it
+            // reaches the tunnel and the UDP engine as live configuration.
+            if busy && !preset.canSwitchLive(to: newValue) { return }
+            let live = busy && newValue != preset
             if mode != settings.mode { mode = settings.mode }
             if policy != settings.policy { policy = settings.policy }
+            if live { log("Switched to \(newValue.title) without reconnecting") }
         }
     }
     @Published var secureDomainsText = "" { didSet { configurationChanged() } }

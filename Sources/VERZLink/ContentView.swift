@@ -114,12 +114,16 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 14) {
                 eyebrow("CONNECTION")
                 Picker("Connection", selection: Binding(get: { model.preset }, set: { model.preset = $0 })) {
-                    ForEach(ConnectionPreset.allCases) { preset in
+                    ForEach(ConnectionPreset.selectable(connected: model.busy, current: model.preset)) { preset in
                         Text(preset.title).tag(preset)
                     }
-                }.pickerStyle(.segmented).disabled(model.busy)
+                }.pickerStyle(.segmented).disabled(model.busy && model.mode == .direct)
                 Text(model.preset.description).font(.system(size: 11)).foregroundStyle(muted)
-                if model.busy { Text("Disconnect to change the connection type.").font(.system(size: 10)).foregroundStyle(muted) }
+                if model.busy {
+                    Text(model.mode == .direct ? "Disconnect to change the connection type."
+                         : "Bonded, Smart Repair and Maximum Continuity switch without reconnecting. Disconnect to use Direct.")
+                        .font(.system(size: 10)).foregroundStyle(muted)
+                }
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { showAdvanced.toggle() }
                 } label: {
