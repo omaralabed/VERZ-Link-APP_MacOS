@@ -1,4 +1,4 @@
 [submodule "Server"]
 	path = Server
 	url = https://github.com/omaralabed/Gateway-VERZ-LINK-Deploy-APP.git
-	branch = server-engine
+	branch = main
