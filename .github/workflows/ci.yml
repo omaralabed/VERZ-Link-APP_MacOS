@@ -23,8 +23,9 @@ jobs:
           token: ${{ secrets.ENGINE_REPO_TOKEN || github.token }}
       - name: Swift tests
         run: swift test
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
