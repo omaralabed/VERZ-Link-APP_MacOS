@@ -303,6 +303,7 @@ final class LinkModel: ObservableObject {
     // packet contents or credentials; disk I/O stays off the UI/event queue.
     private let transportDiagnosticQueue = DispatchQueue(label: "com.verz.link.tcp-diagnostics", qos: .utility)
     private var lastTransportDiagnostic = Date.distantPast
+    private var lastUDPDiagnostic = Date.distantPast
     var busy: Bool { state != .disconnected }
     var canTest: Bool { state == .connected && mode != .direct && !testRunning }
     var effectiveDisabledInterfaces: Set<String> {
@@ -377,6 +378,14 @@ final class LinkModel: ObservableObject {
         udpConnection.onTelemetry = { [weak self] data in
             guard let self, let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
             let now = Date()
+            // The UDP lane's latest status next to the tunnel's, under the same
+            // opt-in diagnostics flag, so the lane can be observed after a fault.
+            if UserDefaults.standard.bool(forKey: "TCPTransportDiagnostics"),
+               now.timeIntervalSince(self.lastUDPDiagnostic) >= 1, data.count <= 262_144 {
+                self.lastUDPDiagnostic = now
+                let destination = self.storage.appendingPathComponent("udp-status-latest.json")
+                self.transportDiagnosticQueue.async { try? data.write(to: destination, options: .atomic) }
+            }
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
             if let payload = try? decoder.decode(UDPProviderTelemetry.self, from: data).payload {
                 let previousUploaded = self.udpPayloadMeter.uploaded
@@ -420,6 +429,32 @@ final class LinkModel: ObservableObject {
     func log(_ text: String) {
         activity.append(ActivityEntry(message: text))
         if activity.count > 300 { activity.removeFirst(activity.count - 300) }
+        recordActivity(text)
+    }
+
+    /// The Activity log on disk (`activity.log` next to the other diagnostics),
+    /// one timestamped line per entry, kept under about 2 MB. Local only. It is
+    /// what lets a tunnel restart be explained after the fact instead of asked
+    /// about.
+    private func recordActivity(_ text: String) {
+        let url = storage.appendingPathComponent("activity.log")
+        let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
+                                               formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+        guard let data = (stamp + " " + text + "\n").data(using: .utf8) else { return }
+        transportDiagnosticQueue.async {
+            if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
+               size > 2_000_000, let whole = try? Data(contentsOf: url) {
+                try? whole.suffix(1_000_000).write(to: url, options: .atomic)
+            }
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: url, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            }
+        }
     }
 
     /// One JSON line per direct/relay flow from the engine: placement inputs and
