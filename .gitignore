@@ -1,10 +1,6 @@
 .build/
 dist/
 Helper/target/
-Engine/target/
-UdpEngine/target/
-Engine/vendor/**/target/
-Engine/vendor/**/Cargo.lock
 *.log
 .DS_Store
 .swiftpm/
@@ -13,5 +9,3 @@ Engine/vendor/**/Cargo.lock
 *.verz
 build/
 __pycache__/
-Simulator/target/
-Simulator/recordings/

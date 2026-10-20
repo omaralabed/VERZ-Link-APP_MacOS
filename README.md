@@ -93,9 +93,18 @@ implementation status for remaining distribution and second-Mac checks.
 ```sh
 bash scripts/build-app.sh
 swift test
-cargo test --manifest-path Engine/Cargo.toml --locked --lib --bin verz-bond
-cargo clippy --manifest-path Engine/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path Server/Engine/Cargo.toml --locked --lib --bin verz-bond
+cargo clippy --manifest-path Server/Engine/Cargo.toml --locked --all-targets -- -D warnings
 ```
+
+The engine (tunnel, UDP engine, shared cores) is not part of this repository:
+it lives in `omaralabed/Gateway-VERZ-LINK-Deploy-APP`, which also holds the
+server built from it, and is mounted here as the `Server/` submodule at a
+pinned commit. Clone with `git clone --recurse-submodules`, or run
+`git submodule update --init` in an existing checkout; the build scripts and
+the Xcode bridging header read `Server/Engine` and `Server/UdpEngine`. An
+engine change is committed there first, then this repository moves the pin
+and bumps the app build number.
 
 The universal signed test product is built in Xcode DerivedData outside iCloud
 Desktop. The script prints its exact location and creates the distribution ZIP
@@ -103,7 +112,7 @@ in `dist/`. Select an Apple signing team in Xcode: the managed helper refuses
 ad-hoc clients. Apple Development signing is not Developer ID/notarized release
 distribution; release packaging and a Network Extension remain outstanding.
 
-`Engine/scripts/check-linux-continuity.sh` runs as root on the Linux test relay.
+`Server/Engine/scripts/check-linux-continuity.sh` runs as root on the Linux test relay.
 It creates two isolated network namespaces, two shaped virtual WAN links and a
 private HTTP endpoint. It never changes the host default route or shapes SSH.
 Modes: `cuts`, `low`, `high`, `both`. It removes only its temporary namespaces

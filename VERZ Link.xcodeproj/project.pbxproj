@@ -31,13 +31,13 @@ CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; DEVELOPME
 CODE_SIGN_ENTITLEMENTS = Resources/UDP-Proxy.entitlements; INFOPLIST_FILE = Resources/UDP-Proxy-Info.plist;
 PRODUCT_BUNDLE_IDENTIFIER = com.omaralabed.verzlink.classic.udp; PRODUCT_NAME = com.omaralabed.verzlink.classic.udp; PRODUCT_MODULE_NAME = VERZUDP;
 SKIP_INSTALL = YES; ENABLE_HARDENED_RUNTIME = YES; ENABLE_APP_SANDBOX = YES; ENABLE_USER_SCRIPT_SANDBOXING = NO;
-SWIFT_OBJC_BRIDGING_HEADER = UdpEngine/include/VerzEngine.h; LIBRARY_SEARCH_PATHS = ("$(inherited)","$(DERIVED_FILE_DIR)",); OTHER_LDFLAGS = ("$(inherited)","-lverz_udp_proxy",); }; };
+SWIFT_OBJC_BRIDGING_HEADER = Server/UdpEngine/include/VerzEngine.h; LIBRARY_SEARCH_PATHS = ("$(inherited)","$(DERIVED_FILE_DIR)",); OTHER_LDFLAGS = ("$(inherited)","-lverz_udp_proxy",); }; };
 B00000000000000000000018 = {isa = XCBuildConfiguration; name = Release; buildSettings = {
 CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; DEVELOPMENT_TEAM = H7728UD4B3;
 CODE_SIGN_ENTITLEMENTS = Resources/UDP-Proxy.entitlements; INFOPLIST_FILE = Resources/UDP-Proxy-Info.plist;
 PRODUCT_BUNDLE_IDENTIFIER = com.omaralabed.verzlink.classic.udp; PRODUCT_NAME = com.omaralabed.verzlink.classic.udp; PRODUCT_MODULE_NAME = VERZUDP;
 SKIP_INSTALL = YES; ENABLE_HARDENED_RUNTIME = YES; ENABLE_APP_SANDBOX = YES; ENABLE_USER_SCRIPT_SANDBOXING = NO;
-SWIFT_OBJC_BRIDGING_HEADER = UdpEngine/include/VerzEngine.h; LIBRARY_SEARCH_PATHS = ("$(inherited)","$(DERIVED_FILE_DIR)",); OTHER_LDFLAGS = ("$(inherited)","-lverz_udp_proxy",); }; };
+SWIFT_OBJC_BRIDGING_HEADER = Server/UdpEngine/include/VerzEngine.h; LIBRARY_SEARCH_PATHS = ("$(inherited)","$(DERIVED_FILE_DIR)",); OTHER_LDFLAGS = ("$(inherited)","-lverz_udp_proxy",); }; };
 
 /* Begin PBXBuildFile section */
         D00000000000000000000002 = {isa = PBXBuildFile; fileRef = D00000000000000000000001; };

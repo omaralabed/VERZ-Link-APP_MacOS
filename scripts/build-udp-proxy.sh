@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
-cd "$SRCROOT/UdpEngine"
+cd "$SRCROOT/Server/UdpEngine"
 archives=()
 for architecture in $ARCHS; do
     case "$architecture" in
