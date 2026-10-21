@@ -18,153 +18,6 @@ enum Control {
     Stop,
     Connected(String),
     Settings(Value),
-    /// A kept stream's socket closed; its index in the bypass list.
-    FlowEnded(usize),
-}
-
-/// A stream the app found running on a physical link before Connect and the
-/// user chose to keep there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Bypass {
-    protocol: String,
-    port: u16,
-    interface: String,
-    remote: Option<std::net::Ipv4Addr>,
-    process: String,
-}
-
-const MAX_BYPASS: usize = 8;
-
-fn parse_bypass(initial: &Value, interfaces: &[String]) -> Vec<Bypass> {
-    let Some(items) = initial.get("bypass").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let protocol = item.get("protocol")?.as_str()?;
-            if protocol != "udp" && protocol != "tcp" {
-                return None;
-            }
-            let port = u16::try_from(item.get("port")?.as_u64()?).ok().filter(|port| *port > 0)?;
-            let interface = item.get("interface")?.as_str()?;
-            if !interfaces.iter().any(|name| name == interface) {
-                return None;
-            }
-            let remote = match item.get("remote").and_then(Value::as_str).unwrap_or("") {
-                "" => None,
-                text => Some(text.parse().ok()?),
-            };
-            let process: String = item
-                .get("process")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
-                .take(24)
-                .collect();
-            Some(Bypass {
-                protocol: protocol.to_owned(),
-                port,
-                interface: interface.to_owned(),
-                remote,
-                process: if process.trim().is_empty() { "A stream".to_owned() } else { process },
-            })
-        })
-        .take(MAX_BYPASS)
-        .collect()
-}
-
-/// The far end of a captured packet: "IP 192.168.1.5.63690 > 1.2.3.4.9000: UDP ..."
-fn destination_from_capture(output: &str) -> Option<std::net::Ipv4Addr> {
-    output.lines().find_map(|line| {
-        let (_, rest) = line.split_once(" > ")?;
-        let endpoint = rest.split([':', ' ']).next()?;
-        let (host, _port) = endpoint.rsplit_once('.')?;
-        host.parse().ok()
-    })
-}
-
-/// Learns where an unconnected socket sends by capturing one of its packets
-/// on its link, before the tunnel takes the route.
-fn capture_destination(stream: &Bypass) -> Option<std::net::Ipv4Addr> {
-    let filter = format!("{} and src port {}", stream.protocol, stream.port);
-    let mut child = Command::new("/usr/sbin/tcpdump")
-        .args(["-i", &stream.interface, "-c", "1", "-n", "-l", "-q", "-s", "64", &filter])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if child.try_wait().ok()?.is_some() {
-            let output = child.wait_with_output().ok()?;
-            return destination_from_capture(&String::from_utf8_lossy(&output.stdout));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    None
-}
-
-/// Reports when the kept stream's socket is gone, so its pin can be lifted.
-fn watch_flow(stream: Bypass, index: usize, tx: mpsc::Sender<Control>) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(5));
-        let open = Command::new("/usr/sbin/lsof")
-            .args(["-nP", &format!("-i{}:{}", stream.protocol.to_uppercase(), stream.port), "-F", "p"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(true);
-        if !open {
-            let _ = tx.send(Control::FlowEnded(index));
-            break;
-        }
-    });
-}
-
-/// Pins each kept stream's destination to its link and starts watching it.
-fn keep_streams(
-    guard: &mut network::NetworkGuard,
-    streams: &[Bypass],
-    events: &Events,
-    tx: &mpsc::Sender<Control>,
-) -> Vec<Option<std::net::Ipv4Addr>> {
-    streams
-        .iter()
-        .enumerate()
-        .map(|(index, stream)| {
-            let Some(destination) = stream.remote.or_else(|| capture_destination(stream)) else {
-                event(
-                    events,
-                    json!({"event":"log", "line":format!("Could not learn where {}'s stream goes; it will reconnect once through VERZ", stream.process)}),
-                );
-                return None;
-            };
-            match guard.add_bypass(&destination.to_string(), &stream.interface) {
-                Ok(()) => {
-                    event(
-                        events,
-                        json!({"event":"log", "line":format!("{}'s stream to {destination} stays on {} until it restarts", stream.process, stream.interface)}),
-                    );
-                    watch_flow(stream.clone(), index, tx.clone());
-                    Some(destination)
-                }
-                Err(error) => {
-                    event(
-                        events,
-                        json!({"event":"log", "line":format!("Could not keep {}'s stream on {}: {error}; it will reconnect once through VERZ", stream.process, stream.interface)}),
-                    );
-                    None
-                }
-            }
-        })
-        .collect()
 }
 
 fn event(events: &Events, value: Value) {
@@ -268,8 +121,6 @@ fn main() -> Result<()> {
             && interfaces.iter().all(|name| valid_interface(name)),
         "invalid initial interfaces"
     );
-    let bypass = if direct || hybrid { Vec::new() } else { parse_bypass(&initial, &interfaces) };
-    let mut kept: Vec<Option<std::net::Ipv4Addr>> = Vec::new();
     // Persistent service: only run the engine beside this signed supervisor,
     // never a user-replaceable executable from the session directory.
     let engine = std::env::current_exe()?
@@ -406,7 +257,6 @@ fn main() -> Result<()> {
             event(&err_events, json!({"event":"engine_error", "line":line}));
         }
     });
-    let watch_tx = stop_tx.clone();
     drop(stop_tx);
     let mut network: Option<network::NetworkGuard> = None;
     let mut proxy: Option<network::ProxyGuard> = None;
@@ -468,14 +318,7 @@ fn main() -> Result<()> {
                         &events,
                         json!({"event":"configuring", "line":"Routing Mac traffic and DNS through VERZ"}),
                     );
-                    network::NetworkGuard::prepare(endpoint, &interfaces, &relay.ip().to_string(), false)
-                        .and_then(|mut guard| {
-                            // Pinned before the tunnel takes the route, so a
-                            // kept stream never sends a packet through it.
-                            kept = keep_streams(&mut guard, &bypass, &events, &watch_tx);
-                            guard.capture()?;
-                            Ok(guard)
-                        })
+                    network::NetworkGuard::configure(endpoint, &interfaces, &relay.ip().to_string())
                         .map(|guard| network = Some(guard))
                 };
                 match configured {
@@ -555,22 +398,6 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            Ok(Control::FlowEnded(index)) => {
-                let Some(destination) = kept.get_mut(index).and_then(Option::take) else { continue };
-                let Some(stream) = bypass.get(index) else { continue };
-                if let Some(guard) = network.as_mut() {
-                    match guard.remove_bypass(&destination.to_string()) {
-                        Ok(()) => event(
-                            &events,
-                            json!({"event":"log", "line":format!("{}'s stream on {} ended · new streams go through VERZ", stream.process, stream.interface)}),
-                        ),
-                        Err(error) => event(
-                            &events,
-                            json!({"event":"log", "line":format!("Could not release the kept route for {}: {error}", stream.process)}),
-                        ),
-                    }
-                }
-            }
             Ok(Control::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stop(&mut child)?;
                 break 0;
@@ -609,42 +436,4 @@ fn valid_domain(domain: &str) -> bool {
                 && !label.ends_with('-')
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
-}
-
-#[cfg(test)]
-mod kept_stream_tests {
-    use super::*;
-
-    #[test]
-    fn captured_packet_names_the_far_end() {
-        let line = "12:00:00.000000 IP 192.168.108.12.63690 > 93.184.216.34.9000: UDP, length 1316\n";
-        assert_eq!(destination_from_capture(line), Some("93.184.216.34".parse().unwrap()));
-        let tcp = "IP 192.168.1.5.54459 > 17.57.144.55.1935: tcp 1448\n";
-        assert_eq!(destination_from_capture(tcp), Some("17.57.144.55".parse().unwrap()));
-        assert_eq!(destination_from_capture("tcpdump: listening on en7\n"), None);
-        assert_eq!(destination_from_capture(""), None);
-    }
-
-    #[test]
-    fn only_valid_kept_streams_on_selected_links_are_accepted() {
-        let interfaces = vec!["en7".to_owned(), "en0".to_owned()];
-        let initial = json!({"bypass": [
-            {"protocol": "udp", "port": 63690, "interface": "en7", "remote": "", "process": "OBS"},
-            {"protocol": "tcp", "port": 54459, "interface": "en0", "remote": "17.57.144.55", "process": "Google Chrome H"},
-            {"protocol": "icmp", "port": 1, "interface": "en7"},
-            {"protocol": "udp", "port": 0, "interface": "en7"},
-            {"protocol": "udp", "port": 5000, "interface": "en9"},
-            {"protocol": "udp", "port": 5001, "interface": "en7", "remote": "not an address"},
-            {"protocol": "udp", "port": 5002, "interface": "en7", "process": "x<script>\u{1F600}"}
-        ]});
-        let parsed = parse_bypass(&initial, &interfaces);
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0], Bypass { protocol: "udp".into(), port: 63690, interface: "en7".into(), remote: None, process: "OBS".into() });
-        assert_eq!(parsed[1].remote, Some("17.57.144.55".parse().unwrap()));
-        assert_eq!(parsed[1].process, "Google Chrome H");
-        assert_eq!(parsed[2].process, "xscript");
-        assert!(parse_bypass(&json!({}), &interfaces).is_empty());
-        let many = json!({"bypass": (0..20).map(|i| json!({"protocol": "udp", "port": 1000 + i, "interface": "en7"})).collect::<Vec<_>>()});
-        assert_eq!(parse_bypass(&many, &interfaces).len(), MAX_BYPASS);
-    }
 }

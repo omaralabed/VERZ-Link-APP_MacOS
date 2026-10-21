@@ -222,13 +222,6 @@ final class LinkModel: ObservableObject {
     @Published var tunnelInterface = ""
     @Published var publicIP: String?
     @Published var errorMessage: String?
-    /// Live streams found on the physical links when Connect was pressed;
-    /// non-nil while the user decides what happens to them.
-    @Published var streamChoice: [ActiveStream]?
-    @Published var checkingStreams = false
-    /// Streams the user chose to keep on their links; the helper pins their
-    /// destinations there until the sockets close.
-    private var keptStreams: [ActiveStream] = []
     @Published var hasCredential = false
     @Published var testRunning = false
     @Published var testProgress = 0.0
@@ -485,32 +478,7 @@ final class LinkModel: ObservableObject {
     }
 
     func connect() {
-        guard !busy, !checkingStreams else { return }
-        // A stream already running on a link would reconnect once when the
-        // tunnel takes the route; the user decides before that happens.
-        checkingStreams = true
-        let physical = Set(enabledInterfaces.map(\.name))
-        Task { @MainActor [weak self] in
-            let found = await ActiveStreams.detect(physical: physical)
-            guard let self else { return }
-            self.checkingStreams = false
-            if found.isEmpty { self.beginConnect(keeping: []) } else { self.streamChoice = found }
-        }
-    }
-
-    /// Starts the tunnel; `streams` stay on their links until they restart.
-    func beginConnect(keeping streams: [ActiveStream]) {
-        let found = streamChoice ?? []
-        streamChoice = nil
         guard !busy else { return }
-        keptStreams = streams
-        for stream in found {
-            if streams.contains(stream) {
-                log("\(stream.description) · kept on \(stream.interface) until it restarts; from then on it goes through VERZ")
-            } else {
-                log("\(stream.description) · it will reconnect once through VERZ")
-            }
-        }
         userStopped = false
         recoveryTask?.cancel(); recoveryTask = nil
         recovery.reset(); recoveryDetail = ""
@@ -633,7 +601,6 @@ final class LinkModel: ObservableObject {
     func disconnect() {
         guard busy else { return }
         userStopped = true
-        keptStreams = []
         recoveryTask?.cancel(); recoveryTask = nil
         recovery.reset(); recoveryDetail = ""
         runner?.cancel(); testTask?.cancel(); testRunning = false
@@ -930,9 +897,7 @@ final class LinkModel: ObservableObject {
             "interfaces": paths,
             "policy": mainTunnelPolicy(policy),
             "mode": mode.rawValue,
-            "secureDomains": secureDomains() ?? [],
-            "bypass": keptStreams.map { ["protocol": $0.protocolName, "port": Int($0.localPort), "interface": $0.interface,
-                                        "remote": $0.remote ?? "", "process": $0.process] }
+            "secureDomains": secureDomains() ?? []
         ], options: [.sortedKeys])) ?? Data()
     }
 
