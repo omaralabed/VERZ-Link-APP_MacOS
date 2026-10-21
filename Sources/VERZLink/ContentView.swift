@@ -176,14 +176,28 @@ struct ContentView: View {
                 HStack(spacing: 18) {
                     Button { model.busy ? model.disconnect() : model.connect() } label: {
                         HStack(spacing: 10) {
-                            if model.state == .authorizing || model.state == .connecting || model.state == .disconnecting {
+                            if model.state == .authorizing || model.state == .connecting || model.state == .disconnecting || model.checkingStreams {
                                 ProgressView().controlSize(.small)
                             } else { Image(systemName: "power") }
                             Text(model.busy ? "Disconnect" : "Connect").fontWeight(.semibold)
                         }.frame(width: 150, height: 42)
                             .foregroundStyle(model.busy ? mint : Color.black)
                             .background(model.busy ? mint.opacity(0.12) : mint, in: RoundedRectangle(cornerRadius: 9))
-                    }.buttonStyle(.plain).disabled(model.state == .disconnecting || (!model.busy && !model.hasReadyInterface))
+                    }.buttonStyle(.plain).disabled(model.state == .disconnecting || model.checkingStreams || (!model.busy && !model.hasReadyInterface))
+                    .confirmationDialog("A stream is already running",
+                                        isPresented: Binding(get: { model.streamChoice != nil }, set: { if !$0 { model.streamChoice = nil } }),
+                                        titleVisibility: .visible) {
+                        if let streams = model.streamChoice, let first = streams.first {
+                            Button("Keep it on \(first.interface) for now") { model.beginConnect(keeping: streams) }
+                            Button("Connect anyway · it reconnects once") { model.beginConnect(keeping: []) }
+                            Button("Cancel", role: .cancel) { model.streamChoice = nil }
+                        }
+                    } message: {
+                        if let streams = model.streamChoice {
+                            Text(streams.map(\.description).joined(separator: "\n")
+                                 + "\n\nThrough VERZ its receiver sees a new address, so the stream would reconnect once, after about 7 seconds. Kept on its link it stays untouched until it restarts; from then on it goes through VERZ.")
+                        }
+                    }
                     if model.state == .connected {
                         Text("UPTIME  \(uptime)")
                             .font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(muted)

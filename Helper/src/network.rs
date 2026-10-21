@@ -19,6 +19,28 @@ fn gateway_for_interface(route: &str, physical: &str) -> Option<Ipv4Addr> {
     field("gateway:")?.parse().ok()
 }
 
+/// A physical interface's gateway: its scoped default route, or its DHCP
+/// lease when roaming or unplugging left no route behind. Never another
+/// ISP's or the global gateway. Returns the route output, the routed gateway
+/// if any, and the gateway to use.
+fn interface_gateway(physical: &str) -> Result<(String, Option<Ipv4Addr>, String)> {
+    let default = run(
+        "/sbin/route",
+        &["-n", "get", "-ifscope", physical, "default"],
+    )
+    .unwrap_or_default();
+    let routed_gateway = gateway_for_interface(&default, physical);
+    let gateway = routed_gateway
+        .or_else(|| {
+            run("/usr/sbin/ipconfig", &["getoption", physical, "router"])
+                .ok()
+                .and_then(|value| dhcp_gateway(&value))
+        })
+        .context("selected interface has no route or DHCP gateway")?
+        .to_string();
+    Ok((default, routed_gateway, gateway))
+}
+
 fn dhcp_gateway(value: &str) -> Option<Ipv4Addr> {
     value
         .split_whitespace()
@@ -67,12 +89,6 @@ pub struct NetworkGuard {
 }
 
 impl NetworkGuard {
-    pub fn configure(tun: &str, physical: &[String], relay: &str) -> Result<Self> {
-        let mut guard = Self::prepare(tun, physical, relay, false)?;
-        guard.capture()?;
-        Ok(guard)
-    }
-
     /// Prepare only interface-scoped routes. Existing global routing and DNS
     /// remain untouched while the helper verifies direct and encrypted paths.
     pub fn prepare(
@@ -173,23 +189,7 @@ impl NetworkGuard {
     }
 
     pub fn add_uplink(&mut self, physical: &str, relay: &str) -> Result<()> {
-        let default = run(
-            "/sbin/route",
-            &["-n", "get", "-ifscope", physical, "default"],
-        )
-        .unwrap_or_default();
-        let routed_gateway = gateway_for_interface(&default, physical);
-        let gateway = routed_gateway
-            .or_else(|| {
-                // Roaming/unplugging may remove a secondary scoped default even
-                // while DHCP remains valid. Use this adapter's lease, never the
-                // other ISP's/global gateway, and add a session-owned route.
-                run("/usr/sbin/ipconfig", &["getoption", physical, "router"])
-                    .ok()
-                    .and_then(|value| dhcp_gateway(&value))
-            })
-            .context("selected interface has no route or DHCP gateway")?
-            .to_string();
+        let (default, routed_gateway, gateway) = interface_gateway(physical)?;
         let gateway = gateway.as_str();
         // IP_BOUND_IF uses the interface-scoped routing table. macOS commonly
         // leaves the currently preferred Ethernet default route global rather
@@ -282,6 +282,42 @@ impl NetworkGuard {
                 &["-setdnsservers", service, "1.1.1.1", "1.0.0.1"],
             )?;
         }
+        Ok(())
+    }
+
+    /// Keeps one destination on a physical link while the tunnel owns the
+    /// default route. A stream that was running before Connect keeps the
+    /// public address its receiver knows and never notices the switch.
+    pub fn add_bypass(&mut self, destination: &str, physical: &str) -> Result<()> {
+        ensure!(
+            self.physical.iter().any(|name| name == physical),
+            "kept stream names a link that is not selected"
+        );
+        let (_, _, gateway) = interface_gateway(physical)?;
+        let desired: Vec<String> = ["-host", destination, gateway.as_str()]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        if self.routes.contains(&desired) {
+            return Ok(());
+        }
+        self.add_route(&["-host", destination, gateway.as_str()])
+    }
+
+    /// The kept stream's socket closed: its destination goes through the
+    /// tunnel from now on.
+    pub fn remove_bypass(&mut self, destination: &str) -> Result<()> {
+        let Some(index) = self
+            .routes
+            .iter()
+            .position(|route| route.len() == 3 && route[0] == "-host" && route[1] == destination)
+        else {
+            return Ok(());
+        };
+        let route = self.routes.remove(index);
+        let mut args = vec!["-n", "delete"];
+        args.extend(route.iter().map(String::as_str));
+        run("/sbin/route", &args)?;
         Ok(())
     }
 
