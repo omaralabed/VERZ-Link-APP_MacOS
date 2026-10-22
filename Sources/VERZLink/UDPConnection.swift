@@ -121,6 +121,17 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
     func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
         guard request === activation, starting else { return }; activation = nil
         guard result == .completed else { finish(.failure(failure("Restart macOS to complete UDP extension installation."))); return }
+        // A lane still running from this app's previous launch (it was quit by
+        // a signal, so it never stopped its lane): starting it again changes
+        // nothing, macOS reports no new status, and after 20 s the app shut the
+        // working lane down and cut a running stream (2026-10-22 08:02). Same
+        // relay and device: adopt it and push the current settings live.
+        if let existing = self.manager, runningForThisDevice(existing) {
+            update(disabled: configuration["disabled"] as? [String] ?? [], mode: configuration["mode"] as? Int ?? 2)
+            onMessage?("UDP lane already running from the previous launch · kept, settings updated")
+            finish(.success(()))
+            return
+        }
         let manager = self.manager ?? NETransparentProxyManager(); self.manager = manager
         let proto = NETunnelProviderProtocol(); proto.providerBundleIdentifier = Self.identifier
         proto.serverAddress = configuration["gateway"] as? String; proto.providerConfiguration = configuration
@@ -141,6 +152,12 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
                             try manager.connection.startVPNTunnel(options: ["key": key as NSString])
                             let timeout = DispatchWorkItem { [weak self] in
                                 guard let self, self.generation == current, self.starting else { return }
+                                // The status notification can be missed; trust the
+                                // connection's actual state before giving up.
+                                if self.runningForThisDevice(manager) {
+                                    self.finish(.success(()))
+                                    return
+                                }
                                 self.finish(.failure(self.failure("UDP extension startup timed out. Normal networking has been restored.")))
                             }
                             self.startupTimeout = timeout
@@ -158,9 +175,20 @@ final class UDPConnection: NSObject, @preconcurrency OSSystemExtensionRequestDel
             : policy == "smart-repair" ? 5
             : 2
     }
+    /// Connected, to this relay, as this device.
+    private func runningForThisDevice(_ manager: NETransparentProxyManager) -> Bool {
+        guard manager.connection.status == .connected,
+              let running = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+        else { return false }
+        return running["gateway"] as? String == configuration["gateway"] as? String
+            && (running["session"] as? NSNumber)?.intValue == (configuration["session"] as? Int)
+    }
     func update(disabled: [String], policy: String) {
+        update(disabled: disabled, mode: mode(policy))
+    }
+    private func update(disabled: [String], mode: Int) {
         guard let session = manager?.connection as? NETunnelProviderSession, session.status == .connected,
-              let data = try? JSONSerialization.data(withJSONObject: ["disabled": disabled, "mode": mode(policy)]) else { return }
+              let data = try? JSONSerialization.data(withJSONObject: ["disabled": disabled, "mode": mode]) else { return }
         try? session.sendProviderMessage(data) { _ in }
     }
     func telemetry() {

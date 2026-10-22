@@ -593,6 +593,10 @@ final class LinkModel: ObservableObject {
                 self.log("UDP accelerator active · native UDP when available, encrypted main-tunnel fallback otherwise")
             case .failure(let error):
                 self.udpAcceleratorStarted = false
+                // Without this the link rows kept showing the lane's last
+                // status ("Streams & calls ready") while every UDP flow was
+                // already on the main tunnel (2026-10-22).
+                self.udpPaths = [:]
                 self.log("UDP accelerator unavailable: \(error.localizedDescription). UDP remains on the encrypted main tunnel.")
             }
         }
