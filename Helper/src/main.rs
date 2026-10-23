@@ -263,6 +263,14 @@ fn main() -> Result<()> {
     let mut hybrid_proxy_endpoint: Option<String> = None;
     let mut hybrid_tun: Option<String> = None;
     let mut hybrid_announced = false;
+    // Interfaces whose relay route could not be installed yet (a cable that
+    // has just come back has a link but no gateway until DHCP answers), and
+    // when every interface's route was last verified. macOS drops a scoped
+    // route when its link goes down; a cable that came back at 00:51 had no
+    // route to the relay for the rest of the session and every new socket on
+    // it failed with "No route to host" (2026-10-23).
+    let mut uplink_waiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut uplinks_checked = Instant::now();
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(1);
@@ -402,7 +410,34 @@ fn main() -> Result<()> {
                 stop(&mut child)?;
                 break 0;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if uplinks_checked.elapsed() < Duration::from_secs(2) {
+                    continue;
+                }
+                uplinks_checked = Instant::now();
+                if let Some(guard) = network.as_mut() {
+                    for interface in &interfaces {
+                        match guard.add_uplink(interface, &relay.ip().to_string()) {
+                            Ok(()) => {
+                                if uplink_waiting.remove(interface) {
+                                    event(
+                                        &events,
+                                        json!({"event":"log", "line":format!("Uplink {interface} routed to the relay")}),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                if uplink_waiting.insert(interface.clone()) {
+                                    event(
+                                        &events,
+                                        json!({"event":"log", "line":format!("Uplink {interface} is waiting for a gateway: {error}")}),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
     if let Some(mut guard) = proxy {
