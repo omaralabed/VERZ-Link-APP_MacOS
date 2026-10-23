@@ -230,6 +230,17 @@ struct ContentView: View {
         }
     }
 
+    /// A meter column for a link that carries nothing: same width and place
+    /// as the live one, so the columns line up across rows.
+    private func offMeter(_ label: String, width: CGFloat) -> some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Text(label)
+            Text(" ")
+            Text("↑ 0.00  ↓ 0.00 Mbps").font(.system(size: 12, weight: .semibold)).monospacedDigit()
+        }
+        .font(.system(size: 10)).foregroundStyle(muted).frame(width: width, alignment: .trailing)
+    }
+
     private var networkInterfaces: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -253,7 +264,14 @@ struct ContentView: View {
                             .font(.system(size: 10)).foregroundStyle(muted)
                     }
                     Spacer()
-                    if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
+                    // A switched-off link keeps both meter columns, marked Off:
+                    // its lane entry disappears, and the remaining column used
+                    // to slide into the other's place.
+                    let switchedOff = model.effectiveDisabledInterfaces.contains(interface.name)
+                    if model.busy, model.mode == .secure,
+                       switchedOff || model.bondTelemetry?.paths.first(where: { $0.name == interface.name }) == nil {
+                        offMeter(switchedOff ? "Web & transfers · Off" : "Web & transfers · waiting", width: 180)
+                    } else if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
                             Text(path.carrier == "tls-tcp" ? "Corporate fallback · TCP 443" : path.state == "offline" ? "Offline" : path.uploadHeld == true
                                  ? "Upload congested · new flows prefer another link" : (path.latencyExcluded == true || path.realtimePreferred == false)
@@ -280,7 +298,9 @@ struct ContentView: View {
                             }
                         }.font(.system(size: 10)).frame(width: 180, alignment: .trailing)
                     }
-                    if let udp = model.udpPaths[interface.name], model.busy {
+                    if model.busy, model.mode == .secure, switchedOff || model.udpPaths[interface.name] == nil {
+                        offMeter(switchedOff ? "Streams & calls · Off" : "Streams & calls waiting", width: 150)
+                    } else if let udp = model.udpPaths[interface.name], model.busy {
                         let corporateFallback = model.bondTelemetry?.paths.first(where: { $0.name == interface.name })?.carrier == "tls-tcp"
                         VStack(alignment: .trailing, spacing: 4) {
                             Text(udp.healthy ? "Streams & calls ready"
