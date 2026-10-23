@@ -268,9 +268,14 @@ struct ContentView: View {
                     // its lane entry disappears, and the remaining column used
                     // to slide into the other's place.
                     let switchedOff = model.effectiveDisabledInterfaces.contains(interface.name)
+                    // Idle because it is marked Metered while an unmetered link
+                    // works ("Avoid metered links"): unticking Metered on one
+                    // link turned the other off with no word of why.
+                    let avoidedMetered = switchedOff && !model.disabledInterfaces.contains(interface.name)
+                    let offLabel = avoidedMetered ? "Idle · metered" : "Off"
                     if model.busy, model.mode == .secure,
                        switchedOff || model.bondTelemetry?.paths.first(where: { $0.name == interface.name }) == nil {
-                        offMeter(switchedOff ? "Web & transfers · Off" : "Web & transfers · waiting", width: 180)
+                        offMeter(switchedOff ? "Web & transfers · \(offLabel)" : "Web & transfers · waiting", width: 180)
                     } else if let path = model.bondTelemetry?.paths.first(where: { $0.name == interface.name }), model.busy {
                         VStack(alignment: .trailing, spacing: 4) {
                             Text(path.carrier == "tls-tcp" ? "Corporate fallback · TCP 443" : path.state == "offline" ? "Offline" : path.uploadHeld == true
@@ -299,7 +304,8 @@ struct ContentView: View {
                         }.font(.system(size: 10)).frame(width: 180, alignment: .trailing)
                     }
                     if model.busy, model.mode == .secure, switchedOff || model.udpPaths[interface.name] == nil {
-                        offMeter(switchedOff ? "Streams & calls · Off" : "Streams & calls waiting", width: 150)
+                        offMeter(switchedOff ? "Streams & calls · \(offLabel)" : "Streams & calls waiting", width: 150)
+                            .help(avoidedMetered ? "Marked Metered, and Avoid metered links is on: this link stays idle while an unmetered link works. Untick Metered here, or turn off Avoid metered links under Advanced." : "")
                     } else if let udp = model.udpPaths[interface.name], model.busy {
                         let corporateFallback = model.bondTelemetry?.paths.first(where: { $0.name == interface.name })?.carrier == "tls-tcp"
                         VStack(alignment: .trailing, spacing: 4) {
@@ -338,6 +344,9 @@ struct ContentView: View {
                         .help("Include this adapter in the multipath connection")
                     Toggle("Metered", isOn: Binding(get: { model.meteredInterfaces.contains(interface.name) },
                         set: { model.setMetered(interface.name, metered: $0) })).controlSize(.small).fixedSize()
+                        .help(model.avoidMeteredLinks
+                              ? "Avoid metered links is on: while any unmetered link works, every link marked Metered stays idle."
+                              : "Marks this link as metered. It only changes routing when Avoid metered links (Advanced) is on.")
                         .accessibilityIdentifier("interface-metered-\(interface.name)")
                 }.padding(.vertical, 5)
             }
