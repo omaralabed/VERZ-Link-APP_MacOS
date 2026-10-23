@@ -342,7 +342,9 @@ impl NetworkGuard {
             }
         }
         for (interface, was_disabled) in self.ipv6_interfaces.drain(..).rev() {
-            if was_disabled {
+            // An adapter unplugged during the session has nothing to restore:
+            // macOS creates it afresh, IPv6 on, when it comes back.
+            if was_disabled || run("/sbin/ifconfig", &[interface.as_str()]).is_err() {
                 continue;
             }
             if let Err(error) = run(
