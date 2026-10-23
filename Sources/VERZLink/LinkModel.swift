@@ -337,7 +337,11 @@ final class LinkModel: ObservableObject {
         if relay == "69.164.213.57:39001" { relay = "69.164.213.57:443" }
         if relay == "69.164.213.57:39002" { relay = "69.164.213.57:443" }
         disabledInterfaces = Set(UserDefaults.standard.stringArray(forKey: "disabledInterfaces") ?? [])
-        meteredInterfaces = Set(UserDefaults.standard.stringArray(forKey: "meteredInterfaces") ?? [])
+        // The Metered ticks and "Avoid metered links" are hidden from the app
+        // (2026-10-23): with every link ticked Metered, unticking one switched
+        // the others off, and a hidden setting must not keep doing that.
+        // Earlier choices are left in the defaults, unused.
+        meteredInterfaces = []
         // Smart Repair is the default since 2026-10-20: measured on the live
         // relay it rebuilds a lossy link's packets and rides out a cable pull
         // without a visible gap, at a fraction of Continuity's data.
@@ -349,7 +353,7 @@ final class LinkModel: ObservableObject {
             avoidMeteredLinks: UserDefaults.standard.bool(forKey: "avoidMeteredLinks"))
         policy = normalized.policy
         mode = normalized.mode
-        avoidMeteredLinks = normalized.avoidMeteredLinks
+        avoidMeteredLinks = false
         UserDefaults.standard.set(policy, forKey: "bondPolicy")
         UserDefaults.standard.set(mode.rawValue, forKey: "transportMode")
         UserDefaults.standard.set(avoidMeteredLinks, forKey: "avoidMeteredLinks")
